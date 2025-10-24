@@ -7,7 +7,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Generator, Iterable, List, Optional
 
@@ -33,7 +33,7 @@ class Repository:
     async def ensure_user(self, user_id: int) -> UserProfile:
         profile = await self.get_user(user_id)
         if profile is None:
-            profile = UserProfile(user_id=user_id, last_reset_at=datetime.now(UTC))
+            profile = UserProfile(user_id=user_id, last_reset_at=datetime.now(timezone.utc))
             await asyncio.to_thread(self._upsert_user, profile)
         return profile
 
@@ -43,7 +43,7 @@ class Repository:
         )
 
     async def ensure_daily_reset(self, user_id: int, *, now: Optional[datetime] = None) -> UserProfile:
-        now = now or datetime.now(UTC)
+        now = now or datetime.now(timezone.utc)
         lock = self._ensure_lock()
         async with lock:
             profile = await self.ensure_user(user_id)

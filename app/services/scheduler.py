@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import datetime, timedelta, timezone
+
 from typing import Optional
 
 from aiogram import Bot
@@ -54,7 +55,7 @@ class ReminderScheduler:
                 continue
 
     async def _check_and_send(self) -> None:
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         reminders = await self._repository.list_due_reminders(now)
         for profile in reminders:
             await self._repository.set_reminder(profile.user_id, None)

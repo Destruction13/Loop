@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from pydantic import BaseSettings, Field, validator
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -23,15 +24,16 @@ class Settings(BaseSettings):
     nano_api_key: Optional[str] = Field(None, env="NANO_API_KEY")
     drive_public_base_url: Optional[str] = Field(None, env="DRIVE_PUBLIC_BASE_URL")
 
-    @validator("catalog_root", "uploads_root", "results_root", pre=True)
+    @field_validator("catalog_root", "uploads_root", "results_root", mode="before")
     def _ensure_path(cls, value: str | Path) -> Path:  # type: ignore[override]
         """Convert string values to Path objects."""
 
         return Path(value)
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
 
 def load_settings(env_file: str | None = None) -> Settings:
