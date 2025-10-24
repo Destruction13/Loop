@@ -160,7 +160,7 @@ def setup_router(
         photo = message.photo[-1]
         filename = f"{photo.file_unique_id}.jpg"
         path = await storage.allocate_upload_path(user_id, filename)
-        await photo.download(destination=str(path))
+        await message.bot.download(photo, destination=path)
         await state.update_data(upload=str(path))
         await repository.ensure_daily_reset(user_id)
         remaining = await repository.remaining_tries(user_id)
