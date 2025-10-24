@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -69,7 +69,7 @@ def setup_router(
 
     async def _send_models(message: Message, user_id: int, filters: FilterOptions, state: FSMContext) -> None:
         models = await catalog.pick_four(user_id, filters)
-                model_ids: List[str] = []
+        model_ids: List[str] = []
         for model in models:
             caption = f"{model.meta.title}\nБренд: {model.meta.brand or '—'}"
             try:
@@ -260,7 +260,7 @@ def setup_router(
     @router.callback_query(StateFilter(TryOnStates.LIMIT_REACHED), F.data == "limit_remind")
     async def limit_remind(callback: CallbackQuery) -> None:
         user_id = callback.from_user.id
-        when = datetime.now(UTC) + timedelta(hours=reminder_hours)
+        when = datetime.now(timezone.utc) + timedelta(hours=reminder_hours)
         await repository.set_reminder(user_id, when)
         await callback.message.answer("Напомню через сутки!")
         await callback.answer()
