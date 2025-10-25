@@ -1,6 +1,6 @@
-# Loop Telegram Bot Skeleton
+# Loop Telegram Bot
 
-Производственный skeleton Telegram-бота под try-on очков. Архитектура позволяет заменить mock-сервисы на реальные интеграции без переписывания бизнес-логики.
+Производственный Telegram-бот (aiogram v3) для подбора очков с интеграцией каталога через Google Sheets CSV.
 
 ## Требования
 
@@ -17,13 +17,32 @@ pip install -r requirements.txt
 
 ## Настройка окружения
 
-Скопируйте `.env.example` в `.env` и заполните значения:
+Создайте `.env` на основе следующего шаблона и заполните значения:
 
-```bash
-cp .env.example .env
+```dotenv
+BOT_TOKEN=123456:ABCDEF
+SHEET_CSV_URL=https://docs.google.com/spreadsheets/d/e/2PACX-1vRT2CXRcmWxmWHKADYfHTadlxBUZ-R7nEX7HcAqrBo_PzSKYrCln4HFeCUJTB2q_C7asfwO7AOLNiwh/pub?output=csv
+DAILY_TRY_LIMIT=7
+REMINDER_HOURS=24
+MOCK_TRYON=1
+UPLOADS_ROOT=./uploads
+RESULTS_ROOT=./results
+# Будущие интеграции:
+NANO_API_URL=
+NANO_API_KEY=
+DRIVE_PUBLIC_BASE_URL=
 ```
 
-Минимально необходимо указать `BOT_TOKEN`.
+`SHEET_CSV_URL` можно не указывать, если используете значение по умолчанию. Настройки загружаются через Pydantic и `python-dotenv`.
+
+## Как работает каталог
+
+- `GoogleSheetCatalog` подтягивает CSV по ссылке публикации Google Таблицы.
+- Ответ кэшируется на 60 секунд, чтобы не ддосить источник.
+- Для устойчивости реализован повтор запросов с экспоненциальной задержкой.
+- Каждая карточка преобразует Google Drive `view`-ссылку к прямому URL (`/uc?export=view&id=...`) перед отправкой пользователю.
+- Фильтрация идёт по колонке «Пол»; если моделей мало, добавляются «Унисекс».
+- Кнопки «Подробнее о модели» открывают ссылку из таблицы.
 
 ## Запуск
 
@@ -31,15 +50,7 @@ cp .env.example .env
 python -m app.main
 ```
 
-Бот использует long polling (aiogram v3). При первом запуске будут созданы локальные каталоги для загрузок и результатов.
-
-## Структура каталогов
-
-- `catalog/` — локальный каталог моделей (вместо Google Drive). Каждая модель хранится в подпапке с `meta.json`, `.keep` и опциональным `overlay.png`. При отсутствии превью сервис сам сгенерирует белый квадрат и сохранит рядом `thumb_auto.jpg`.
-- `uploads/` — пользовательские загрузки.
-- `results/` — сгенерированные изображения (mock try-on).
-
-Пример каталога: `catalog/male/25-34/normal/model-001/meta.json`.
+Бот использует long polling. При старте создаются директории `uploads/` и `results/`, а каталог очков подгружается из Google Sheets.
 
 ## Тесты
 
@@ -47,13 +58,15 @@ python -m app.main
 pytest
 ```
 
-## Реальные интеграции (TODO)
+## Архитектура
 
-- `app/services/drive_future.py` — заготовка под Google Drive API (публикация и выдача ссылок).
-- `app/services/tryon_nanobanana.py` — заготовка под NanoBanana API.
+- `app/services/catalog_google.py` — сервис каталога с кэшем и retry.
+- `app/services/repository.py` — SQLite-хранилище пользователей и дневных лимитов.
+- `app/services/tryon_mock.py` — mock-генерация результатов (белые изображения).
+- `app/fsm.py` — конечный автомат aiogram, который обращается к каталогу и управляет UX.
+- `app/utils/drive.py` — преобразование ссылок Google Drive.
 
-Реализации должны следовать существующим интерфейсам в `catalog_base.py`, `tryon_base.py`, `storage_base.py`.
+## План развития
 
-## Makefile
-
-Удобные команды запуска, тестов и линтинга находятся в `Makefile`.
+- Интеграция NanoBanana вместо mock-сервиса.
+- Подключение реального стора для выдачи превью пользователю.

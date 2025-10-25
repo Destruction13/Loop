@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 
 @dataclass(slots=True)
@@ -18,23 +17,16 @@ class FilterOptions:
 
 
 @dataclass(slots=True)
-class ModelMeta:
-    """Metadata for a catalog item."""
+class GlassModel:
+    """Catalog entry parsed from Google Sheets."""
 
+    unique_id: str
     title: str
-    product_url: str
-    shape: Optional[str] = None
-    brand: Optional[str] = None
-
-
-@dataclass(slots=True)
-class ModelItem:
-    """Catalog item representation."""
-
-    model_id: str
-    thumb_path: Path
-    overlay_path: Optional[Path]
-    meta: ModelMeta
+    model_code: str
+    site_url: str
+    img_user_url: str
+    img_nano_url: str
+    gender: Literal["Мужской", "Женский", "Унисекс"]
 
 
 @dataclass(slots=True)

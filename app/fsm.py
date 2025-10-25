@@ -13,22 +13,23 @@ from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
-from aiogram.types.input_file import FSInputFile
+from aiogram.types.input_file import FSInputFile, URLInputFile
 
 from app import messages_ru as msg
 from app.keyboards import (
     age_keyboard,
     gender_keyboard,
     limit_reached_keyboard,
-    models_keyboard,
+    model_card_keyboard,
+    more_models_keyboard,
     result_keyboard,
     retry_keyboard,
     start_keyboard,
     style_keyboard,
 )
 from app.logging_conf import EVENT_ID
-from app.models import FilterOptions, ModelItem
-from app.services.catalog_base import CatalogService
+from app.models import FilterOptions, GlassModel
+from app.services.catalog_base import CatalogError, CatalogService
 from app.services.repository import Repository
 from app.services.tryon_base import TryOnService
 from app.services.storage_base import StorageService
@@ -59,6 +60,15 @@ def setup_router(
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
 
+    def _catalog_gender(value: str) -> str:
+        mapping = {
+            "male": "Мужской",
+            "female": "Женский",
+            "unisex": "Унисекс",
+        }
+        normalized = (value or "").lower()
+        return mapping.get(normalized, "Унисекс")
+
     async def _ensure_filters(user_id: int, state: FSMContext) -> FilterOptions:
         data = await state.get_data()
         return FilterOptions(
@@ -68,28 +78,37 @@ def setup_router(
         )
 
     async def _send_models(message: Message, user_id: int, filters: FilterOptions, state: FSMContext) -> None:
-        models = await catalog.pick_four(user_id, filters)
-        model_ids: List[str] = []
+        profile = await repository.ensure_user(user_id)
+        seen_ids = set(profile.seen_models if profile else [])
+        gender = _catalog_gender(filters.gender)
+        try:
+            models = await catalog.pick_four(gender, seen_ids)
+        except CatalogError as exc:
+            logger.error("%s Failed to fetch catalog: %s", EVENT_ID["MODELS_SENT"], exc)
+            await message.answer(msg.CATALOG_TEMPORARILY_UNAVAILABLE)
+            await state.update_data(current_models=[])
+            return
+        if not models:
+            await message.answer(msg.CATALOG_TEMPORARILY_UNAVAILABLE)
+            await state.update_data(current_models=[])
+            return
+        await repository.add_seen_models(user_id, [model.unique_id for model in models])
+        await state.update_data(current_models=models)
         for model in models:
-            caption = f"{model.meta.title}\nБренд: {model.meta.brand or '—'}"
             try:
                 await message.answer_photo(
-                    photo=FSInputFile(path=str(model.thumb_path)),
-                    caption=caption,
+                    photo=URLInputFile(model.img_user_url),
+                    caption=model.title,
+                    reply_markup=model_card_keyboard(model.unique_id, model.title, model.site_url),
                 )
-                model_ids.append(model.model_id)
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "%s Failed to send model %s: %s",
                     EVENT_ID["MODELS_SENT"],
-                    model.model_id,
+                    model.unique_id,
                     exc,
                 )
-        if model_ids:
-            await message.answer(
-                "Выберите модель:", reply_markup=models_keyboard(model_ids)
-            )
-        await state.update_data(current_models=models)
+        await message.answer(msg.SHOWING_MODELS, reply_markup=more_models_keyboard())
         logger.info("%s Sent %s models", EVENT_ID["MODELS_SENT"], len(models))
 
     @router.message(CommandStart())
@@ -171,7 +190,7 @@ def setup_router(
             return
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
-        await message.answer(msg.SHOWING_MODELS)
+        await message.answer("Ищу свежие модели...")
         await _send_models(message, user_id, filters, state)
         logger.info("%s Photo received from %s", EVENT_ID["PHOTO_RECEIVED"], user_id)
 
@@ -182,12 +201,12 @@ def setup_router(
         await _send_models(callback.message, user_id, filters, state)
         await callback.answer()
 
-    @router.callback_query(StateFilter(TryOnStates.SHOW_RECS), F.data.startswith("choose_"))
+    @router.callback_query(StateFilter(TryOnStates.SHOW_RECS), F.data.startswith("pick|"))
     async def choose_model(callback: CallbackQuery, state: FSMContext) -> None:
-        model_id = callback.data.replace("choose_", "")
+        model_id = callback.data.replace("pick|", "")
         data = await state.get_data()
-        models_data: List[ModelItem] = data.get("current_models", [])
-        selected = next((model for model in models_data if model.model_id == model_id), None)
+        models_data: List[GlassModel] = data.get("current_models", [])
+        selected = next((model for model in models_data if model.unique_id == model_id), None)
         if not selected:
             await callback.answer("Модель недоступна", show_alert=True)
             return
@@ -203,7 +222,7 @@ def setup_router(
         await callback.answer()
         await _perform_generation(callback.message, state, selected)
 
-    async def _perform_generation(message: Message, state: FSMContext, model: ModelItem) -> None:
+    async def _perform_generation(message: Message, state: FSMContext, model: GlassModel) -> None:
         user_id = message.chat.id
         data = await state.get_data()
         upload_path = data.get("upload")
@@ -217,7 +236,7 @@ def setup_router(
                 user_id=user_id,
                 session_id=session_id,
                 input_photo=Path(upload_path),
-                overlays=[model.overlay_path],
+                overlays=[],
             )
         except Exception as exc:  # noqa: BLE001
             logger.error(
@@ -234,7 +253,7 @@ def setup_router(
         ref_link = build_ref_link(bot_username, user_id)
         await message.answer(
             "Поделиться ссылкой: " + ref_link,
-            reply_markup=result_keyboard(model.meta.product_url, ref_link),
+            reply_markup=result_keyboard(model.site_url, ref_link),
         )
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
@@ -248,7 +267,7 @@ def setup_router(
         user_id = callback.from_user.id
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
-        await callback.message.answer(msg.SHOWING_MODELS)
+        await callback.message.answer("Ищу свежие модели...")
         await _send_models(callback.message, user_id, filters, state)
         await callback.answer()
 
@@ -271,14 +290,13 @@ def setup_router(
     @router.callback_query(StateFilter(TryOnStates.ERROR), F.data == "retry")
     async def retry(callback: CallbackQuery, state: FSMContext) -> None:
         data = await state.get_data()
-        selected: Optional[ModelItem] = data.get("selected_model")
+        selected: Optional[GlassModel] = data.get("selected_model")
         if not selected:
             await callback.answer("Нет выбранной модели", show_alert=True)
             return
-        model = selected
         await state.set_state(TryOnStates.GENERATING)
         await callback.message.answer(msg.GENERATING)
         await callback.answer()
-        await _perform_generation(callback.message, state, model)
+        await _perform_generation(callback.message, state, selected)
 
     return router
