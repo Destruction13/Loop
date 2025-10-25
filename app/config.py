@@ -17,13 +17,21 @@ DEFAULT_SHEET_URL = (
 
 @dataclass(slots=True)
 class CollageConfig:
-    """Rendering options for collage previews."""
+    """Rendering options for two-up collage previews."""
 
-    enabled: bool
-    max_width: int
-    padding_px: int
-    cache_ttl_sec: int
-    draw_divider: bool
+    width: int
+    height: int
+    gap: int
+    padding: int
+    background: str
+    jpeg_quality: int
+    fit_mode: str
+    sharpen: float
+    divider: int
+    divider_color: str
+    divider_radius: int
+    cell_border: int
+    cell_border_color: str
 
 
 @dataclass(slots=True)
@@ -72,6 +80,22 @@ def _as_int(value: Optional[str], fallback: int) -> int:
         return fallback
 
 
+def _as_float(value: Optional[str], fallback: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _as_fit_mode(value: Optional[str], fallback: str) -> str:
+    if not value:
+        return fallback
+    normalized = value.strip().lower()
+    if normalized in {"contain", "cover"}:
+        return normalized
+    return fallback
+
+
 def _as_path(value: Optional[str], fallback: str) -> Path:
     return Path(value or fallback)
 
@@ -85,11 +109,20 @@ def load_config(env_file: str | None = None) -> Config:
         load_dotenv()
 
     collage = CollageConfig(
-        enabled=_as_bool(_get("COLLAGE_ENABLED", "1"), True),
-        max_width=_as_int(_get("COLLAGE_MAX_WIDTH", "1280"), 1280),
-        padding_px=_as_int(_get("COLLAGE_PADDING_PX", "20"), 20),
-        cache_ttl_sec=_as_int(_get("COLLAGE_CACHE_TTL_SEC", "300"), 300),
-        draw_divider=_as_bool(_get("COLLAGE_DRAW_DIVIDER", "1"), True),
+        width=_as_int(_get("COLLAGE_WIDTH", "1280"), 1280),
+        height=_as_int(_get("COLLAGE_HEIGHT", "640"), 640),
+        gap=_as_int(_get("COLLAGE_GAP", "16"), 16),
+        padding=_as_int(_get("COLLAGE_PADDING", "24"), 24),
+        background=_get("COLLAGE_BG", "#FFFFFF") or "#FFFFFF",
+        jpeg_quality=_as_int(_get("COLLAGE_JPEG_QUALITY", "90"), 90),
+        fit_mode=_as_fit_mode(_get("COLLAGE_FIT_MODE", "contain"), "contain"),
+        sharpen=_as_float(_get("COLLAGE_SHARPEN", "0.0"), 0.0),
+        divider=_as_int(_get("COLLAGE_DIVIDER", "6"), 6),
+        divider_color=_get("COLLAGE_DIVIDER_COLOR", "#E6E9EF") or "#E6E9EF",
+        divider_radius=_as_int(_get("COLLAGE_DIVIDER_RADIUS", "0"), 0),
+        cell_border=_as_int(_get("COLLAGE_CELL_BORDER", "0"), 0),
+        cell_border_color=_get("COLLAGE_CELL_BORDER_COLOR", "#D7DBE4")
+        or "#D7DBE4",
     )
 
     return Config(

@@ -3,20 +3,26 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Awaitable, Callable, List, Optional, Sequence
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardRemove,
+)
 from aiogram.types.input_file import BufferedInputFile, FSInputFile, URLInputFile
 
 from app.keyboards import (
@@ -31,7 +37,12 @@ from app.keyboards import (
 from app.logging_conf import EVENT_ID
 from app.models import FilterOptions, GlassModel
 from app.services.catalog_base import CatalogError, CatalogService
-from app.services.collage import CollageResult, CollageService
+from app.config import CollageConfig
+from app.services.collage import (
+    CollageProcessingError,
+    CollageSourceUnavailable,
+    build_two_up_collage,
+)
 from app.services.repository import Repository
 from app.services.storage_base import StorageService
 from app.services.tryon_base import TryOnService
@@ -96,7 +107,8 @@ def setup_router(
     catalog: CatalogService,
     tryon: TryOnService,
     storage: StorageService,
-    collage: CollageService,
+    collage_config: CollageConfig,
+    collage_builder: Callable[[str | None, str | None, CollageConfig], Awaitable[io.BytesIO]] = build_two_up_collage,
     reminder_hours: int,
     selection_button_title_max: int,
     landing_url: str,
@@ -148,13 +160,9 @@ def setup_router(
         pairs = pair_models(batch)
         total_pairs = len(pairs)
         for index, pair in enumerate(pairs, start=1):
-            caption = (
-                msg.PAIR_CAPTION_TEMPLATE.format(current=index, total=total_pairs)
-                if total_pairs > 1
-                else ""
-            )
+            label_text = msg.PAIR_CAPTION_TEMPLATE.format(current=index, total=total_pairs)
             try:
-                await _send_pair_message(message, pair, caption)
+                await _send_pair_message(message, pair, label_text)
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "%s Failed to send model pair %s: %s",
@@ -164,51 +172,68 @@ def setup_router(
                 )
 
     async def _send_pair_message(
-        message: Message, pair: tuple[GlassModel, ...], caption: str
+        message: Message, pair: tuple[GlassModel, ...], label_text: str
     ) -> None:
-        caption_to_use = caption or None
-        collage_result: CollageResult | None = None
-        if collage.enabled:
-            left_url = pair[0].img_user_url if len(pair) > 0 else None
-            right_url = pair[1].img_user_url if len(pair) > 1 else None
-            collage_result = await collage.build_collage(left_url, right_url)
-        if collage_result and collage_result.included_positions:
-            included_models = [pair[pos] for pos in collage_result.included_positions]
-            keyboard = pair_selection_keyboard(
-                [
-                    (item.unique_id, item.title)
-                    for item in included_models
-                ],
-                max_title_length=selection_button_title_max,
-            )
-            filename = f"collage-{uuid.uuid4().hex}.jpg"
-            collage_caption = caption_to_use if 0 in collage_result.included_positions else None
-            await message.answer_photo(
-                photo=BufferedInputFile(collage_result.image_bytes, filename=filename),
-                caption=collage_caption,
+        keyboard = pair_selection_keyboard(
+            [(item.unique_id, item.title) for item in pair],
+            max_title_length=selection_button_title_max,
+        )
+        left_url = pair[0].img_user_url if len(pair) > 0 else None
+        right_url = pair[1].img_user_url if len(pair) > 1 else None
+        try:
+            buffer = await collage_builder(left_url, right_url, collage_config)
+        except CollageSourceUnavailable:
+            await message.answer(
+                f"{label_text}\n\n{msg.COLLAGE_IMAGES_UNAVAILABLE}",
                 reply_markup=keyboard,
             )
             return
-
-        for offset, item in enumerate(pair):
-            await _send_single_model(
-                message,
-                item,
-                caption if offset == 0 else "",
+        except CollageProcessingError as exc:
+            logger.warning(
+                "Collage processing failed for models %s: %s",
+                [model.unique_id for model in pair],
+                exc,
             )
+            await _send_pair_as_photos(
+                message, pair, label_text=label_text, reply_markup=keyboard
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Unexpected collage error for models %s: %s",
+                [model.unique_id for model in pair],
+                exc,
+            )
+            await _send_pair_as_photos(
+                message, pair, label_text=label_text, reply_markup=keyboard
+            )
+            return
 
-    async def _send_single_model(
-        message: Message, model: GlassModel, caption: str
-    ) -> None:
-        keyboard = pair_selection_keyboard(
-            [(model.unique_id, model.title)],
-            max_title_length=selection_button_title_max,
-        )
+        filename = f"collage-{uuid.uuid4().hex}.jpg"
+        collage_bytes = buffer.getvalue()
+        buffer.close()
         await message.answer_photo(
-            photo=URLInputFile(model.img_user_url),
-            caption=caption or None,
+            photo=BufferedInputFile(collage_bytes, filename=filename),
+            caption=label_text,
             reply_markup=keyboard,
         )
+
+    async def _send_pair_as_photos(
+        message: Message,
+        pair: tuple[GlassModel, ...],
+        *,
+        label_text: str,
+        reply_markup: InlineKeyboardMarkup,
+    ) -> None:
+        last_index = len(pair) - 1
+        for index, item in enumerate(pair):
+            caption = label_text if index == last_index else None
+            markup = reply_markup if index == last_index else None
+            await message.answer_photo(
+                photo=URLInputFile(item.img_user_url),
+                caption=caption,
+                reply_markup=markup,
+            )
 
     async def _delete_state_message(message: Message, state: FSMContext, key: str) -> None:
         data = await state.get_data()
@@ -301,9 +326,9 @@ def setup_router(
         await _send_models(message, user_id, filters, state)
         logger.info("%s Photo received from %s", EVENT_ID["PHOTO_RECEIVED"], user_id)
 
-    @router.callback_query(StateFilter(TryOnStates.SHOW_RECS), F.data.startswith("pick|"))
+    @router.callback_query(StateFilter(TryOnStates.SHOW_RECS), F.data.startswith("pick:"))
     async def choose_model(callback: CallbackQuery, state: FSMContext) -> None:
-        model_id = callback.data.replace("pick|", "")
+        model_id = callback.data.replace("pick:", "", 1)
         data = await state.get_data()
         models_data: List[GlassModel] = data.get("current_models", [])
         selected = next((model for model in models_data if model.unique_id == model_id), None)
