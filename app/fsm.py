@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -34,7 +33,7 @@ from app.keyboards import (
 from app.logging_conf import EVENT_ID
 from app.models import FilterOptions, GlassModel
 from app.services.catalog_base import CatalogError, CatalogService
-from app.services.collage import CollageItem, CollageResult, CollageService
+from app.services.collage import CollageResult, CollageService
 from app.services.repository import Repository
 from app.services.tryon_base import TryOnService
 from app.services.storage_base import StorageService
@@ -53,24 +52,10 @@ class TryOnStates(StatesGroup):
     ERROR = State()
 
 
-@dataclass(slots=True)
-class IndexedModel:
-    """Model entry with a stable index within a batch."""
+def pair_models(models: Sequence[GlassModel]) -> list[tuple[GlassModel, ...]]:
+    """Split models into consecutive pairs preserving order."""
 
-    model: GlassModel
-    index: int
-
-
-def build_indexed_batch(models: Sequence[GlassModel]) -> list[IndexedModel]:
-    """Assign stable indices starting from 1 to the provided models."""
-
-    return [IndexedModel(model=model, index=offset + 1) for offset, model in enumerate(models)]
-
-
-def pair_indexed_models(batch: Sequence[IndexedModel]) -> list[tuple[IndexedModel, ...]]:
-    """Split indexed models into pairs preserving order."""
-
-    return [tuple(batch[i : i + 2]) for i in range(0, len(batch), 2)]
+    return [tuple(models[i : i + 2]) for i in range(0, len(models), 2)]
 
 
 def setup_router(
@@ -81,11 +66,9 @@ def setup_router(
     collage: CollageService,
     reminder_hours: int,
     selection_button_title_max: int,
-    selection_button_index_style: str,
 ) -> Router:
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
-    button_index_style = (selection_button_index_style or "emoji").lower()
 
     def _catalog_gender(value: str) -> str:
         mapping = {
@@ -122,13 +105,13 @@ def setup_router(
             await state.update_data(current_models=[])
             return
         await repository.add_seen_models(user_id, [model.unique_id for model in models])
-        batch = build_indexed_batch(models)
-        await state.update_data(current_models=models, last_batch=batch)
+        batch = list(models)
+        await state.update_data(current_models=batch, last_batch=batch)
         await _send_model_pairs(message, batch)
         logger.info("%s Sent %s models", EVENT_ID["MODELS_SENT"], len(models))
 
-    async def _send_model_pairs(message: Message, batch: list[IndexedModel]) -> None:
-        pairs = pair_indexed_models(batch)
+    async def _send_model_pairs(message: Message, batch: list[GlassModel]) -> None:
+        pairs = pair_models(batch)
         total_pairs = len(pairs)
         for index, pair in enumerate(pairs, start=1):
             caption = f"Подборка {index}/{total_pairs}" if total_pairs > 1 else ""
@@ -143,24 +126,21 @@ def setup_router(
                 )
 
     async def _send_pair_message(
-        message: Message, pair: tuple[IndexedModel, ...], caption: str
+        message: Message, pair: tuple[GlassModel, ...], caption: str
     ) -> None:
         caption_to_use = caption or None
         collage_result: CollageResult | None = None
         if collage.enabled:
-            collage_items = [
-                CollageItem(url=item.model.img_user_url, display_index=item.index)
-                for item in pair
-            ]
-            collage_result = await collage.build_collage(collage_items)
+            left_url = pair[0].img_user_url if len(pair) > 0 else None
+            right_url = pair[1].img_user_url if len(pair) > 1 else None
+            collage_result = await collage.build_collage(left_url, right_url)
         if collage_result and collage_result.included_positions:
             included_models = [pair[pos] for pos in collage_result.included_positions]
             keyboard = pair_selection_keyboard(
                 [
-                    (item.index, item.model.unique_id, item.model.title)
+                    (item.unique_id, item.title)
                     for item in included_models
                 ],
-                index_style=button_index_style,
                 max_title_length=selection_button_title_max,
             )
             filename = f"collage-{uuid.uuid4().hex}.jpg"
@@ -180,15 +160,14 @@ def setup_router(
             )
 
     async def _send_single_model(
-        message: Message, indexed: IndexedModel, caption: str
+        message: Message, model: GlassModel, caption: str
     ) -> None:
         keyboard = pair_selection_keyboard(
-            [(indexed.index, indexed.model.unique_id, indexed.model.title)],
-            index_style=button_index_style,
+            [(model.unique_id, model.title)],
             max_title_length=selection_button_title_max,
         )
         await message.answer_photo(
-            photo=URLInputFile(indexed.model.img_user_url),
+            photo=URLInputFile(model.img_user_url),
             caption=caption or None,
             reply_markup=keyboard,
         )
@@ -281,7 +260,6 @@ def setup_router(
         model_id = callback.data.replace("pick|", "")
         data = await state.get_data()
         models_data: List[GlassModel] = data.get("current_models", [])
-        batch: List[IndexedModel] = data.get("last_batch", [])
         selected = next((model for model in models_data if model.unique_id == model_id), None)
         if not selected:
             await callback.answer("Модель недоступна", show_alert=True)
@@ -292,13 +270,8 @@ def setup_router(
             await callback.message.answer(msg.LIMIT_REACHED, reply_markup=limit_reached_keyboard())
             await callback.answer()
             return
-        selected_index = next(
-            (item.index for item in batch if item.model.unique_id == model_id),
-            None,
-        )
         await state.update_data(
             selected_model=selected,
-            selected_index=selected_index,
             last_batch=[],
         )
         await state.set_state(TryOnStates.GENERATING)

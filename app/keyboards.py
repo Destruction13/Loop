@@ -7,14 +7,6 @@ from typing import Sequence
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-_EMOJI_DIGITS = {
-    1: "1️⃣",
-    2: "2️⃣",
-    3: "3️⃣",
-    4: "4️⃣",
-}
-
-
 def start_keyboard() -> InlineKeyboardMarkup:
     """Keyboard for the start menu."""
 
@@ -68,10 +60,9 @@ def style_keyboard() -> InlineKeyboardMarkup:
 
 
 def pair_selection_keyboard(
-    models: Sequence[tuple[int, str, str]],
+    models: Sequence[tuple[str, str]],
     *,
-    index_style: str = "emoji",
-    max_title_length: int = 24,
+    max_title_length: int = 28,
 ) -> InlineKeyboardMarkup:
     """Keyboard for selecting one of the models in a pair."""
 
@@ -79,17 +70,11 @@ def pair_selection_keyboard(
         return InlineKeyboardMarkup(inline_keyboard=[])
 
     buttons: list[InlineKeyboardButton] = []
-    normalized_style = (index_style or "emoji").lower()
-    for ordinal, unique_id, title in models:
-        prefix = _prefix_for_index(ordinal, normalized_style)
+    for unique_id, title in models:
         truncated = _truncate_title(title, max_title_length)
-        if prefix:
-            text = f"{prefix} Выбрать: {truncated}"
-        else:
-            text = f"Выбрать: {truncated}"
         buttons.append(
             InlineKeyboardButton(
-                text=text,
+                text=truncated,
                 callback_data=f"pick|{unique_id}",
             )
         )
@@ -102,17 +87,6 @@ def _truncate_title(title: str, max_length: int) -> str:
     if max_length <= 1:
         return "…"
     return title[: max_length - 1] + "…"
-
-
-def _prefix_for_index(index: int, style: str) -> str:
-    if style == "none":
-        return ""
-    if style == "emoji":
-        return _EMOJI_DIGITS.get(index, f"{index}️⃣")
-    # treat both ascii and legacy numeric values as bracketed numbers
-    if style in {"ascii", "numeric"}:
-        return f"[{index}]"
-    return f"[{index}]"
 
 
 def generation_result_keyboard(site_url: str, remaining: int) -> InlineKeyboardMarkup:
