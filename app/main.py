@@ -11,7 +11,7 @@ from aiogram.enums import ParseMode
 from app import messages_ru as msg
 from app.config import load_settings
 from app.fsm import setup_router
-from app.keyboards import start_keyboard
+from app.keyboards import reminder_keyboard, start_keyboard
 from app.logging_conf import EVENT_ID, setup_logging
 from app.services.catalog_google import GoogleCatalogConfig, GoogleSheetCatalog
 from app.services.collage import CollageService
@@ -68,6 +68,8 @@ async def main() -> None:
         collage=collage_service,
         reminder_hours=settings.reminder_hours,
         selection_button_title_max=settings.button_title_max,
+        landing_url=str(settings.landing_url),
+        promo_template=settings.promo_template,
     )
     dp.include_router(router)
 
@@ -75,7 +77,7 @@ async def main() -> None:
         bot=bot,
         repository=repository,
         message_text=msg.REMINDER_MESSAGE,
-        keyboard_factory=start_keyboard,
+        keyboard_factory=reminder_keyboard,
         interval_seconds=60,
     )
     scheduler.start()

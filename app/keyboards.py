@@ -6,6 +6,8 @@ from typing import Sequence
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from app import messages_ru as msg
+
 
 def start_keyboard() -> InlineKeyboardMarkup:
     """Keyboard for the start menu."""
@@ -30,31 +32,17 @@ def gender_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def age_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard for selecting age bucket."""
-
-    ages = [
-        ("13–17", "age_13-17"),
-        ("18–24", "age_18-24"),
-        ("25–34", "age_25-34"),
-        ("35–44", "age_35-44"),
-        ("45–55", "age_45-55"),
-    ]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=label, callback_data=data)] for label, data in ages
-        ]
-    )
-
-
-def style_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard for selecting style preference."""
+def attach_photo_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard prompting the user to upload a photo."""
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Обычный", callback_data="style_normal")],
-            [InlineKeyboardButton(text="Необычный", callback_data="style_bold")],
-            [InlineKeyboardButton(text="Пропустить", callback_data="style_skip")],
+            [
+                InlineKeyboardButton(
+                    text=msg.ATTACH_PHOTO_BUTTON,
+                    callback_data="attach_photo",
+                )
+            ]
         ]
     )
 
@@ -92,25 +80,56 @@ def _truncate_title(title: str, max_length: int) -> str:
 def generation_result_keyboard(site_url: str, remaining: int) -> InlineKeyboardMarkup:
     """Keyboard attached to the generation result message."""
 
-    buttons = [InlineKeyboardButton(text="Подробнее о модели", url=site_url)]
+    buttons = [InlineKeyboardButton(text=msg.DETAILS_BUTTON, url=site_url)]
     if remaining > 0:
         buttons.append(
             InlineKeyboardButton(
-                text=f"Ещё варианты (осталось {remaining})",
+                text=f"{msg.MORE_VARIANTS_BUTTON} (осталось {remaining})",
                 callback_data=f"more|{remaining}",
             )
         )
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
-def limit_reached_keyboard() -> InlineKeyboardMarkup:
+def first_generation_keyboard(site_url: str, remaining: int) -> InlineKeyboardMarkup:
+    """Keyboard shown together with the first generation message."""
+
+    buttons = [InlineKeyboardButton(text=msg.DETAILS_BUTTON, url=site_url)]
+    if remaining > 0:
+        buttons.append(
+            InlineKeyboardButton(
+                text=f"{msg.MORE_VARIANTS_BUTTON} (осталось {remaining})",
+                callback_data=f"more|{remaining}",
+            )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+def followup_photo_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard for prompting additional photo uploads."""
+
+    return attach_photo_keyboard()
+
+
+def limit_reached_keyboard(landing_url: str) -> InlineKeyboardMarkup:
     """Keyboard displayed when daily limit is reached."""
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Получить промокод", callback_data="limit_promo")],
-            [InlineKeyboardButton(text="Записаться", url="https://example.com/booking")],
-            [InlineKeyboardButton(text="Вернуться завтра", callback_data="limit_remind")],
+            [InlineKeyboardButton(text=msg.BOOKING_BUTTON, url=landing_url)],
+            [InlineKeyboardButton(text=msg.PROMO_BUTTON, callback_data="limit_promo")],
+            [InlineKeyboardButton(text=msg.REMIND_LATER_BUTTON, callback_data="limit_remind")],
+        ]
+    )
+
+
+def promo_keyboard(landing_url: str) -> InlineKeyboardMarkup:
+    """Keyboard attached to the promo code message."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=msg.BOOKING_BUTTON, url=landing_url)],
+            [InlineKeyboardButton(text=msg.REMIND_LATER_BUTTON, callback_data="limit_remind")],
         ]
     )
 
@@ -120,4 +139,14 @@ def retry_keyboard() -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Повторить генерацию", callback_data="retry")]]
+    )
+
+
+def reminder_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard attached to reminder messages."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=msg.REMINDER_PROMPT_BUTTON, callback_data="reminder_go")]
+        ]
     )

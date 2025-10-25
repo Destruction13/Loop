@@ -12,8 +12,6 @@ class FilterOptions:
     """User-selected filters for catalog lookup."""
 
     gender: str
-    age_bucket: str
-    style: str
 
 
 @dataclass(slots=True)

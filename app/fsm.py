@@ -1,55 +1,89 @@
+
 """FSM definitions and handler registration."""
 
 from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from aiogram import Router, F
+from aiogram import F, Router
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
-from aiogram.types.input_file import (
-    BufferedInputFile,
-    FSInputFile,
-    URLInputFile,
-)
+from aiogram.types.input_file import BufferedInputFile, FSInputFile, URLInputFile
 
 from app import messages_ru as msg
 from app.keyboards import (
-    age_keyboard,
+    attach_photo_keyboard,
+    first_generation_keyboard,
+    followup_photo_keyboard,
     gender_keyboard,
     generation_result_keyboard,
     limit_reached_keyboard,
     pair_selection_keyboard,
+    promo_keyboard,
     retry_keyboard,
     start_keyboard,
-    style_keyboard,
 )
 from app.logging_conf import EVENT_ID
 from app.models import FilterOptions, GlassModel
 from app.services.catalog_base import CatalogError, CatalogService
 from app.services.collage import CollageResult, CollageService
 from app.services.repository import Repository
-from app.services.tryon_base import TryOnService
 from app.services.storage_base import StorageService
+from app.services.tryon_base import TryOnService
 
 
 class TryOnStates(StatesGroup):
     START = State()
     FOR_WHO = State()
-    AGE = State()
-    STYLE = State()
-    WAIT_PHOTO = State()
+    AWAITING_PHOTO = State()
     SHOW_RECS = State()
     GENERATING = State()
     RESULT = State()
-    LIMIT_REACHED = State()
+    DAILY_LIMIT_REACHED = State()
     ERROR = State()
+
+
+class GenerationOutcome(Enum):
+    """Post-generation follow-up decision."""
+
+    FIRST = "first"
+    FOLLOWUP = "followup"
+    LIMIT = "limit"
+
+
+@dataclass(slots=True)
+class GenerationPlan:
+    """Information about the follow-up flow after generation."""
+
+    outcome: GenerationOutcome
+    remaining: int
+
+
+def resolve_generation_followup(
+    *, first_generated_today: bool, remaining: int
+) -> GenerationPlan:
+    """Resolve which follow-up path to use after generation."""
+
+    if remaining <= 0:
+        return GenerationPlan(outcome=GenerationOutcome.LIMIT, remaining=0)
+    outcome = GenerationOutcome.FIRST if first_generated_today else GenerationOutcome.FOLLOWUP
+    return GenerationPlan(outcome=outcome, remaining=remaining)
+
+
+def next_first_flag_value(current_flag: bool, outcome: GenerationOutcome) -> bool:
+    """Return the next value for the first-generation flag."""
+
+    if current_flag and outcome in {GenerationOutcome.FIRST, GenerationOutcome.LIMIT}:
+        return False
+    return current_flag
 
 
 def pair_models(models: Sequence[GlassModel]) -> list[tuple[GlassModel, ...]]:
@@ -59,6 +93,7 @@ def pair_models(models: Sequence[GlassModel]) -> list[tuple[GlassModel, ...]]:
 
 
 def setup_router(
+    *,
     repository: Repository,
     catalog: CatalogService,
     tryon: TryOnService,
@@ -66,6 +101,8 @@ def setup_router(
     collage: CollageService,
     reminder_hours: int,
     selection_button_title_max: int,
+    landing_url: str,
+    promo_template: str,
 ) -> Router:
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
@@ -81,11 +118,7 @@ def setup_router(
 
     async def _ensure_filters(user_id: int, state: FSMContext) -> FilterOptions:
         data = await state.get_data()
-        return FilterOptions(
-            gender=data.get("gender", "unisex"),
-            age_bucket=data.get("age", "18-24"),
-            style=data.get("style", "normal"),
-        )
+        return FilterOptions(gender=data.get("gender", "unisex"))
 
     async def _send_models(
         message: Message, user_id: int, filters: FilterOptions, state: FSMContext
@@ -204,37 +237,29 @@ def setup_router(
     async def select_gender(callback: CallbackQuery, state: FSMContext) -> None:
         gender = callback.data.replace("gender_", "")
         await repository.update_filters(callback.from_user.id, gender=gender)
-        await state.update_data(gender=gender)
-        await state.set_state(TryOnStates.AGE)
-        await callback.message.edit_text(msg.FILTER_AGE, reply_markup=age_keyboard())
+        await state.update_data(gender=gender, first_generated_today=True)
+        await state.set_state(TryOnStates.AWAITING_PHOTO)
+        await callback.message.edit_text(
+            msg.PHOTO_INSTRUCTIONS,
+            reply_markup=attach_photo_keyboard(),
+        )
         await callback.answer()
         logger.info("%s Gender selected %s", EVENT_ID["FILTER_SELECTED"], gender)
 
-    @router.callback_query(StateFilter(TryOnStates.AGE))
-    async def select_age(callback: CallbackQuery, state: FSMContext) -> None:
-        age = callback.data.replace("age_", "")
-        await repository.update_filters(callback.from_user.id, age_bucket=age)
-        await state.update_data(age=age)
-        await state.set_state(TryOnStates.STYLE)
-        await callback.message.edit_text(msg.FILTER_STYLE, reply_markup=style_keyboard())
+    @router.callback_query(F.data == "attach_photo")
+    async def request_photo(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(TryOnStates.AWAITING_PHOTO)
+        await callback.message.answer(
+            msg.PHOTO_INSTRUCTIONS,
+            reply_markup=attach_photo_keyboard(),
+        )
         await callback.answer()
 
-    @router.callback_query(StateFilter(TryOnStates.STYLE))
-    async def select_style(callback: CallbackQuery, state: FSMContext) -> None:
-        style = callback.data.replace("style_", "")
-        if style == "skip":
-            style = "normal"
-        await repository.update_filters(callback.from_user.id, style=style)
-        await state.update_data(style=style)
-        await state.set_state(TryOnStates.WAIT_PHOTO)
-        await callback.message.edit_text(msg.ASK_PHOTO)
-        await callback.answer()
-
-    @router.message(StateFilter(TryOnStates.WAIT_PHOTO), ~F.photo)
+    @router.message(StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT), ~F.photo)
     async def reject_non_photo(message: Message) -> None:
         await message.answer(msg.NOT_PHOTO)
 
-    @router.message(StateFilter(TryOnStates.WAIT_PHOTO), F.photo)
+    @router.message(StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT), F.photo)
     async def accept_photo(message: Message, state: FSMContext) -> None:
         user_id = message.from_user.id
         photo = message.photo[-1]
@@ -242,16 +267,21 @@ def setup_router(
         path = await storage.allocate_upload_path(user_id, filename)
         await message.bot.download(photo, destination=path)
         await state.update_data(upload=str(path))
-        await repository.ensure_daily_reset(user_id)
+        profile = await repository.ensure_daily_reset(user_id)
+        if profile.daily_used == 0:
+            await state.update_data(first_generated_today=True)
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
-            await state.set_state(TryOnStates.LIMIT_REACHED)
-            await message.answer(msg.LIMIT_REACHED, reply_markup=limit_reached_keyboard())
+            await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
+            await message.answer(
+                msg.LIMIT_EXHAUSTED_MESSAGE,
+                reply_markup=limit_reached_keyboard(landing_url),
+            )
             logger.info("%s Limit reached for user %s", EVENT_ID["LIMIT_REACHED"], user_id)
             return
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
-        await message.answer("Ищу свежие модели...")
+        await message.answer(msg.LOOKING_FOR_MODELS)
         await _send_models(message, user_id, filters, state)
         logger.info("%s Photo received from %s", EVENT_ID["PHOTO_RECEIVED"], user_id)
 
@@ -266,14 +296,14 @@ def setup_router(
             return
         remaining = await repository.remaining_tries(callback.from_user.id)
         if remaining <= 0:
-            await state.set_state(TryOnStates.LIMIT_REACHED)
-            await callback.message.answer(msg.LIMIT_REACHED, reply_markup=limit_reached_keyboard())
+            await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
+            await callback.message.answer(
+                msg.LIMIT_EXHAUSTED_MESSAGE,
+                reply_markup=limit_reached_keyboard(landing_url),
+            )
             await callback.answer()
             return
-        await state.update_data(
-            selected_model=selected,
-            last_batch=[],
-        )
+        await state.update_data(selected_model=selected, last_batch=[])
         await state.set_state(TryOnStates.GENERATING)
         await callback.message.answer(msg.GENERATING)
         await callback.answer()
@@ -282,17 +312,17 @@ def setup_router(
     async def _perform_generation(message: Message, state: FSMContext, model: GlassModel) -> None:
         user_id = message.chat.id
         data = await state.get_data()
-        upload_path = data.get("upload")
-        if not upload_path:
+        upload_value = data.get("upload")
+        if not upload_value:
             await message.answer(msg.GENERATION_FAILED, reply_markup=retry_keyboard())
             await state.set_state(TryOnStates.ERROR)
             return
-        session_id = uuid.uuid4().hex
+        upload_path = Path(upload_value)
         try:
             results = await tryon.generate(
                 user_id=user_id,
-                session_id=session_id,
-                input_photo=Path(upload_path),
+                session_id=uuid.uuid4().hex,
+                input_photo=upload_path,
                 overlays=[],
             )
         except Exception as exc:  # noqa: BLE001
@@ -302,24 +332,47 @@ def setup_router(
             await message.answer(msg.GENERATION_FAILED, reply_markup=retry_keyboard())
             await state.set_state(TryOnStates.ERROR)
             return
-        await repository.inc_used_on_success(user_id)
-        await state.set_state(TryOnStates.RESULT)
         if not results:
             await message.answer(msg.GENERATION_FAILED, reply_markup=retry_keyboard())
             await state.set_state(TryOnStates.ERROR)
             return
         primary_result = results[0]
+        await repository.inc_used_on_success(user_id)
         remaining = await repository.remaining_tries(user_id)
-        keyboard = generation_result_keyboard(model.site_url, remaining)
+        plan = resolve_generation_followup(
+            first_generated_today=data.get("first_generated_today", True),
+            remaining=remaining,
+        )
         await message.answer_photo(
             FSInputFile(path=str(primary_result)),
-            caption=msg.GENERATION_SUCCESS,
-            reply_markup=keyboard,
+            caption=msg.GENERATION_CAPTION,
+            reply_markup=generation_result_keyboard(model.site_url, plan.remaining),
         )
-        if remaining <= 0:
-            await state.set_state(TryOnStates.LIMIT_REACHED)
-            await message.answer(msg.LIMIT_REACHED, reply_markup=limit_reached_keyboard())
-            logger.info("%s Limit reached post generation %s", EVENT_ID["LIMIT_REACHED"], user_id)
+        new_flag = next_first_flag_value(
+            data.get("first_generated_today", True), plan.outcome
+        )
+        await state.update_data(first_generated_today=new_flag)
+        if plan.outcome is GenerationOutcome.FIRST:
+            await message.answer(
+                msg.FIRST_GENERATION_MESSAGE,
+                reply_markup=first_generation_keyboard(model.site_url, plan.remaining),
+            )
+        elif plan.outcome is GenerationOutcome.FOLLOWUP:
+            await message.answer(
+                msg.FOLLOWUP_GENERATION_MESSAGE,
+                reply_markup=followup_photo_keyboard(),
+            )
+        if plan.outcome is GenerationOutcome.LIMIT:
+            await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
+            await message.answer(
+                msg.LIMIT_EXHAUSTED_MESSAGE,
+                reply_markup=limit_reached_keyboard(landing_url),
+            )
+            logger.info(
+                "%s Limit reached post generation %s", EVENT_ID["LIMIT_REACHED"], user_id
+            )
+        else:
+            await state.set_state(TryOnStates.RESULT)
         logger.info("%s Generation succeeded for %s", EVENT_ID["GENERATION_SUCCESS"], user_id)
 
     @router.callback_query(StateFilter(TryOnStates.RESULT), F.data.startswith("more|"))
@@ -327,31 +380,57 @@ def setup_router(
         user_id = callback.from_user.id
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
-            await state.set_state(TryOnStates.LIMIT_REACHED)
-            await callback.message.answer(msg.LIMIT_REACHED, reply_markup=limit_reached_keyboard())
+            await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
+            await callback.message.answer(
+                msg.LIMIT_EXHAUSTED_MESSAGE,
+                reply_markup=limit_reached_keyboard(landing_url),
+            )
             await callback.answer()
             return
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
-        await callback.message.answer("Ищу свежие модели...")
+        await callback.message.answer(msg.LOOKING_FOR_MODELS)
         await _send_models(callback.message, user_id, filters, state)
         await callback.answer()
 
-    @router.callback_query(StateFilter(TryOnStates.LIMIT_REACHED), F.data == "limit_promo")
+    @router.callback_query(StateFilter(TryOnStates.DAILY_LIMIT_REACHED), F.data == "limit_promo")
     async def limit_promo(callback: CallbackQuery) -> None:
-        await callback.message.answer(msg.PROMO_CODE)
+        text = msg.PROMO_MESSAGE_TEMPLATE.format(code=promo_template)
+        await callback.message.answer(
+            text,
+            reply_markup=promo_keyboard(landing_url),
+        )
         await callback.answer()
 
-    @router.callback_query(StateFilter(TryOnStates.LIMIT_REACHED), F.data == "limit_remind")
+    @router.callback_query(StateFilter(TryOnStates.DAILY_LIMIT_REACHED), F.data == "limit_remind")
     async def limit_remind(callback: CallbackQuery) -> None:
         user_id = callback.from_user.id
         when = datetime.now(timezone.utc) + timedelta(hours=reminder_hours)
         await repository.set_reminder(user_id, when)
-        await callback.message.answer("Напомню через сутки!")
+        await callback.message.answer(msg.REMINDER_CONFIRMATION)
         await callback.answer()
         logger.info(
             "%s Reminder scheduled for %s", EVENT_ID["REMINDER_SCHEDULED"], user_id
         )
+
+    @router.callback_query(F.data == "reminder_go")
+    async def reminder_go(callback: CallbackQuery, state: FSMContext) -> None:
+        user_id = callback.from_user.id
+        profile = await repository.ensure_user(user_id)
+        await repository.set_reminder(user_id, None)
+        if not profile.gender:
+            await state.set_state(TryOnStates.START)
+            await callback.message.answer(msg.WELCOME, reply_markup=start_keyboard())
+            await callback.answer()
+            return
+        first_flag = profile.daily_used == 0
+        await state.update_data(gender=profile.gender, first_generated_today=first_flag)
+        await state.set_state(TryOnStates.AWAITING_PHOTO)
+        await callback.message.answer(
+            msg.PHOTO_INSTRUCTIONS,
+            reply_markup=attach_photo_keyboard(),
+        )
+        await callback.answer()
 
     @router.callback_query(StateFilter(TryOnStates.ERROR), F.data == "retry")
     async def retry(callback: CallbackQuery, state: FSMContext) -> None:

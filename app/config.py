@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     daily_try_limit: int = Field(7, env="DAILY_TRY_LIMIT")
     reminder_hours: int = Field(24, env="REMINDER_HOURS")
     mock_tryon: bool = Field(True, env="MOCK_TRYON")
+    landing_url: AnyHttpUrl = Field("https://example.com/booking", env="LANDING_URL")
+    promo_template: str = Field("-promocode-", env="PROMO_TEMPLATE")
     uploads_root: Path = Field(Path("./uploads"), env="UPLOADS_ROOT")
     results_root: Path = Field(Path("./results"), env="RESULTS_ROOT")
     csv_fetch_ttl_sec: int = Field(60, env="CSV_FETCH_TTL_SEC")
