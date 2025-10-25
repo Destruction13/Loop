@@ -12,17 +12,16 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from aiogram.types.input_file import BufferedInputFile, FSInputFile, URLInputFile
 
 from app import messages_ru as msg
 from app.keyboards import (
     attach_photo_keyboard,
-    first_generation_keyboard,
-    followup_photo_keyboard,
     gender_keyboard,
     generation_result_keyboard,
     limit_reached_keyboard,
@@ -102,7 +101,7 @@ def setup_router(
     reminder_hours: int,
     selection_button_title_max: int,
     landing_url: str,
-    promo_template: str,
+    promo_code: str,
 ) -> Router:
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
@@ -132,16 +131,19 @@ def setup_router(
             logger.error("%s Failed to fetch catalog: %s", EVENT_ID["MODELS_SENT"], exc)
             await message.answer(msg.CATALOG_TEMPORARILY_UNAVAILABLE)
             await state.update_data(current_models=[])
+            await _delete_state_message(message, state, "preload_message_id")
             return
         if not models:
             await message.answer(msg.CATALOG_TEMPORARILY_UNAVAILABLE)
             await state.update_data(current_models=[])
+            await _delete_state_message(message, state, "preload_message_id")
             return
         await repository.add_seen_models(user_id, [model.unique_id for model in models])
         batch = list(models)
         await state.update_data(current_models=batch, last_batch=batch)
         await _send_model_pairs(message, batch)
         logger.info("%s Sent %s models", EVENT_ID["MODELS_SENT"], len(models))
+        await _delete_state_message(message, state, "preload_message_id")
 
     async def _send_model_pairs(message: Message, batch: list[GlassModel]) -> None:
         pairs = pair_models(batch)
@@ -205,6 +207,18 @@ def setup_router(
             reply_markup=keyboard,
         )
 
+    async def _delete_state_message(message: Message, state: FSMContext, key: str) -> None:
+        data = await state.get_data()
+        message_id = data.get(key)
+        if not message_id:
+            return
+        try:
+            await message.bot.delete_message(message.chat.id, message_id)
+        except TelegramBadRequest as exc:
+            logger.warning("Failed to delete %s message %s: %s", key, message_id, exc)
+        finally:
+            await state.update_data(**{key: None})
+
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
         await repository.ensure_user(message.from_user.id)
@@ -239,21 +253,23 @@ def setup_router(
         await repository.update_filters(callback.from_user.id, gender=gender)
         await state.update_data(gender=gender, first_generated_today=True)
         await state.set_state(TryOnStates.AWAITING_PHOTO)
-        await callback.message.edit_text(
+        try:
+            await callback.message.edit_reply_markup()
+        except TelegramBadRequest:
+            logger.debug("Gender prompt message already cleaned up")
+        await callback.message.answer(
             msg.PHOTO_INSTRUCTIONS,
             reply_markup=attach_photo_keyboard(),
         )
         await callback.answer()
         logger.info("%s Gender selected %s", EVENT_ID["FILTER_SELECTED"], gender)
 
-    @router.callback_query(F.data == "attach_photo")
-    async def request_photo(callback: CallbackQuery, state: FSMContext) -> None:
+    @router.message(
+        StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT),
+        F.text == msg.ATTACH_PHOTO_BUTTON,
+    )
+    async def ignore_attach_prompt(message: Message, state: FSMContext) -> None:
         await state.set_state(TryOnStates.AWAITING_PHOTO)
-        await callback.message.answer(
-            msg.PHOTO_INSTRUCTIONS,
-            reply_markup=attach_photo_keyboard(),
-        )
-        await callback.answer()
 
     @router.message(StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT), ~F.photo)
     async def reject_non_photo(message: Message) -> None:
@@ -281,7 +297,11 @@ def setup_router(
             return
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
-        await message.answer(msg.LOOKING_FOR_MODELS)
+        preload_message = await message.answer(
+            msg.LOOKING_FOR_MODELS,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await state.update_data(preload_message_id=preload_message.message_id)
         await _send_models(message, user_id, filters, state)
         logger.info("%s Photo received from %s", EVENT_ID["PHOTO_RECEIVED"], user_id)
 
@@ -305,7 +325,8 @@ def setup_router(
             return
         await state.update_data(selected_model=selected, last_batch=[])
         await state.set_state(TryOnStates.GENERATING)
-        await callback.message.answer(msg.GENERATING)
+        generation_message = await callback.message.answer(msg.GENERATING)
+        await state.update_data(generation_message_id=generation_message.message_id)
         await callback.answer()
         await _perform_generation(callback.message, state, selected)
 
@@ -314,6 +335,7 @@ def setup_router(
         data = await state.get_data()
         upload_value = data.get("upload")
         if not upload_value:
+            await _delete_state_message(message, state, "generation_message_id")
             await message.answer(msg.GENERATION_FAILED, reply_markup=retry_keyboard())
             await state.set_state(TryOnStates.ERROR)
             return
@@ -329,10 +351,12 @@ def setup_router(
             logger.error(
                 "%s Generation failed: %s", EVENT_ID["GENERATION_FAILED"], exc
             )
+            await _delete_state_message(message, state, "generation_message_id")
             await message.answer(msg.GENERATION_FAILED, reply_markup=retry_keyboard())
             await state.set_state(TryOnStates.ERROR)
             return
         if not results:
+            await _delete_state_message(message, state, "generation_message_id")
             await message.answer(msg.GENERATION_FAILED, reply_markup=retry_keyboard())
             await state.set_state(TryOnStates.ERROR)
             return
@@ -343,25 +367,25 @@ def setup_router(
             first_generated_today=data.get("first_generated_today", True),
             remaining=remaining,
         )
+        caption_source = (
+            msg.FIRST_GENERATION_MESSAGE
+            if data.get("first_generated_today", True)
+            else msg.FOLLOWUP_GENERATION_MESSAGE
+        )
+        if isinstance(caption_source, (list, tuple)):
+            caption_text = "".join(caption_source)
+        else:
+            caption_text = str(caption_source)
         await message.answer_photo(
             FSInputFile(path=str(primary_result)),
-            caption=msg.GENERATION_CAPTION,
+            caption=caption_text,
             reply_markup=generation_result_keyboard(model.site_url, plan.remaining),
         )
+        await _delete_state_message(message, state, "generation_message_id")
         new_flag = next_first_flag_value(
             data.get("first_generated_today", True), plan.outcome
         )
         await state.update_data(first_generated_today=new_flag)
-        if plan.outcome is GenerationOutcome.FIRST:
-            await message.answer(
-                msg.FIRST_GENERATION_MESSAGE,
-                reply_markup=first_generation_keyboard(model.site_url, plan.remaining),
-            )
-        elif plan.outcome is GenerationOutcome.FOLLOWUP:
-            await message.answer(
-                msg.FOLLOWUP_GENERATION_MESSAGE,
-                reply_markup=followup_photo_keyboard(),
-            )
         if plan.outcome is GenerationOutcome.LIMIT:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
             await message.answer(
@@ -389,13 +413,14 @@ def setup_router(
             return
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
-        await callback.message.answer(msg.LOOKING_FOR_MODELS)
+        preload_message = await callback.message.answer(msg.LOOKING_FOR_MODELS)
+        await state.update_data(preload_message_id=preload_message.message_id)
         await _send_models(callback.message, user_id, filters, state)
         await callback.answer()
 
     @router.callback_query(StateFilter(TryOnStates.DAILY_LIMIT_REACHED), F.data == "limit_promo")
     async def limit_promo(callback: CallbackQuery) -> None:
-        text = msg.PROMO_MESSAGE_TEMPLATE.format(code=promo_template)
+        text = msg.PROMO_MESSAGE_TEMPLATE.format(code=promo_code)
         await callback.message.answer(
             text,
             reply_markup=promo_keyboard(landing_url),
@@ -440,7 +465,8 @@ def setup_router(
             await callback.answer("Нет выбранной модели", show_alert=True)
             return
         await state.set_state(TryOnStates.GENERATING)
-        await callback.message.answer(msg.GENERATING)
+        generation_message = await callback.message.answer(msg.GENERATING)
+        await state.update_data(generation_message_id=generation_message.message_id)
         await callback.answer()
         await _perform_generation(callback.message, state, selected)
 

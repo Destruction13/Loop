@@ -13,6 +13,7 @@ from app.fsm import (
 )
 from app.keyboards import (
     attach_photo_keyboard,
+    generation_result_keyboard,
     limit_reached_keyboard,
     promo_keyboard,
     reminder_keyboard,
@@ -36,7 +37,20 @@ def test_photo_instruction_text_and_keyboard() -> None:
     assert msg.PHOTO_INSTRUCTIONS == expected_text
 
     keyboard = attach_photo_keyboard()
-    assert keyboard.inline_keyboard[0][0].text == msg.ATTACH_PHOTO_BUTTON
+    assert keyboard.keyboard[0][0].text == msg.ATTACH_PHOTO_BUTTON
+    assert keyboard.resize_keyboard is True
+    assert keyboard.one_time_keyboard is False
+
+
+def test_generation_result_keyboard_layout() -> None:
+    keyboard = generation_result_keyboard("https://site", remaining=3)
+    row = keyboard.inline_keyboard[0]
+    assert [button.text for button in row] == [
+        msg.DETAILS_BUTTON,
+        f"{msg.MORE_VARIANTS_BUTTON} (осталось 3)",
+    ]
+    assert row[0].url == "https://site"
+    assert row[1].callback_data == "more|3"
 
 
 def test_followup_resolution_variants() -> None:
@@ -65,6 +79,13 @@ def test_limit_flow_keyboards() -> None:
     assert [len(row) for row in promo.inline_keyboard] == [1, 1]
     assert promo.inline_keyboard[0][0].url == landing
     assert promo.inline_keyboard[1][0].callback_data == "limit_remind"
+
+
+def test_promo_message_inserts_code() -> None:
+    text = msg.PROMO_MESSAGE_TEMPLATE.format(code="DEMO 10")
+
+    assert "“DEMO 10”" in text
+    assert text.endswith("снова примерить оправы 👓")
 
 
 def test_reminder_scheduler_sends_message_with_keyboard() -> None:

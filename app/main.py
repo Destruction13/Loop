@@ -69,7 +69,7 @@ async def main() -> None:
         reminder_hours=settings.reminder_hours,
         selection_button_title_max=settings.button_title_max,
         landing_url=str(settings.landing_url),
-        promo_template=settings.promo_template,
+        promo_code=settings.promo_code,
     )
     dp.include_router(router)
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from app import messages_ru as msg
 
@@ -32,18 +32,13 @@ def gender_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def attach_photo_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard prompting the user to upload a photo."""
+def attach_photo_keyboard() -> ReplyKeyboardMarkup:
+    """Reply keyboard prompting the user to upload a photo."""
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=msg.ATTACH_PHOTO_BUTTON,
-                    callback_data="attach_photo",
-                )
-            ]
-        ]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=msg.ATTACH_PHOTO_BUTTON)]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
     )
 
 
@@ -89,26 +84,6 @@ def generation_result_keyboard(site_url: str, remaining: int) -> InlineKeyboardM
             )
         )
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
-
-
-def first_generation_keyboard(site_url: str, remaining: int) -> InlineKeyboardMarkup:
-    """Keyboard shown together with the first generation message."""
-
-    buttons = [InlineKeyboardButton(text=msg.DETAILS_BUTTON, url=site_url)]
-    if remaining > 0:
-        buttons.append(
-            InlineKeyboardButton(
-                text=f"{msg.MORE_VARIANTS_BUTTON} (осталось {remaining})",
-                callback_data=f"more|{remaining}",
-            )
-        )
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
-
-
-def followup_photo_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard for prompting additional photo uploads."""
-
-    return attach_photo_keyboard()
 
 
 def limit_reached_keyboard(landing_url: str) -> InlineKeyboardMarkup:
