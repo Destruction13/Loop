@@ -22,11 +22,14 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 "BUTTON_TITLE_MAX=42",
                 "NANO_API_URL=https://nano.example.com",
                 "NANO_API_KEY=secret",
-                "COLLAGE_ENABLED=0",
-                "COLLAGE_MAX_WIDTH=640",
-                "COLLAGE_PADDING_PX=10",
-                "COLLAGE_CACHE_TTL_SEC=30",
-                "COLLAGE_DRAW_DIVIDER=0",
+                "COLLAGE_WIDTH=640",
+                "COLLAGE_HEIGHT=320",
+                "COLLAGE_GAP=12",
+                "COLLAGE_PADDING=20",
+                "COLLAGE_BG=#EFEFEF",
+                "COLLAGE_JPEG_QUALITY=80",
+                "COLLAGE_FIT_MODE=cover",
+                "COLLAGE_SHARPEN=0.5",
             ]
         ),
         encoding="utf-8",
@@ -49,8 +52,11 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.button_title_max == 42
     assert config.nano_api_url == "https://nano.example.com"
     assert config.nano_api_key == "secret"
-    assert config.collage.enabled is False
-    assert config.collage.max_width == 640
-    assert config.collage.padding_px == 10
-    assert config.collage.cache_ttl_sec == 30
-    assert config.collage.draw_divider is False
+    assert config.collage.width == 640
+    assert config.collage.height == 320
+    assert config.collage.gap == 12
+    assert config.collage.padding == 20
+    assert config.collage.background == "#EFEFEF"
+    assert config.collage.jpeg_quality == 80
+    assert config.collage.fit_mode == "cover"
+    assert config.collage.sharpen == 0.5

@@ -4,9 +4,14 @@ import asyncio
 import io
 
 import httpx
+import pytest
 from PIL import Image
 
-from app.services.collage import CollageResult, CollageService
+from app.config import CollageConfig
+from app.services.collage import (
+    CollageSourceUnavailable,
+    build_two_up_collage,
+)
 
 
 def _make_image_bytes(size: tuple[int, int], color: str) -> bytes:
@@ -16,133 +21,101 @@ def _make_image_bytes(size: tuple[int, int], color: str) -> bytes:
     return buffer.getvalue()
 
 
-async def _build_collage(
+async def _render_collage(
     transport: httpx.MockTransport,
     left_url: str | None,
     right_url: str | None,
-    *,
-    draw_divider: bool = True,
-) -> CollageResult | None:
+    cfg: CollageConfig,
+):
     async with httpx.AsyncClient(transport=transport) as client:
-        service = CollageService(
-            enabled=True,
-            max_width=600,
-            padding_px=20,
-            cache_ttl_sec=300,
-            draw_divider=draw_divider,
-            client=client,
-        )
-        return await service.build_collage(left_url, right_url)
+        return await build_two_up_collage(left_url, right_url, cfg, client=client)
 
 
-def test_collage_combines_two_images() -> None:
-    image_one = _make_image_bytes((400, 300), "red")
-    image_two = _make_image_bytes((200, 500), "blue")
+def _default_cfg() -> CollageConfig:
+    return CollageConfig(
+        width=640,
+        height=320,
+        gap=20,
+        padding=16,
+        background="#FFFFFF",
+        jpeg_quality=90,
+        fit_mode="contain",
+        sharpen=0.0,
+    )
+
+
+def test_collage_matches_config_dimensions() -> None:
+    config = _default_cfg()
+    left = _make_image_bytes((800, 400), "red")
+    right = _make_image_bytes((400, 800), "blue")
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("img1.jpg"):
-            return httpx.Response(200, content=image_one, headers={"content-type": "image/jpeg"})
-        if request.url.path.endswith("img2.jpg"):
-            return httpx.Response(200, content=image_two, headers={"content-type": "image/jpeg"})
+        if request.url.path.endswith("left.jpg"):
+            return httpx.Response(200, content=left, headers={"content-type": "image/jpeg"})
+        if request.url.path.endswith("right.jpg"):
+            return httpx.Response(200, content=right, headers={"content-type": "image/jpeg"})
         return httpx.Response(404)
 
     transport = httpx.MockTransport(handler)
-    result = asyncio.run(
-        _build_collage(
+    buffer = asyncio.run(
+        _render_collage(
             transport,
-            "https://example.com/img1.jpg",
-            "https://example.com/img2.jpg",
+            "https://example.com/left.jpg",
+            "https://example.com/right.jpg",
+            config,
         )
     )
 
-    assert result is not None
-    assert result.included_positions == (0, 1)
-    with Image.open(io.BytesIO(result.image_bytes)) as collage:
-        assert collage.width <= 600
-        assert collage.height > 0
+    with Image.open(buffer) as collage:
+        assert collage.size == (config.width, config.height)
+        cell_width = (config.width - 2 * config.padding - config.gap) // 2
+        left_center = collage.getpixel((config.padding + cell_width // 2, config.height // 2))
+        right_center = collage.getpixel((config.padding + cell_width + config.gap + cell_width // 2, config.height // 2))
+        assert left_center[0] > 150  # red channel dominant
+        assert right_center[2] > 150  # blue channel dominant
 
 
-def test_collage_handles_partial_download() -> None:
-    image_one = _make_image_bytes((300, 300), "green")
+def test_collage_uses_placeholder_for_failed_download() -> None:
+    config = _default_cfg()
+    left = _make_image_bytes((500, 500), "green")
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("img1.jpg"):
-            return httpx.Response(200, content=image_one, headers={"content-type": "image/jpeg"})
+        if request.url.path.endswith("left.jpg"):
+            return httpx.Response(200, content=left, headers={"content-type": "image/jpeg"})
         return httpx.Response(500)
 
     transport = httpx.MockTransport(handler)
-    result = asyncio.run(
-        _build_collage(
+    buffer = asyncio.run(
+        _render_collage(
             transport,
-            "https://example.com/img1.jpg",
-            "https://example.com/img2.jpg",
+            "https://example.com/left.jpg",
+            "https://example.com/right.jpg",
+            config,
         )
     )
 
-    assert result is not None
-    assert result.included_positions == (0,)
-    with Image.open(io.BytesIO(result.image_bytes)) as collage:
-        assert collage.width > 0
-        assert collage.height > 0
+    with Image.open(buffer) as collage:
+        cell_width = (config.width - 2 * config.padding - config.gap) // 2
+        placeholder_sample = collage.getpixel(
+            (config.padding + cell_width + config.gap + 5, config.padding + 5)
+        )
+        assert all(channel >= 150 for channel in placeholder_sample)
 
 
-def test_collage_draws_divider_when_enabled() -> None:
-    image_one = _make_image_bytes((200, 200), "red")
-    image_two = _make_image_bytes((200, 200), "green")
+def test_collage_raises_when_no_sources_available() -> None:
+    config = _default_cfg()
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("one.jpg"):
-            return httpx.Response(200, content=image_one, headers={"content-type": "image/jpeg"})
-        if request.url.path.endswith("two.jpg"):
-            return httpx.Response(200, content=image_two, headers={"content-type": "image/jpeg"})
-        return httpx.Response(404)
+    async def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - no calls
+        raise AssertionError("Handler should not be called")
 
     transport = httpx.MockTransport(handler)
-    result = asyncio.run(
-        _build_collage(
-            transport,
-            "https://example.com/one.jpg",
-            "https://example.com/two.jpg",
-            draw_divider=True,
+
+    with pytest.raises(CollageSourceUnavailable):
+        asyncio.run(
+            _render_collage(
+                transport,
+                None,
+                None,
+                config,
+            )
         )
-    )
-
-    assert result is not None
-    with Image.open(io.BytesIO(result.image_bytes)) as collage:
-        width, height = collage.size
-        line_x = 20 + 200 + 10
-        middle_y = height // 2
-        divider_pixel = collage.getpixel((line_x, middle_y))
-        assert max(divider_pixel) < 250
-
-
-def test_collage_does_not_add_overlays() -> None:
-    image_one = _make_image_bytes((200, 200), "red")
-    image_two = _make_image_bytes((200, 200), "green")
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("one.jpg"):
-            return httpx.Response(200, content=image_one, headers={"content-type": "image/jpeg"})
-        if request.url.path.endswith("two.jpg"):
-            return httpx.Response(200, content=image_two, headers={"content-type": "image/jpeg"})
-        return httpx.Response(404)
-
-    transport = httpx.MockTransport(handler)
-    result = asyncio.run(
-        _build_collage(
-            transport,
-            "https://example.com/one.jpg",
-            "https://example.com/two.jpg",
-        )
-    )
-
-    assert result is not None
-    with Image.open(io.BytesIO(result.image_bytes)) as collage:
-        # Sample a pixel inside the left image near the top-left corner to ensure
-        # no badge or overlay has been drawn on top of the model photo.
-        sample_x = 20 + 5
-        sample_y = 20 + 5
-        pixel = collage.getpixel((sample_x, sample_y))[:3]
-        assert pixel[0] > 200
-        assert pixel[1] < 20
-        assert pixel[2] < 20

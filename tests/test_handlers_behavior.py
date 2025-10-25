@@ -1,12 +1,17 @@
 import asyncio
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
-from aiogram.types import ReplyKeyboardRemove
 
+from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardRemove
+from PIL import Image
+
+from app.config import CollageConfig
 from app.fsm import TryOnStates, setup_router
 from app.models import GlassModel
+from app.services.collage import CollageProcessingError, CollageSourceUnavailable
 from app.texts import messages as msg
 
 
@@ -154,37 +159,64 @@ class StubStorage:
         return self.uploads_dir / filename
 
 
-class StubCollage:
-    enabled = False
+class StubCollageBuilder:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Optional[str], Optional[str]]] = []
+        self.fail_processing = False
+        self.fail_sources = False
 
-    async def build_collage(self, left: Optional[str], right: Optional[str]) -> None:  # noqa: D401
-        return None
+    async def __call__(
+        self, left: Optional[str], right: Optional[str], cfg: CollageConfig
+    ) -> io.BytesIO:
+        self.calls.append((left, right))
+        if self.fail_sources:
+            raise CollageSourceUnavailable("sources unavailable")
+        if self.fail_processing:
+            raise CollageProcessingError("processing error")
+        image = Image.new("RGB", (cfg.width, cfg.height), color="white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG")
+        buffer.seek(0)
+        return buffer
 
-    async def aclose(self) -> None:  # noqa: D401
-        return None
 
-
-def build_router(tmp_path: Path, models: Optional[list[GlassModel]] = None) -> tuple[Any, StubRepository, StubTryOn]:
+def build_router(
+    tmp_path: Path,
+    models: Optional[list[GlassModel]] = None,
+    *,
+    collage_builder: Optional[StubCollageBuilder] = None,
+) -> tuple[Any, StubRepository, StubTryOn, StubCollageBuilder]:
     repository = StubRepository()
     catalog = StubCatalog(models or [])
     result_path = tmp_path / "result.png"
     result_path.write_bytes(b"fake-image")
     tryon = StubTryOn(result_path=result_path)
     storage = StubStorage(tmp_path / "uploads")
-    collage = StubCollage()
+    builder = collage_builder or StubCollageBuilder()
+    collage_config = CollageConfig(
+        width=640,
+        height=320,
+        gap=16,
+        padding=24,
+        background="#FFFFFF",
+        jpeg_quality=90,
+        fit_mode="contain",
+        sharpen=0.0,
+    )
 
     router = setup_router(
         repository=repository,
         catalog=catalog,
         tryon=tryon,
         storage=storage,
-        collage=collage,
+        collage_config=collage_config,
+        collage_builder=builder,
         reminder_hours=24,
         selection_button_title_max=28,
         landing_url="https://example.com",
         promo_code="PROMO",
     )
-    return router, repository, tryon
+    return router, repository, tryon, builder
 
 
 def get_callback_handler(router: Any, name: str):
@@ -203,7 +235,7 @@ def get_message_handler(router: Any, name: str):
 
 def test_select_gender_deletes_prompt_and_waits_for_photo(tmp_path: Path) -> None:
     async def scenario() -> None:
-        router, repository, _ = build_router(tmp_path)
+        router, repository, _, _ = build_router(tmp_path)
         handler = get_callback_handler(router, "select_gender")
 
         bot = DummyBot()
@@ -243,9 +275,27 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
             img_nano_url="https://example.com/2-nano.jpg",
             gender="Мужской",
         ),
+        GlassModel(
+            unique_id="m3",
+            title="Model 3",
+            model_code="M3",
+            site_url="https://example.com/3",
+            img_user_url="https://example.com/3.jpg",
+            img_nano_url="https://example.com/3-nano.jpg",
+            gender="Мужской",
+        ),
+        GlassModel(
+            unique_id="m4",
+            title="Model 4",
+            model_code="M4",
+            site_url="https://example.com/4",
+            img_user_url="https://example.com/4.jpg",
+            img_nano_url="https://example.com/4-nano.jpg",
+            gender="Мужской",
+        ),
     ]
     async def scenario() -> None:
-        router, repository, _ = build_router(tmp_path, models=models)
+        router, repository, _, builder = build_router(tmp_path, models=models)
         handler = get_message_handler(router, "accept_photo")
 
         bot = DummyBot()
@@ -259,7 +309,118 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
         preload_id = message.message_id + 1
         assert (321, preload_id) in bot.deleted
         assert state.data.get("preload_message_id") is None
+        assert repository.seen_models == ["m1", "m2", "m3", "m4"]
+        assert len(builder.calls) == 2
+        assert len(message.answer_photos) == 2
+        pair_messages = message.answers[-2:]
+        assert [text for text, _ in pair_messages] == [
+            msg.PAIR_CAPTION_TEMPLATE.format(current=1, total=2),
+            msg.PAIR_CAPTION_TEMPLATE.format(current=2, total=2),
+        ]
+        for _, markup in pair_messages:
+            assert isinstance(markup, InlineKeyboardMarkup)
+            assert len(markup.inline_keyboard) == 1
+            assert len(markup.inline_keyboard[0]) == 2
+
+    asyncio.run(scenario())
+
+
+def test_collage_source_unavailable_falls_back_to_text(tmp_path: Path) -> None:
+    models = [
+        GlassModel(
+            unique_id="m1",
+            title="Alpha",
+            model_code="A1",
+            site_url="https://example.com/1",
+            img_user_url="https://example.com/1.jpg",
+            img_nano_url="https://example.com/1-nano.jpg",
+            gender="Мужской",
+        ),
+        GlassModel(
+            unique_id="m2",
+            title="Beta",
+            model_code="B2",
+            site_url="https://example.com/2",
+            img_user_url="https://example.com/2.jpg",
+            img_nano_url="https://example.com/2-nano.jpg",
+            gender="Мужской",
+        ),
+    ]
+
+    async def scenario() -> None:
+        builder = StubCollageBuilder()
+        builder.fail_sources = True
+        router, repository, _, returned_builder = build_router(
+            tmp_path, models=models, collage_builder=builder
+        )
+        assert returned_builder is builder
+        handler = get_message_handler(router, "accept_photo")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=456, bot=bot)
+        message.photo = [PhotoStub("photo")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler(message, state)
+
+        assert len(builder.calls) == 1
+        assert not message.answer_photos
+        fallback_text, markup = message.answers[-1]
+        assert msg.COLLAGE_IMAGES_UNAVAILABLE in fallback_text
+        assert isinstance(markup, InlineKeyboardMarkup)
+        assert len(markup.inline_keyboard[0]) == 2
         assert repository.seen_models == ["m1", "m2"]
+
+    asyncio.run(scenario())
+
+
+def test_collage_processing_error_sends_individual_photos(tmp_path: Path) -> None:
+    models = [
+        GlassModel(
+            unique_id="m1",
+            title="Alpha",
+            model_code="A1",
+            site_url="https://example.com/1",
+            img_user_url="https://example.com/1.jpg",
+            img_nano_url="https://example.com/1-nano.jpg",
+            gender="Мужской",
+        ),
+        GlassModel(
+            unique_id="m2",
+            title="Beta",
+            model_code="B2",
+            site_url="https://example.com/2",
+            img_user_url="https://example.com/2.jpg",
+            img_nano_url="https://example.com/2-nano.jpg",
+            gender="Мужской",
+        ),
+    ]
+
+    async def scenario() -> None:
+        builder = StubCollageBuilder()
+        builder.fail_processing = True
+        router, _, _, returned_builder = build_router(
+            tmp_path, models=models, collage_builder=builder
+        )
+        assert returned_builder is builder
+        handler = get_message_handler(router, "accept_photo")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=789, bot=bot)
+        message.photo = [PhotoStub("photo")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler(message, state)
+
+        assert len(builder.calls) == 1
+        assert len(message.answer_photos) == 2
+        assert all(photo[1] is None for photo in message.answer_photos)
+        last_text, markup = message.answers[-1]
+        assert last_text == msg.PAIR_CAPTION_TEMPLATE.format(current=1, total=1)
+        assert isinstance(markup, InlineKeyboardMarkup)
+        assert len(markup.inline_keyboard[0]) == 2
 
     asyncio.run(scenario())
 
@@ -275,7 +436,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         gender="Мужской",
     )
     async def scenario() -> None:
-        router, repository, tryon = build_router(tmp_path, models=[model])
+        router, repository, tryon, _ = build_router(tmp_path, models=[model])
         handler_photo = get_message_handler(router, "accept_photo")
         handler_choose = get_callback_handler(router, "choose_model")
 
@@ -293,7 +454,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         callback = DummyCallback("pick|m1", upload_message)
         await handler_choose(callback, state)
 
-        generation_id = upload_message.message_id + 2
+        generation_id = upload_message.message_id + 3
         assert (55, generation_id) in bot.deleted
         assert state.data.get("generation_message_id") is None
         assert repository.daily_used == 1
