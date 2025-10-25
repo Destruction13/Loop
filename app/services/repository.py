@@ -37,10 +37,8 @@ class Repository:
             await asyncio.to_thread(self._upsert_user, profile)
         return profile
 
-    async def update_filters(self, user_id: int, *, gender: Optional[str] = None, age_bucket: Optional[str] = None, style: Optional[str] = None) -> None:
-        await asyncio.to_thread(
-            self._update_filters_sync, user_id, gender, age_bucket, style
-        )
+    async def update_filters(self, user_id: int, *, gender: Optional[str] = None) -> None:
+        await asyncio.to_thread(self._update_filters_sync, user_id, gender)
 
     async def ensure_daily_reset(self, user_id: int, *, now: Optional[datetime] = None) -> UserProfile:
         now = now or datetime.now(timezone.utc)
@@ -131,18 +129,12 @@ class Repository:
             referrer_id=row["referrer_id"],
         )
 
-    def _update_filters_sync(
-        self, user_id: int, gender: Optional[str], age_bucket: Optional[str], style: Optional[str]
-    ) -> None:
+    def _update_filters_sync(self, user_id: int, gender: Optional[str]) -> None:
         profile = self._get_user_sync(user_id)
         if profile is None:
             profile = UserProfile(user_id=user_id)
         if gender:
             profile.gender = gender
-        if age_bucket:
-            profile.age_bucket = age_bucket
-        if style:
-            profile.style = style
         self._upsert_user(profile)
 
     def _upsert_user(self, profile: UserProfile) -> None:
