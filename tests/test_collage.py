@@ -19,7 +19,12 @@ def _make_image_bytes(size: tuple[int, int], color: str) -> bytes:
 
 
 async def _build_collage(
-    transport: httpx.MockTransport, urls: list[str]
+    transport: httpx.MockTransport,
+    urls: list[str],
+    *,
+    draw_divider: bool = True,
+    draw_badges: bool = True,
+    badge_style: str = "circle",
 ) -> CollageResult | None:
     async with httpx.AsyncClient(transport=transport) as client:
         service = CollageService(
@@ -27,6 +32,9 @@ async def _build_collage(
             max_width=600,
             padding_px=20,
             cache_ttl_sec=300,
+            draw_divider=draw_divider,
+            draw_badges=draw_badges,
+            badge_style=badge_style,
             client=client,
         )
         return await service.build_collage(urls)
@@ -79,3 +87,35 @@ def test_collage_handles_partial_download() -> None:
     with Image.open(io.BytesIO(result.image_bytes)) as collage:
         assert collage.width > 0
         assert collage.height > 0
+
+
+def test_collage_draws_divider_and_badges() -> None:
+    image_one = _make_image_bytes((200, 200), "red")
+    image_two = _make_image_bytes((200, 200), "green")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("one.jpg"):
+            return httpx.Response(200, content=image_one, headers={"content-type": "image/jpeg"})
+        if request.url.path.endswith("two.jpg"):
+            return httpx.Response(200, content=image_two, headers={"content-type": "image/jpeg"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    result = asyncio.run(
+        _build_collage(
+            transport,
+            ["https://example.com/one.jpg", "https://example.com/two.jpg"],
+        )
+    )
+
+    assert result is not None
+    with Image.open(io.BytesIO(result.image_bytes)) as collage:
+        width, height = collage.size
+        line_x = 20 + 200 + 10
+        middle_y = height // 2
+        divider_pixel = collage.getpixel((line_x, middle_y))
+        assert max(divider_pixel) < 250
+        badge_x = 20 + 12 + 10
+        badge_y = 20 + 12 + 10
+        badge_pixel = collage.getpixel((badge_x, badge_y))
+        assert badge_pixel != (255, 255, 255)

@@ -59,6 +59,7 @@ def setup_router(
     storage: StorageService,
     collage: CollageService,
     reminder_hours: int,
+    selection_button_title_max: int,
 ) -> Router:
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
@@ -124,10 +125,16 @@ def setup_router(
         collage_result: CollageResult | None = None
         if collage.enabled:
             collage_result = await collage.build_collage([model.img_user_url for model in pair])
-        if collage_result and collage_result.included_indices:
+        if (
+            collage_result
+            and collage_result.included_indices
+            and len(collage_result.included_indices) == len(pair)
+        ):
             included_models = [pair[i] for i in collage_result.included_indices]
             keyboard = pair_selection_keyboard(
-                [(model.unique_id, model.title) for model in included_models]
+                [(model.unique_id, model.title) for model in included_models],
+                start_index=1,
+                max_title_length=selection_button_title_max,
             )
             filename = f"collage-{uuid.uuid4().hex}.jpg"
             collage_caption = caption_to_use if 0 in collage_result.included_indices else None
@@ -136,17 +143,24 @@ def setup_router(
                 caption=collage_caption,
                 reply_markup=keyboard,
             )
-            missing_indices = set(range(len(pair))) - set(collage_result.included_indices)
-            for missing_index in missing_indices:
-                model = pair[missing_index]
-                await _send_single_model(message, model, caption if missing_index == 0 else "")
             return
 
         for offset, model in enumerate(pair):
-            await _send_single_model(message, model, caption if offset == 0 else "")
+            await _send_single_model(
+                message,
+                model,
+                caption if offset == 0 else "",
+                ordinal=offset + 1,
+            )
 
-    async def _send_single_model(message: Message, model: GlassModel, caption: str) -> None:
-        keyboard = pair_selection_keyboard([(model.unique_id, model.title)])
+    async def _send_single_model(
+        message: Message, model: GlassModel, caption: str, ordinal: int
+    ) -> None:
+        keyboard = pair_selection_keyboard(
+            [(model.unique_id, model.title)],
+            start_index=ordinal,
+            max_title_length=selection_button_title_max,
+        )
         await message.answer_photo(
             photo=URLInputFile(model.img_user_url),
             caption=caption or None,

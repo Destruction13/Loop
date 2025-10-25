@@ -7,6 +7,16 @@ from typing import Sequence
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
+_CIRCLED_DIGITS = {
+    1: "①",
+    2: "②",
+    3: "③",
+    4: "④",
+    5: "⑤",
+    6: "⑥",
+}
+
+
 def start_keyboard() -> InlineKeyboardMarkup:
     """Keyboard for the start menu."""
 
@@ -59,14 +69,36 @@ def style_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def pair_selection_keyboard(models: Sequence[tuple[str, str]]) -> InlineKeyboardMarkup:
+def pair_selection_keyboard(
+    models: Sequence[tuple[str, str]],
+    *,
+    start_index: int = 1,
+    max_title_length: int = 24,
+) -> InlineKeyboardMarkup:
     """Keyboard for selecting one of the models in a pair."""
 
-    buttons = [
-        [InlineKeyboardButton(text=f"Выбрать: {title}", callback_data=f"pick|{unique_id}")]
-        for unique_id, title in models
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    if not models:
+        return InlineKeyboardMarkup(inline_keyboard=[])
+
+    buttons: list[InlineKeyboardButton] = []
+    for offset, (unique_id, title) in enumerate(models):
+        ordinal = start_index + offset
+        prefix = _CIRCLED_DIGITS.get(ordinal, str(ordinal))
+        truncated = _truncate_title(title, max_title_length)
+        buttons.append(
+            InlineKeyboardButton(
+                text=f"{prefix} Выбрать: {truncated}", callback_data=f"pick|{unique_id}"
+            )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+def _truncate_title(title: str, max_length: int) -> str:
+    if len(title) <= max_length:
+        return title
+    if max_length <= 1:
+        return "…"
+    return title[: max_length - 1] + "…"
 
 
 def generation_result_keyboard(site_url: str, remaining: int) -> InlineKeyboardMarkup:

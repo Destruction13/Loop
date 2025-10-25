@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 LOGGER = logging.getLogger("loop_bot.collage")
 
@@ -33,12 +33,18 @@ class CollageService:
         max_width: int,
         padding_px: int,
         cache_ttl_sec: int,
+        draw_divider: bool = True,
+        draw_badges: bool = True,
+        badge_style: str = "circle",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._enabled = enabled
         self._max_width = max_width
         self._padding_px = padding_px
         self._cache_ttl = cache_ttl_sec
+        self._draw_divider = draw_divider
+        self._draw_badges = draw_badges
+        self._badge_style = badge_style
         if client is None:
             timeout = httpx.Timeout(10.0, connect=10.0, read=10.0)
             self._client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
@@ -48,6 +54,14 @@ class CollageService:
             self._client_owner = False
         self._cache: dict[tuple[str, ...], tuple[float, CollageResult]] = {}
         self._cache_lock = asyncio.Lock()
+        self._badge_font = self._load_font()
+        self._font_supports_circled = self._detect_circled_support(self._badge_font)
+        self._circled_digits = {
+            1: "①",
+            2: "②",
+            3: "③",
+            4: "④",
+        }
 
     @property
     def enabled(self) -> bool:
@@ -151,7 +165,11 @@ class CollageService:
             raise ValueError("No images to compose")
 
         resized = self._normalize_heights(pil_images)
-        collage, _ = self._place_images(resized)
+        collage, padding, placements = self._place_images(resized)
+        if self._draw_divider and len(placements) > 1:
+            self._add_dividers(collage, placements, padding)
+        if self._draw_badges and placements:
+            self._add_badges(collage, placements)
         buffer = io.BytesIO()
         try:
             collage.save(buffer, format="JPEG", quality=85)
@@ -184,7 +202,9 @@ class CollageService:
             normalized.append(resized)
         return normalized
 
-    def _place_images(self, images: list[Image.Image]) -> tuple[Image.Image, int]:
+    def _place_images(
+        self, images: list[Image.Image]
+    ) -> tuple[Image.Image, int, list[tuple[int, int, int, int]]]:
         padding = self._padding_px
         total_width = sum(image.width for image in images) + padding * (len(images) + 1)
         height = images[0].height if images else 0
@@ -206,9 +226,89 @@ class CollageService:
         canvas_height = height + padding * 2
         collage = Image.new("RGB", (total_width, canvas_height), color="#FFFFFF")
         current_x = padding
+        placements: list[tuple[int, int, int, int]] = []
         for image in images:
             y = padding + (height - image.height) // 2
             collage.paste(image, (current_x, y))
+            placements.append((current_x, y, current_x + image.width, y + image.height))
             current_x += image.width + padding
-        return collage, padding
+        return collage, padding, placements
+
+    def _add_dividers(
+        self,
+        collage: Image.Image,
+        placements: list[tuple[int, int, int, int]],
+        padding: int,
+    ) -> None:
+        divider_color = (229, 229, 229)
+        divider_width = 2
+        draw = ImageDraw.Draw(collage)
+        top = padding
+        bottom = collage.height - padding
+        for left_box, right_box in zip(placements, placements[1:]):
+            gap_start = left_box[2]
+            gap_end = right_box[0]
+            if gap_end <= gap_start:
+                continue
+            x = gap_start + (gap_end - gap_start) // 2
+            draw.line([(x, top), (x, bottom)], fill=divider_color, width=divider_width)
+
+    def _add_badges(
+        self,
+        collage: Image.Image,
+        placements: list[tuple[int, int, int, int]],
+    ) -> None:
+        draw = ImageDraw.Draw(collage, "RGBA")
+        diameter = 40
+        margin = 12
+        for index, (left, top, right, bottom) in enumerate(placements, start=1):
+            label = self._badge_label(index)
+            bbox_left = left + margin
+            bbox_top = top + margin
+            bbox_right = min(right - margin, bbox_left + diameter)
+            bbox_bottom = min(bottom - margin, bbox_top + diameter)
+            if bbox_right <= bbox_left or bbox_bottom <= bbox_top:
+                continue
+            if self._badge_style == "circle":
+                draw.ellipse(
+                    [bbox_left, bbox_top, bbox_right, bbox_bottom],
+                    fill=(0, 0, 0, 128),
+                )
+                text_color = (255, 255, 255, 255)
+            else:
+                text_color = (0, 0, 0, 255)
+            text_width, text_height = self._measure_text(label)
+            text_x = bbox_left + (bbox_right - bbox_left - text_width) / 2
+            text_y = bbox_top + (bbox_bottom - bbox_top - text_height) / 2
+            draw.text((text_x, text_y), label, font=self._badge_font, fill=text_color)
+
+    def _badge_label(self, index: int) -> str:
+        label = self._circled_digits.get(index, str(index))
+        if not self._font_supports_circled:
+            return str(index)
+        return label
+
+    def _measure_text(self, text: str) -> tuple[int, int]:
+        bbox = self._badge_font.getbbox(text)
+        if bbox is None:
+            return (0, 0)
+        left, top, right, bottom = bbox
+        return (right - left, bottom - top)
+
+    def _load_font(self) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        try:
+            return ImageFont.truetype("DejaVuSans-Bold.ttf", size=22)
+        except Exception:  # noqa: BLE001
+            return ImageFont.load_default()
+
+    def _detect_circled_support(self, font: ImageFont.ImageFont) -> bool:
+        try:
+            bbox = font.getbbox("①")
+        except Exception:  # noqa: BLE001
+            return False
+        if not bbox:
+            return False
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        return width > 0 and height > 0
 

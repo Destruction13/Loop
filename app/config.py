@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     collage_max_width: int = Field(1280, env="COLLAGE_MAX_WIDTH")
     collage_padding_px: int = Field(20, env="COLLAGE_PADDING_PX")
     collage_cache_ttl_sec: int = Field(300, env="COLLAGE_CACHE_TTL_SEC")
+    collage_draw_divider: bool = Field(True, env="COLLAGE_DRAW_DIVIDER")
+    collage_draw_badges: bool = Field(True, env="COLLAGE_DRAW_BADGES")
+    collage_badge_style: str = Field("circle", env="COLLAGE_BADGE_STYLE")
+    collage_button_title_max: int = Field(24, env="COLLAGE_BUTTON_TITLE_MAX")
     nano_api_url: Optional[str] = Field(None, env="NANO_API_URL")
     nano_api_key: Optional[str] = Field(None, env="NANO_API_KEY")
     drive_public_base_url: Optional[str] = Field(None, env="DRIVE_PUBLIC_BASE_URL")
@@ -41,6 +45,16 @@ class Settings(BaseSettings):
         """Convert string values to Path objects."""
 
         return Path(value)
+
+    @field_validator("collage_badge_style", mode="before")
+    def _normalize_badge_style(cls, value: str) -> str:  # type: ignore[override]
+        """Ensure badge style is one of the supported options."""
+
+        normalized = (value or "circle").strip().lower()
+        allowed = {"circle", "plain"}
+        if normalized not in allowed:
+            raise ValueError("COLLAGE_BADGE_STYLE must be 'circle' or 'plain'")
+        return normalized
 
     model_config = SettingsConfigDict(
         env_file=".env",
