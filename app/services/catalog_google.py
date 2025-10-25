@@ -16,7 +16,7 @@ import httpx
 
 from app.models import GlassModel
 from app.services.catalog_base import CatalogError, CatalogService
-from app.utils.drive import drive_view_to_direct
+from app.utils.drive import DriveFolderUrlError, DriveUrlError, drive_view_to_direct
 
 LOGGER = logging.getLogger("loop_bot.catalog.google")
 
@@ -198,24 +198,39 @@ class GoogleSheetCatalog(CatalogService):
         if not reader.fieldnames:
             raise CatalogError("Catalog CSV has no header row")
         models: list[GlassModel] = []
+        total_rows = 0
+        skipped_empty = 0
+        skipped_folder = 0
+        skipped_invalid = 0
         for row_index, row in enumerate(reader, start=2):
+            total_rows += 1
             normalized_row = {_normalize_header(key): (value or "").strip() for key, value in row.items()}
             title = normalized_row.get("название")
             site_url = normalized_row.get("ссылка на сайт")
             if not title or not site_url:
+                skipped_invalid += 1
                 LOGGER.warning("Skipping row %s due to missing title or site URL", row_index)
                 continue
             model_code = normalized_row.get("модель", "")
             gender_value = normalized_row.get("пол", "")
             gender = _normalize_gender(gender_value)
-            img_user_original = normalized_row.get("ссылка на изображение для пользователя", "")
+            img_user_original = _clean_drive_url(normalized_row.get("ссылка на изображение для пользователя", ""))
             if not img_user_original:
-                LOGGER.warning("Skipping row %s due to missing user image URL", row_index)
+                skipped_empty += 1
+                LOGGER.debug("Skipping row %s due to empty user image URL", row_index)
                 continue
             try:
                 img_user_url = drive_view_to_direct(img_user_original, export="view")
-            except ValueError as exc:
-                LOGGER.warning("Skipping row %s due to invalid drive URL: %s", row_index, exc)
+            except DriveFolderUrlError:
+                skipped_folder += 1
+                LOGGER.warning(
+                    "Skipping row %s due to folder Drive URL; expected file share like /file/d/.../view",
+                    row_index,
+                )
+                continue
+            except DriveUrlError as exc:
+                skipped_invalid += 1
+                LOGGER.warning("Skipping row %s due to invalid Drive URL: %s", row_index, exc)
                 continue
             img_nano_url = normalized_row.get("ссылка на изображение для nanobanana", "")
             unique_id = normalized_row.get("уникальный id") or _make_fallback_id(title, site_url)
@@ -229,6 +244,15 @@ class GoogleSheetCatalog(CatalogService):
                 gender=gender,
             )
             models.append(model)
+
+        LOGGER.info(
+            "Catalog CSV parsed: total_rows=%s valid_rows=%s skipped_empty=%s skipped_folder=%s skipped_invalid=%s",
+            total_rows,
+            len(models),
+            skipped_empty,
+            skipped_folder,
+            skipped_invalid,
+        )
         return models
 
 
@@ -281,3 +305,9 @@ def _build_fallback_urls(original_url: str) -> list[str]:
     gviz = f"{base}/{sheet_id}/gviz/tq?tqx=out:csv&gid={gid}"
     export = f"{base}/{sheet_id}/export?format=csv&gid={gid}"
     return [gviz, export]
+
+
+def _clean_drive_url(value: str | None) -> str:
+    if value is None:
+        return ""
+    return value.strip().strip("\u200b\u200c\u200d\ufeff")
