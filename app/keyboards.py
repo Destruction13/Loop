@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Sequence
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
@@ -57,37 +59,28 @@ def style_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def model_card_keyboard(unique_id: str, title: str, site_url: str) -> InlineKeyboardMarkup:
-    """Keyboard attached to a catalog card."""
+def pair_selection_keyboard(models: Sequence[tuple[str, str]]) -> InlineKeyboardMarkup:
+    """Keyboard for selecting one of the models in a pair."""
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"Выбрать «{title}»", callback_data=f"pick|{unique_id}")],
-            [InlineKeyboardButton(text="Подробнее о модели", url=site_url)],
-        ]
-    )
-
-
-def more_models_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard offering to fetch more models."""
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Ещё 4", callback_data="more_models")]
-        ]
-    )
+    buttons = [
+        [InlineKeyboardButton(text=f"Выбрать: {title}", callback_data=f"pick|{unique_id}")]
+        for unique_id, title in models
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def result_keyboard(product_url: str, ref_url: str) -> InlineKeyboardMarkup:
-    """Keyboard for the result screen."""
+def generation_result_keyboard(site_url: str, remaining: int) -> InlineKeyboardMarkup:
+    """Keyboard attached to the generation result message."""
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Ещё", callback_data="result_more")],
-            [InlineKeyboardButton(text="Посмотреть/Купить", url=product_url)],
-            [InlineKeyboardButton(text="Поделиться", url=ref_url)],
-        ]
-    )
+    buttons = [InlineKeyboardButton(text="Подробнее о модели", url=site_url)]
+    if remaining > 0:
+        buttons.append(
+            InlineKeyboardButton(
+                text=f"Ещё варианты (осталось {remaining})",
+                callback_data=f"more|{remaining}",
+            )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 def limit_reached_keyboard() -> InlineKeyboardMarkup:

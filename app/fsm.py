@@ -13,16 +13,19 @@ from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
-from aiogram.types.input_file import FSInputFile, URLInputFile
+from aiogram.types.input_file import (
+    BufferedInputFile,
+    FSInputFile,
+    URLInputFile,
+)
 
 from app import messages_ru as msg
 from app.keyboards import (
     age_keyboard,
     gender_keyboard,
+    generation_result_keyboard,
     limit_reached_keyboard,
-    model_card_keyboard,
-    more_models_keyboard,
-    result_keyboard,
+    pair_selection_keyboard,
     retry_keyboard,
     start_keyboard,
     style_keyboard,
@@ -30,10 +33,10 @@ from app.keyboards import (
 from app.logging_conf import EVENT_ID
 from app.models import FilterOptions, GlassModel
 from app.services.catalog_base import CatalogError, CatalogService
+from app.services.collage import CollageResult, CollageService
 from app.services.repository import Repository
 from app.services.tryon_base import TryOnService
 from app.services.storage_base import StorageService
-from app.utils.deeplink import build_ref_link
 
 
 class TryOnStates(StatesGroup):
@@ -54,8 +57,8 @@ def setup_router(
     catalog: CatalogService,
     tryon: TryOnService,
     storage: StorageService,
+    collage: CollageService,
     reminder_hours: int,
-    bot_username: str,
 ) -> Router:
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
@@ -77,7 +80,9 @@ def setup_router(
             style=data.get("style", "normal"),
         )
 
-    async def _send_models(message: Message, user_id: int, filters: FilterOptions, state: FSMContext) -> None:
+    async def _send_models(
+        message: Message, user_id: int, filters: FilterOptions, state: FSMContext
+    ) -> None:
         profile = await repository.ensure_user(user_id)
         seen_ids = set(profile.seen_models if profile else [])
         gender = _catalog_gender(filters.gender)
@@ -94,22 +99,62 @@ def setup_router(
             return
         await repository.add_seen_models(user_id, [model.unique_id for model in models])
         await state.update_data(current_models=models)
-        for model in models:
+        await _send_model_pairs(message, models)
+        logger.info("%s Sent %s models", EVENT_ID["MODELS_SENT"], len(models))
+
+    async def _send_model_pairs(message: Message, models: list[GlassModel]) -> None:
+        pairs = _pair_models(models)
+        total_pairs = len(pairs)
+        for index, pair in enumerate(pairs, start=1):
+            caption = f"Подборка {index}/{total_pairs}" if total_pairs > 1 else ""
             try:
-                await message.answer_photo(
-                    photo=URLInputFile(model.img_user_url),
-                    caption=model.title,
-                    reply_markup=model_card_keyboard(model.unique_id, model.title, model.site_url),
-                )
+                await _send_pair_message(message, pair, caption)
             except Exception as exc:  # noqa: BLE001
                 logger.error(
-                    "%s Failed to send model %s: %s",
+                    "%s Failed to send model pair %s: %s",
                     EVENT_ID["MODELS_SENT"],
-                    model.unique_id,
+                    [model.unique_id for model in pair],
                     exc,
                 )
-        await message.answer(msg.SHOWING_MODELS, reply_markup=more_models_keyboard())
-        logger.info("%s Sent %s models", EVENT_ID["MODELS_SENT"], len(models))
+
+    async def _send_pair_message(
+        message: Message, pair: tuple[GlassModel, ...], caption: str
+    ) -> None:
+        caption_to_use = caption or None
+        collage_result: CollageResult | None = None
+        if collage.enabled:
+            collage_result = await collage.build_collage([model.img_user_url for model in pair])
+        if collage_result and collage_result.included_indices:
+            included_models = [pair[i] for i in collage_result.included_indices]
+            keyboard = pair_selection_keyboard(
+                [(model.unique_id, model.title) for model in included_models]
+            )
+            filename = f"collage-{uuid.uuid4().hex}.jpg"
+            collage_caption = caption_to_use if 0 in collage_result.included_indices else None
+            await message.answer_photo(
+                photo=BufferedInputFile(collage_result.image_bytes, filename=filename),
+                caption=collage_caption,
+                reply_markup=keyboard,
+            )
+            missing_indices = set(range(len(pair))) - set(collage_result.included_indices)
+            for missing_index in missing_indices:
+                model = pair[missing_index]
+                await _send_single_model(message, model, caption if missing_index == 0 else "")
+            return
+
+        for offset, model in enumerate(pair):
+            await _send_single_model(message, model, caption if offset == 0 else "")
+
+    async def _send_single_model(message: Message, model: GlassModel, caption: str) -> None:
+        keyboard = pair_selection_keyboard([(model.unique_id, model.title)])
+        await message.answer_photo(
+            photo=URLInputFile(model.img_user_url),
+            caption=caption or None,
+            reply_markup=keyboard,
+        )
+
+    def _pair_models(models: list[GlassModel]) -> list[tuple[GlassModel, ...]]:
+        return [tuple(models[i : i + 2]) for i in range(0, len(models), 2)]
 
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
@@ -194,13 +239,6 @@ def setup_router(
         await _send_models(message, user_id, filters, state)
         logger.info("%s Photo received from %s", EVENT_ID["PHOTO_RECEIVED"], user_id)
 
-    @router.callback_query(StateFilter(TryOnStates.SHOW_RECS), F.data == "more_models")
-    async def more_models(callback: CallbackQuery, state: FSMContext) -> None:
-        user_id = callback.from_user.id
-        filters = await _ensure_filters(user_id, state)
-        await _send_models(callback.message, user_id, filters, state)
-        await callback.answer()
-
     @router.callback_query(StateFilter(TryOnStates.SHOW_RECS), F.data.startswith("pick|"))
     async def choose_model(callback: CallbackQuery, state: FSMContext) -> None:
         model_id = callback.data.replace("pick|", "")
@@ -247,24 +285,33 @@ def setup_router(
             return
         await repository.inc_used_on_success(user_id)
         await state.set_state(TryOnStates.RESULT)
-        await message.answer(msg.GENERATION_SUCCESS)
-        for result_path in results:
-            await message.answer_photo(FSInputFile(path=str(result_path)))
-        ref_link = build_ref_link(bot_username, user_id)
-        await message.answer(
-            "Поделиться ссылкой: " + ref_link,
-            reply_markup=result_keyboard(model.site_url, ref_link),
-        )
+        if not results:
+            await message.answer(msg.GENERATION_FAILED, reply_markup=retry_keyboard())
+            await state.set_state(TryOnStates.ERROR)
+            return
+        primary_result = results[0]
         remaining = await repository.remaining_tries(user_id)
+        keyboard = generation_result_keyboard(model.site_url, remaining)
+        await message.answer_photo(
+            FSInputFile(path=str(primary_result)),
+            caption=msg.GENERATION_SUCCESS,
+            reply_markup=keyboard,
+        )
         if remaining <= 0:
             await state.set_state(TryOnStates.LIMIT_REACHED)
             await message.answer(msg.LIMIT_REACHED, reply_markup=limit_reached_keyboard())
             logger.info("%s Limit reached post generation %s", EVENT_ID["LIMIT_REACHED"], user_id)
         logger.info("%s Generation succeeded for %s", EVENT_ID["GENERATION_SUCCESS"], user_id)
 
-    @router.callback_query(StateFilter(TryOnStates.RESULT), F.data == "result_more")
+    @router.callback_query(StateFilter(TryOnStates.RESULT), F.data.startswith("more|"))
     async def result_more(callback: CallbackQuery, state: FSMContext) -> None:
         user_id = callback.from_user.id
+        remaining = await repository.remaining_tries(user_id)
+        if remaining <= 0:
+            await state.set_state(TryOnStates.LIMIT_REACHED)
+            await callback.message.answer(msg.LIMIT_REACHED, reply_markup=limit_reached_keyboard())
+            await callback.answer()
+            return
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
         await callback.message.answer("Ищу свежие модели...")
