@@ -13,7 +13,7 @@ from app.config import load_settings
 from app.fsm import setup_router
 from app.keyboards import start_keyboard
 from app.logging_conf import EVENT_ID, setup_logging
-from app.services.catalog_local import CatalogLocalConfig, CatalogServiceLocal
+from app.services.catalog_google import GoogleCatalogConfig, GoogleSheetCatalog
 from app.services.repository import Repository
 from app.services.scheduler import ReminderScheduler
 from app.services.storage_local import LocalStorage
@@ -26,7 +26,6 @@ async def main() -> None:
     settings = load_settings()
     logger = setup_logging()
 
-    ensure_dir(settings.catalog_root)
     ensure_dir(settings.uploads_root)
     ensure_dir(settings.results_root)
 
@@ -37,10 +36,12 @@ async def main() -> None:
     await repository.init()
 
     storage = LocalStorage(settings.uploads_root, settings.results_root)
-    catalog_config = CatalogLocalConfig(
-        root=settings.catalog_root,
+    catalog_config = GoogleCatalogConfig(
+        csv_url=str(settings.sheet_csv_url),
+        cache_ttl_seconds=settings.csv_fetch_ttl_sec,
+        retries=settings.csv_fetch_retries,
     )
-    catalog_service = CatalogServiceLocal(catalog_config, repository)
+    catalog_service = GoogleSheetCatalog(catalog_config)
 
     if settings.mock_tryon:
         tryon_service = MockTryOnService(storage)
@@ -77,6 +78,7 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         await scheduler.stop()
+        await catalog_service.aclose()
         await bot.session.close()
 
 

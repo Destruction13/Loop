@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Iterable, List
-
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
@@ -59,20 +57,25 @@ def style_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def models_keyboard(model_ids: Iterable[str]) -> InlineKeyboardMarkup:
-    """Keyboard allowing to select one of the presented models."""
+def model_card_keyboard(unique_id: str, title: str, site_url: str) -> InlineKeyboardMarkup:
+    """Keyboard attached to a catalog card."""
 
-    rows: List[List[InlineKeyboardButton]] = []
-    for model_id in model_ids:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"Выбрать {model_id}", callback_data=f"choose_{model_id}"
-                )
-            ]
-        )
-    rows.append([InlineKeyboardButton(text="Ещё 4", callback_data="more_models")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"Выбрать «{title}»", callback_data=f"pick|{unique_id}")],
+            [InlineKeyboardButton(text="Подробнее о модели", url=site_url)],
+        ]
+    )
+
+
+def more_models_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard offering to fetch more models."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Ещё 4", callback_data="more_models")]
+        ]
+    )
 
 
 def result_keyboard(product_url: str, ref_url: str) -> InlineKeyboardMarkup:
