@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Generator, Iterable, List, Optional
+from typing import Generator, Iterable, List, Optional, Tuple
 
 from app.models import UserProfile
 
@@ -64,13 +64,45 @@ class Repository:
             await asyncio.to_thread(self._upsert_user, profile)
 
     async def add_seen_models(self, user_id: int, model_ids: Iterable[str]) -> None:
+        ids = list(dict.fromkeys(model_ids))
+        if not ids:
+            return
+        await self.record_seen_models(user_id, ids)
         profile = await self.ensure_daily_reset(user_id)
         lock = self._ensure_lock()
         async with lock:
             seen_set = set(profile.seen_models)
-            seen_set.update(model_ids)
+            seen_set.update(ids)
             profile.seen_models = list(seen_set)
             await asyncio.to_thread(self._upsert_user, profile)
+
+    async def record_seen_models(
+        self,
+        user_id: int,
+        model_ids: Iterable[str],
+        *,
+        when: datetime | None = None,
+    ) -> None:
+        ids = list(dict.fromkeys(model_ids))
+        if not ids:
+            return
+        timestamp = (when or datetime.now(timezone.utc)).isoformat()
+        await asyncio.to_thread(self._record_seen_models_sync, user_id, ids, timestamp)
+
+    async def list_seen_models(self, user_id: int, *, since: datetime | None) -> set[str]:
+        since_iso = since.isoformat() if since else None
+        return await asyncio.to_thread(self._list_seen_models_sync, user_id, since_iso)
+
+    async def sync_catalog_version(
+        self, version_hash: str, *, clear_on_change: bool
+    ) -> Tuple[bool, bool]:
+        lock = self._ensure_lock()
+        async with lock:
+            return await asyncio.to_thread(
+                self._sync_catalog_version_sync,
+                version_hash,
+                clear_on_change,
+            )
 
     async def set_referrer(self, user_id: int, referrer_id: int) -> None:
         profile = await self.ensure_user(user_id)
@@ -100,6 +132,24 @@ class Repository:
                     seen_models TEXT,
                     remind_at TEXT,
                     referrer_id INTEGER
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_seen_models (
+                    user_id INTEGER NOT NULL,
+                    model_id TEXT NOT NULL,
+                    seen_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, model_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS catalog_meta (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    version_hash TEXT NOT NULL
                 )
                 """
             )
@@ -184,6 +234,67 @@ class Repository:
             if profile:
                 result.append(profile)
         return result
+
+    def _record_seen_models_sync(
+        self, user_id: int, model_ids: list[str], timestamp: str
+    ) -> None:
+        if not model_ids:
+            return
+        with self._connection() as conn:
+            conn.executemany(
+                """
+                INSERT INTO user_seen_models (user_id, model_id, seen_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id, model_id) DO UPDATE SET seen_at=excluded.seen_at
+                """,
+                [(user_id, model_id, timestamp) for model_id in model_ids],
+            )
+            conn.commit()
+
+    def _list_seen_models_sync(
+        self, user_id: int, since_iso: str | None
+    ) -> set[str]:
+        with self._connection() as conn:
+            if since_iso:
+                cur = conn.execute(
+                    "SELECT model_id FROM user_seen_models WHERE user_id = ? AND seen_at >= ?",
+                    (user_id, since_iso),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT model_id FROM user_seen_models WHERE user_id = ?",
+                    (user_id,),
+                )
+            rows = cur.fetchall()
+        return {row[0] for row in rows}
+
+    def _sync_catalog_version_sync(
+        self, version_hash: str, clear_on_change: bool
+    ) -> Tuple[bool, bool]:
+        changed = False
+        cleared = False
+        with self._connection() as conn:
+            cur = conn.execute("SELECT version_hash FROM catalog_meta WHERE id = 1")
+            row = cur.fetchone()
+            if not row:
+                conn.execute(
+                    "INSERT INTO catalog_meta (id, version_hash) VALUES (1, ?)",
+                    (version_hash,),
+                )
+                conn.commit()
+                return changed, cleared
+            current = row[0]
+            if current != version_hash:
+                changed = True
+                if clear_on_change:
+                    conn.execute("DELETE FROM user_seen_models")
+                    cleared = True
+                conn.execute(
+                    "UPDATE catalog_meta SET version_hash = ? WHERE id = 1",
+                    (version_hash,),
+                )
+            conn.commit()
+        return changed, cleared
 
     def _ensure_lock(self) -> asyncio.Lock:
         if self._lock is None:

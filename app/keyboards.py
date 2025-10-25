@@ -167,3 +167,22 @@ def reminder_keyboard() -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def all_seen_keyboard(landing_url: str) -> InlineKeyboardMarkup:
+    """Keyboard shown when подборки закончились."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=msg.REMIND_LATER_BUTTON_TEXT,
+                    callback_data="limit_remind",
+                ),
+                InlineKeyboardButton(
+                    text=msg.BOOKING_BUTTON_TEXT,
+                    url=landing_url,
+                ),
+            ]
+        ]
+    )

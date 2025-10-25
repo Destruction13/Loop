@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 
 from app.models import GlassModel
-from app.services.catalog_base import CatalogError, CatalogService
+from app.services.catalog_base import CatalogError, CatalogService, CatalogSnapshot
 from app.utils.drive import DriveFolderUrlError, DriveUrlError, drive_view_to_direct
 
 LOGGER = logging.getLogger("loop_bot.catalog.google")
@@ -58,11 +58,12 @@ class GoogleSheetCatalog(CatalogService):
         else:
             self._client = client
         self._client_owner = client is None
-        self._cache: tuple[float, list[GlassModel]] | None = None
+        self._cache: tuple[float, CatalogSnapshot] | None = None
         self._lock = asyncio.Lock()
 
     async def list_by_gender(self, gender: str) -> list[GlassModel]:
-        models = await self._load_models()
+        snapshot = await self.snapshot()
+        models = snapshot.models
         normalized = _normalize_gender(gender)
         allowed: set[str]
         if normalized == "Унисекс":
@@ -89,19 +90,30 @@ class GoogleSheetCatalog(CatalogService):
         if self._client_owner:
             await self._client.aclose()
 
-    async def _load_models(self) -> list[GlassModel]:
+    async def snapshot(self) -> CatalogSnapshot:
+        snapshot = await self._load_snapshot()
+        return CatalogSnapshot(models=list(snapshot.models), version_hash=snapshot.version_hash)
+
+    async def _load_snapshot(self) -> CatalogSnapshot:
         async with self._lock:
             if self._cache and (time.monotonic() - self._cache[0] < self._config.cache_ttl_seconds):
-                return list(self._cache[1])
+                cached_snapshot = self._cache[1]
+                return CatalogSnapshot(
+                    models=list(cached_snapshot.models),
+                    version_hash=cached_snapshot.version_hash,
+                )
             csv_content = await self._fetch_csv()
             models = self._parse_csv(csv_content)
-            self._cache = (time.monotonic(), models)
+            version_hash = _compute_version_hash(models)
+            snapshot = CatalogSnapshot(models=list(models), version_hash=version_hash)
+            self._cache = (time.monotonic(), snapshot)
             LOGGER.info(
-                "Catalog cache refreshed with %s entries (payload %s bytes)",
+                "Catalog cache refreshed with %s entries (payload %s bytes, hash=%s)",
                 len(models),
                 len(csv_content.encode("utf-8")),
+                version_hash,
             )
-            return list(models)
+            return CatalogSnapshot(models=list(models), version_hash=version_hash)
 
     async def _fetch_csv(self) -> str:
         urls: List[str] = [self._config.csv_url]
@@ -262,13 +274,20 @@ def _normalize_header(header: str) -> str:
 
 def _normalize_gender(value: str) -> str:
     prepared = (value or "").strip().lower()
-    if prepared.startswith("муж") or prepared.startswith("male"):
+    male_tokens = {"муж", "мужской", "м", "male", "m"}
+    female_tokens = {"жен", "женский", "ж", "female", "f"}
+    unisex_tokens = {"унисекс", "uni", "unisex", "u"}
+    if prepared in male_tokens or prepared.startswith("муж"):
         return "Мужской"
-    if prepared.startswith("жен") or prepared.startswith("female"):
+    if prepared in female_tokens or prepared.startswith("жен"):
         return "Женский"
-    if prepared.startswith("уни") or prepared.startswith("uni"):
+    if prepared in unisex_tokens or prepared.startswith("уни") or prepared.startswith("uni"):
         return "Унисекс"
-    return "Унисекс"
+    if not prepared:
+        return "Унисекс"
+    if prepared:
+        LOGGER.warning("Unknown gender value '%s' in catalog, treating as Other", value)
+    return "Other"
 
 
 def _make_fallback_id(title: str, site_url: str) -> str:
@@ -311,3 +330,21 @@ def _clean_drive_url(value: str | None) -> str:
     if value is None:
         return ""
     return value.strip().strip("\u200b\u200c\u200d\ufeff")
+
+
+def _compute_version_hash(models: list[GlassModel]) -> str:
+    lines = []
+    for model in models:
+        normalized_gender = (model.gender or "").strip().lower()
+        line = "|".join(
+            [
+                model.unique_id.strip(),
+                model.title.strip(),
+                model.site_url.strip(),
+                model.img_user_url.strip(),
+                normalized_gender,
+            ]
+        )
+        lines.append(line)
+    payload = "\n".join(lines)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

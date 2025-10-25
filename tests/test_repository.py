@@ -29,3 +29,26 @@ def test_daily_reset(tmp_path: Path) -> None:
         assert remaining == 2
 
     asyncio.run(scenario())
+
+
+def test_catalog_version_sync_clears_seen(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    repo = Repository(db_path, daily_limit=5)
+
+    async def scenario() -> None:
+        await repo.init()
+        await repo.sync_catalog_version("v1", clear_on_change=True)
+        await repo.record_seen_models(1, ["a", "b"])
+        seen = await repo.list_seen_models(1, since=None)
+        assert seen == {"a", "b"}
+
+        changed, cleared = await repo.sync_catalog_version("v1", clear_on_change=True)
+        assert changed is False
+        assert cleared is False
+
+        changed, cleared = await repo.sync_catalog_version("v2", clear_on_change=True)
+        assert changed is True
+        assert cleared is True
+        assert await repo.list_seen_models(1, since=None) == set()
+
+    asyncio.run(scenario())

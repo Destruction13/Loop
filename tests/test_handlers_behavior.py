@@ -3,7 +3,7 @@ import io
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardRemove
 from PIL import Image
@@ -100,6 +100,8 @@ class StubRepository:
         self.daily_used: int = 0
         self.seen_models: list[str] = []
         self.updated_filters: list[tuple[int, str]] = []
+        self.reminder: Optional[Any] = None
+        self.synced_versions: list[str] = []
 
     async def ensure_user(self, user_id: int) -> Any:
         return SimpleNamespace(gender=self.gender, daily_used=self.daily_used, seen_models=list(self.seen_models))
@@ -114,8 +116,17 @@ class StubRepository:
     async def remaining_tries(self, user_id: int) -> int:
         return max(self.daily_limit - self.daily_used, 0)
 
-    async def add_seen_models(self, user_id: int, model_ids: list[str]) -> None:
+    async def record_seen_models(
+        self, user_id: int, model_ids: Iterable[str], *, when: Optional[Any] = None
+    ) -> None:
         self.seen_models.extend(model_ids)
+
+    async def list_seen_models(self, user_id: int, *, since: Optional[Any]) -> set[str]:
+        return set()
+
+    async def sync_catalog_version(self, version_hash: str, *, clear_on_change: bool) -> tuple[bool, bool]:
+        self.synced_versions.append(version_hash)
+        return False, False
 
     async def inc_used_on_success(self, user_id: int) -> None:
         self.daily_used += 1
@@ -130,14 +141,17 @@ class StubRepository:
         return []
 
 
-class StubCatalog:
+class StubRecommendationService:
     def __init__(self, models: list[GlassModel]) -> None:
-        self.models = models
-        self.calls: list[tuple[str, set[str]]] = []
+        self.default = list(models)
+        self.queue: list[list[GlassModel]] = []
+        self.calls: list[tuple[int, str]] = []
 
-    async def pick_four(self, gender: str, seen_ids: set[str]) -> list[GlassModel]:
-        self.calls.append((gender, seen_ids))
-        return list(self.models)
+    async def recommend_for_user(self, user_id: int, gender: str) -> list[GlassModel]:
+        self.calls.append((user_id, gender))
+        if self.queue:
+            return self.queue.pop(0)
+        return list(self.default)
 
 
 class StubTryOn:
@@ -185,9 +199,9 @@ def build_router(
     models: Optional[list[GlassModel]] = None,
     *,
     collage_builder: Optional[StubCollageBuilder] = None,
-) -> tuple[Any, StubRepository, StubTryOn, StubCollageBuilder]:
+) -> tuple[Any, StubRepository, StubTryOn, StubCollageBuilder, StubRecommendationService]:
     repository = StubRepository()
-    catalog = StubCatalog(models or [])
+    recommender = StubRecommendationService(models or [])
     result_path = tmp_path / "result.png"
     result_path.write_bytes(b"fake-image")
     tryon = StubTryOn(result_path=result_path)
@@ -211,7 +225,7 @@ def build_router(
 
     router = setup_router(
         repository=repository,
-        catalog=catalog,
+        recommender=recommender,
         tryon=tryon,
         storage=storage,
         collage_config=collage_config,
@@ -220,8 +234,9 @@ def build_router(
         selection_button_title_max=28,
         landing_url="https://example.com",
         promo_code="PROMO",
+        no_more_message_key="all_seen",
     )
-    return router, repository, tryon, builder
+    return router, repository, tryon, builder, recommender
 
 
 def get_callback_handler(router: Any, name: str):
@@ -240,7 +255,7 @@ def get_message_handler(router: Any, name: str):
 
 def test_select_gender_deletes_prompt_and_waits_for_photo(tmp_path: Path) -> None:
     async def scenario() -> None:
-        router, repository, _, _ = build_router(tmp_path)
+        router, repository, _, _, _ = build_router(tmp_path)
         handler = get_callback_handler(router, "select_gender")
 
         bot = DummyBot()
@@ -300,7 +315,7 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
         ),
     ]
     async def scenario() -> None:
-        router, repository, _, builder = build_router(tmp_path, models=models)
+        router, repository, _, builder, _ = build_router(tmp_path, models=models)
         handler = get_message_handler(router, "accept_photo")
 
         bot = DummyBot()
@@ -314,7 +329,6 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
         preload_id = message.message_id + 1
         assert (321, preload_id) in bot.deleted
         assert state.data.get("preload_message_id") is None
-        assert repository.seen_models == ["m1", "m2", "m3", "m4"]
         assert len(builder.calls) == 2
         assert len(message.answer_photos) == 2
         captions = [caption for _, caption, _ in message.answer_photos]
@@ -326,6 +340,31 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
             assert isinstance(markup, InlineKeyboardMarkup)
             assert len(markup.inline_keyboard) == 1
             assert len(markup.inline_keyboard[0]) == 2
+
+    asyncio.run(scenario())
+
+
+def test_exhausted_catalog_sends_marketing_message(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, recommender = build_router(tmp_path)
+        recommender.queue.append([])
+        handler = get_message_handler(router, "accept_photo")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=999, bot=bot)
+        message.photo = [PhotoStub("photo")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler(message, state)
+
+        fallback_text, markup = message.answers[-1]
+        assert fallback_text == msg.marketing_text("all_seen")
+        assert isinstance(markup, InlineKeyboardMarkup)
+        assert len(markup.inline_keyboard) == 1
+        assert len(markup.inline_keyboard[0]) == 2
+        assert markup.inline_keyboard[0][0].callback_data == "limit_remind"
+        assert markup.inline_keyboard[0][1].url == "https://example.com"
 
     asyncio.run(scenario())
 
@@ -355,7 +394,7 @@ def test_collage_source_unavailable_falls_back_to_text(tmp_path: Path) -> None:
     async def scenario() -> None:
         builder = StubCollageBuilder()
         builder.fail_sources = True
-        router, repository, _, returned_builder = build_router(
+        router, repository, _, returned_builder, _ = build_router(
             tmp_path, models=models, collage_builder=builder
         )
         assert returned_builder is builder
@@ -375,7 +414,6 @@ def test_collage_source_unavailable_falls_back_to_text(tmp_path: Path) -> None:
         assert msg.COLLAGE_IMAGES_UNAVAILABLE in fallback_text
         assert isinstance(markup, InlineKeyboardMarkup)
         assert len(markup.inline_keyboard[0]) == 2
-        assert repository.seen_models == ["m1", "m2"]
 
     asyncio.run(scenario())
 
@@ -405,7 +443,7 @@ def test_collage_processing_error_sends_individual_photos(tmp_path: Path) -> Non
     async def scenario() -> None:
         builder = StubCollageBuilder()
         builder.fail_processing = True
-        router, _, _, returned_builder = build_router(
+        router, _, _, returned_builder, _ = build_router(
             tmp_path, models=models, collage_builder=builder
         )
         assert returned_builder is builder
@@ -444,7 +482,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         gender="Мужской",
     )
     async def scenario() -> None:
-        router, repository, tryon, _ = build_router(tmp_path, models=[model])
+        router, repository, tryon, _, _ = build_router(tmp_path, models=[model])
         handler_photo = get_message_handler(router, "accept_photo")
         handler_choose = get_callback_handler(router, "choose_model")
 
