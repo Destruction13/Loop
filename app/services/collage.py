@@ -117,6 +117,8 @@ async def _download_sources(
 
 def _compose_collage(sources: Iterable[_CollageSource], cfg: CollageConfig) -> io.BytesIO:
     background = ImageColor.getrgb(cfg.background)
+    divider_color = ImageColor.getrgb(cfg.divider_color)
+    cell_border_color = ImageColor.getrgb(cfg.cell_border_color)
     width = max(cfg.width, 1)
     height = max(cfg.height, 1)
     padding = max(cfg.padding, 0)
@@ -125,14 +127,47 @@ def _compose_collage(sources: Iterable[_CollageSource], cfg: CollageConfig) -> i
     cell_height = max(height - 2 * padding, 1)
 
     canvas = Image.new("RGB", (width, height), color=background)
+    draw = ImageDraw.Draw(canvas)
+
+    cell_boxes = [
+        (
+            padding + index * (cell_width + gap),
+            padding,
+            padding + index * (cell_width + gap) + cell_width,
+            padding + cell_height,
+        )
+        for index in range(2)
+    ]
 
     for index, source in enumerate(sources):
         image = _load_source_image(source, (cell_width, cell_height), cfg, background)
-        offset_x = padding + index * (cell_width + gap)
+        cell_left, _, _, _ = cell_boxes[index]
+        offset_x = cell_left
         pos_x = offset_x + max((cell_width - image.width) // 2, 0)
         pos_y = padding + max((cell_height - image.height) // 2, 0)
         canvas.paste(image, (pos_x, pos_y))
         image.close()
+
+    divider_width = max(cfg.divider, 0)
+    if divider_width > 0:
+        divider_radius = max(cfg.divider_radius, 0)
+        divider_left = padding + cell_width + (gap - divider_width) // 2
+        divider_left = max(padding, min(divider_left, width - padding - divider_width))
+        divider_right = divider_left + divider_width
+        divider_box = (divider_left, padding, divider_right, padding + cell_height)
+        if divider_radius > 0:
+            draw.rounded_rectangle(
+                divider_box,
+                radius=min(divider_radius, min(cell_height, divider_width) // 2),
+                fill=divider_color,
+            )
+        else:
+            draw.rectangle(divider_box, fill=divider_color)
+
+    border_width = max(cfg.cell_border, 0)
+    if border_width > 0:
+        for cell_box in cell_boxes:
+            draw.rectangle(cell_box, outline=cell_border_color, width=border_width)
 
     sharpen_amount = max(0.0, min(cfg.sharpen, 1.0))
     if sharpen_amount > 0:

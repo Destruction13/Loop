@@ -27,6 +27,11 @@ class CollageConfig:
     jpeg_quality: int
     fit_mode: str
     sharpen: float
+    divider: int
+    divider_color: str
+    divider_radius: int
+    cell_border: int
+    cell_border_color: str
 
 
 @dataclass(slots=True)
@@ -112,6 +117,12 @@ def load_config(env_file: str | None = None) -> Config:
         jpeg_quality=_as_int(_get("COLLAGE_JPEG_QUALITY", "90"), 90),
         fit_mode=_as_fit_mode(_get("COLLAGE_FIT_MODE", "contain"), "contain"),
         sharpen=_as_float(_get("COLLAGE_SHARPEN", "0.0"), 0.0),
+        divider=_as_int(_get("COLLAGE_DIVIDER", "6"), 6),
+        divider_color=_get("COLLAGE_DIVIDER_COLOR", "#E6E9EF") or "#E6E9EF",
+        divider_radius=_as_int(_get("COLLAGE_DIVIDER_RADIUS", "0"), 0),
+        cell_border=_as_int(_get("COLLAGE_CELL_BORDER", "0"), 0),
+        cell_border_color=_get("COLLAGE_CELL_BORDER_COLOR", "#D7DBE4")
+        or "#D7DBE4",
     )
 
     return Config(

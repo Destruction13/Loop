@@ -17,7 +17,12 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardRemove,
+)
 from aiogram.types.input_file import BufferedInputFile, FSInputFile, URLInputFile
 
 from app.keyboards import (
@@ -189,8 +194,9 @@ def setup_router(
                 [model.unique_id for model in pair],
                 exc,
             )
-            await _send_pair_as_photos(message, pair)
-            await message.answer(label_text, reply_markup=keyboard)
+            await _send_pair_as_photos(
+                message, pair, label_text=label_text, reply_markup=keyboard
+            )
             return
         except Exception as exc:  # noqa: BLE001
             logger.error(
@@ -198,8 +204,9 @@ def setup_router(
                 [model.unique_id for model in pair],
                 exc,
             )
-            await _send_pair_as_photos(message, pair)
-            await message.answer(label_text, reply_markup=keyboard)
+            await _send_pair_as_photos(
+                message, pair, label_text=label_text, reply_markup=keyboard
+            )
             return
 
         filename = f"collage-{uuid.uuid4().hex}.jpg"
@@ -207,14 +214,26 @@ def setup_router(
         buffer.close()
         await message.answer_photo(
             photo=BufferedInputFile(collage_bytes, filename=filename),
+            caption=label_text,
+            reply_markup=keyboard,
         )
-        await message.answer(label_text, reply_markup=keyboard)
 
     async def _send_pair_as_photos(
-        message: Message, pair: tuple[GlassModel, ...]
+        message: Message,
+        pair: tuple[GlassModel, ...],
+        *,
+        label_text: str,
+        reply_markup: InlineKeyboardMarkup,
     ) -> None:
-        for item in pair:
-            await message.answer_photo(photo=URLInputFile(item.img_user_url))
+        last_index = len(pair) - 1
+        for index, item in enumerate(pair):
+            caption = label_text if index == last_index else None
+            markup = reply_markup if index == last_index else None
+            await message.answer_photo(
+                photo=URLInputFile(item.img_user_url),
+                caption=caption,
+                reply_markup=markup,
+            )
 
     async def _delete_state_message(message: Message, state: FSMContext, key: str) -> None:
         data = await state.get_data()
@@ -307,9 +326,9 @@ def setup_router(
         await _send_models(message, user_id, filters, state)
         logger.info("%s Photo received from %s", EVENT_ID["PHOTO_RECEIVED"], user_id)
 
-    @router.callback_query(StateFilter(TryOnStates.SHOW_RECS), F.data.startswith("pick|"))
+    @router.callback_query(StateFilter(TryOnStates.SHOW_RECS), F.data.startswith("pick:"))
     async def choose_model(callback: CallbackQuery, state: FSMContext) -> None:
-        model_id = callback.data.replace("pick|", "")
+        model_id = callback.data.replace("pick:", "", 1)
         data = await state.get_data()
         models_data: List[GlassModel] = data.get("current_models", [])
         selected = next((model for model in models_data if model.unique_id == model_id), None)

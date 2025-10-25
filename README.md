@@ -40,11 +40,24 @@ COLLAGE_BG="#FFFFFF"
 COLLAGE_JPEG_QUALITY=90
 COLLAGE_FIT_MODE=contain  # варианты: contain | cover
 COLLAGE_SHARPEN=0.0       # 0..1, лёгкая резкость
+COLLAGE_DIVIDER=6         # толщина вертикальной полосы между фото
+COLLAGE_DIVIDER_COLOR="#E6E9EF"
+COLLAGE_DIVIDER_RADIUS=0  # px скругления разделителя
+COLLAGE_CELL_BORDER=0     # толщина рамки вокруг каждой ячейки (0 = выкл)
+COLLAGE_CELL_BORDER_COLOR="#D7DBE4"
 ```
 
 Параметры отвечают за итоговый размер, отступы, цвет фона и качество JPEG. По умолчанию изображения вписываются по
 алгоритму «contain» (без кропа), но можно переключить режим на «cover» через `COLLAGE_FIT_MODE`. Допустимо включить
 лёгкую резкость значением `COLLAGE_SHARPEN` (> 0).
+
+### Разделитель и рамки
+
+- `COLLAGE_DIVIDER` + `COLLAGE_DIVIDER_COLOR` рисуют вертикальную полосу между половинами. Скругление задаётся через
+  `COLLAGE_DIVIDER_RADIUS` — 0 отключает его.
+- `COLLAGE_CELL_BORDER` позволяет обвести каждую ячейку поверх изображения; цвет задаётся в `COLLAGE_CELL_BORDER_COLOR`.
+- Для аккуратной нейтральной палитры подойдут оттенки #E6E9EF (разделитель) и #D7DBE4 (рамки), которые не отвлекают от
+  самих оправ.
 
 Рекомендации по исходным кадрам:
 

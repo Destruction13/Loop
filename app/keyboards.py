@@ -73,7 +73,7 @@ def pair_selection_keyboard(
         buttons.append(
             InlineKeyboardButton(
                 text=truncated,
-                callback_data=f"pick|{unique_id}",
+                callback_data=f"pick:{unique_id}",
             )
         )
     return InlineKeyboardMarkup(inline_keyboard=[buttons])

@@ -16,9 +16,9 @@ def test_pair_selection_keyboard_contains_expected_buttons() -> None:
     row = keyboard.inline_keyboard[0]
     assert len(row) == 2
     assert row[0].text == "Garnet Black"
-    assert row[0].callback_data == "pick|id1"
+    assert row[0].callback_data == "pick:id1"
     assert row[1].text == "Antimony Grey"
-    assert row[1].callback_data == "pick|id2"
+    assert row[1].callback_data == "pick:id2"
 
 
 def test_pair_selection_keyboard_truncates_titles() -> None:
@@ -43,7 +43,7 @@ def test_pair_selection_keyboard_single_model() -> None:
     row = keyboard.inline_keyboard[0]
     assert len(row) == 1
     assert row[0].text == "Solo Model"
-    assert row[0].callback_data == "pick|id1"
+    assert row[0].callback_data == "pick:id1"
 
 
 def test_generation_result_keyboard_with_remaining_options() -> None:

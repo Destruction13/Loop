@@ -30,6 +30,11 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 "COLLAGE_JPEG_QUALITY=80",
                 "COLLAGE_FIT_MODE=cover",
                 "COLLAGE_SHARPEN=0.5",
+                "COLLAGE_DIVIDER=8",
+                "COLLAGE_DIVIDER_COLOR=#112233",
+                "COLLAGE_DIVIDER_RADIUS=4",
+                "COLLAGE_CELL_BORDER=2",
+                "COLLAGE_CELL_BORDER_COLOR=#445566",
             ]
         ),
         encoding="utf-8",
@@ -60,3 +65,8 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.collage.jpeg_quality == 80
     assert config.collage.fit_mode == "cover"
     assert config.collage.sharpen == 0.5
+    assert config.collage.divider == 8
+    assert config.collage.divider_color == "#112233"
+    assert config.collage.divider_radius == 4
+    assert config.collage.cell_border == 2
+    assert config.collage.cell_border_color == "#445566"

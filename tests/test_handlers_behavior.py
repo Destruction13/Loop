@@ -202,6 +202,11 @@ def build_router(
         jpeg_quality=90,
         fit_mode="contain",
         sharpen=0.0,
+        divider=6,
+        divider_color="#E6E9EF",
+        divider_radius=0,
+        cell_border=0,
+        cell_border_color="#D7DBE4",
     )
 
     router = setup_router(
@@ -312,12 +317,12 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
         assert repository.seen_models == ["m1", "m2", "m3", "m4"]
         assert len(builder.calls) == 2
         assert len(message.answer_photos) == 2
-        pair_messages = message.answers[-2:]
-        assert [text for text, _ in pair_messages] == [
+        captions = [caption for _, caption, _ in message.answer_photos]
+        assert captions == [
             msg.PAIR_CAPTION_TEMPLATE.format(current=1, total=2),
             msg.PAIR_CAPTION_TEMPLATE.format(current=2, total=2),
         ]
-        for _, markup in pair_messages:
+        for _, _, markup in message.answer_photos:
             assert isinstance(markup, InlineKeyboardMarkup)
             assert len(markup.inline_keyboard) == 1
             assert len(markup.inline_keyboard[0]) == 2
@@ -416,9 +421,12 @@ def test_collage_processing_error_sends_individual_photos(tmp_path: Path) -> Non
 
         assert len(builder.calls) == 1
         assert len(message.answer_photos) == 2
-        assert all(photo[1] is None for photo in message.answer_photos)
-        last_text, markup = message.answers[-1]
-        assert last_text == msg.PAIR_CAPTION_TEMPLATE.format(current=1, total=1)
+        first_photo = message.answer_photos[0]
+        second_photo = message.answer_photos[1]
+        assert first_photo[1] is None
+        assert first_photo[2] is None
+        assert second_photo[1] == msg.PAIR_CAPTION_TEMPLATE.format(current=1, total=1)
+        markup = second_photo[2]
         assert isinstance(markup, InlineKeyboardMarkup)
         assert len(markup.inline_keyboard[0]) == 2
 
@@ -451,10 +459,10 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         data = await state.get_data()
         assert data.get("upload")
 
-        callback = DummyCallback("pick|m1", upload_message)
+        callback = DummyCallback("pick:m1", upload_message)
         await handler_choose(callback, state)
 
-        generation_id = upload_message.message_id + 3
+        generation_id = upload_message.message_id + 2
         assert (55, generation_id) in bot.deleted
         assert state.data.get("generation_message_id") is None
         assert repository.daily_used == 1
@@ -465,7 +473,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         callback_follow = DummyCallback("more|1", upload_message)
         handler_more = get_callback_handler(router, "result_more")
         await handler_more(callback_follow, state)
-        callback_second = DummyCallback("pick|m1", upload_message)
+        callback_second = DummyCallback("pick:m1", upload_message)
         await handler_choose(callback_second, state)
         assert upload_message.answer_photos[-1][1] == "".join(msg.NEXT_RESULT_CAPTION)
 
