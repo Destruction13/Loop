@@ -4,25 +4,29 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from aiogram import Router, F
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
-from aiogram.types.input_file import FSInputFile, URLInputFile
+from aiogram.types.input_file import (
+    BufferedInputFile,
+    FSInputFile,
+    URLInputFile,
+)
 
 from app import messages_ru as msg
 from app.keyboards import (
     age_keyboard,
     gender_keyboard,
+    generation_result_keyboard,
     limit_reached_keyboard,
-    model_card_keyboard,
-    more_models_keyboard,
-    result_keyboard,
+    pair_selection_keyboard,
     retry_keyboard,
     start_keyboard,
     style_keyboard,
@@ -30,10 +34,10 @@ from app.keyboards import (
 from app.logging_conf import EVENT_ID
 from app.models import FilterOptions, GlassModel
 from app.services.catalog_base import CatalogError, CatalogService
+from app.services.collage import CollageItem, CollageResult, CollageService
 from app.services.repository import Repository
 from app.services.tryon_base import TryOnService
 from app.services.storage_base import StorageService
-from app.utils.deeplink import build_ref_link
 
 
 class TryOnStates(StatesGroup):
@@ -49,16 +53,39 @@ class TryOnStates(StatesGroup):
     ERROR = State()
 
 
+@dataclass(slots=True)
+class IndexedModel:
+    """Model entry with a stable index within a batch."""
+
+    model: GlassModel
+    index: int
+
+
+def build_indexed_batch(models: Sequence[GlassModel]) -> list[IndexedModel]:
+    """Assign stable indices starting from 1 to the provided models."""
+
+    return [IndexedModel(model=model, index=offset + 1) for offset, model in enumerate(models)]
+
+
+def pair_indexed_models(batch: Sequence[IndexedModel]) -> list[tuple[IndexedModel, ...]]:
+    """Split indexed models into pairs preserving order."""
+
+    return [tuple(batch[i : i + 2]) for i in range(0, len(batch), 2)]
+
+
 def setup_router(
     repository: Repository,
     catalog: CatalogService,
     tryon: TryOnService,
     storage: StorageService,
+    collage: CollageService,
     reminder_hours: int,
-    bot_username: str,
+    selection_button_title_max: int,
+    selection_button_index_style: str,
 ) -> Router:
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
+    button_index_style = (selection_button_index_style or "emoji").lower()
 
     def _catalog_gender(value: str) -> str:
         mapping = {
@@ -77,7 +104,9 @@ def setup_router(
             style=data.get("style", "normal"),
         )
 
-    async def _send_models(message: Message, user_id: int, filters: FilterOptions, state: FSMContext) -> None:
+    async def _send_models(
+        message: Message, user_id: int, filters: FilterOptions, state: FSMContext
+    ) -> None:
         profile = await repository.ensure_user(user_id)
         seen_ids = set(profile.seen_models if profile else [])
         gender = _catalog_gender(filters.gender)
@@ -93,23 +122,76 @@ def setup_router(
             await state.update_data(current_models=[])
             return
         await repository.add_seen_models(user_id, [model.unique_id for model in models])
-        await state.update_data(current_models=models)
-        for model in models:
+        batch = build_indexed_batch(models)
+        await state.update_data(current_models=models, last_batch=batch)
+        await _send_model_pairs(message, batch)
+        logger.info("%s Sent %s models", EVENT_ID["MODELS_SENT"], len(models))
+
+    async def _send_model_pairs(message: Message, batch: list[IndexedModel]) -> None:
+        pairs = pair_indexed_models(batch)
+        total_pairs = len(pairs)
+        for index, pair in enumerate(pairs, start=1):
+            caption = f"Подборка {index}/{total_pairs}" if total_pairs > 1 else ""
             try:
-                await message.answer_photo(
-                    photo=URLInputFile(model.img_user_url),
-                    caption=model.title,
-                    reply_markup=model_card_keyboard(model.unique_id, model.title, model.site_url),
-                )
+                await _send_pair_message(message, pair, caption)
             except Exception as exc:  # noqa: BLE001
                 logger.error(
-                    "%s Failed to send model %s: %s",
+                    "%s Failed to send model pair %s: %s",
                     EVENT_ID["MODELS_SENT"],
-                    model.unique_id,
+                    [model.unique_id for model in pair],
                     exc,
                 )
-        await message.answer(msg.SHOWING_MODELS, reply_markup=more_models_keyboard())
-        logger.info("%s Sent %s models", EVENT_ID["MODELS_SENT"], len(models))
+
+    async def _send_pair_message(
+        message: Message, pair: tuple[IndexedModel, ...], caption: str
+    ) -> None:
+        caption_to_use = caption or None
+        collage_result: CollageResult | None = None
+        if collage.enabled:
+            collage_items = [
+                CollageItem(url=item.model.img_user_url, display_index=item.index)
+                for item in pair
+            ]
+            collage_result = await collage.build_collage(collage_items)
+        if collage_result and collage_result.included_positions:
+            included_models = [pair[pos] for pos in collage_result.included_positions]
+            keyboard = pair_selection_keyboard(
+                [
+                    (item.index, item.model.unique_id, item.model.title)
+                    for item in included_models
+                ],
+                index_style=button_index_style,
+                max_title_length=selection_button_title_max,
+            )
+            filename = f"collage-{uuid.uuid4().hex}.jpg"
+            collage_caption = caption_to_use if 0 in collage_result.included_positions else None
+            await message.answer_photo(
+                photo=BufferedInputFile(collage_result.image_bytes, filename=filename),
+                caption=collage_caption,
+                reply_markup=keyboard,
+            )
+            return
+
+        for offset, item in enumerate(pair):
+            await _send_single_model(
+                message,
+                item,
+                caption if offset == 0 else "",
+            )
+
+    async def _send_single_model(
+        message: Message, indexed: IndexedModel, caption: str
+    ) -> None:
+        keyboard = pair_selection_keyboard(
+            [(indexed.index, indexed.model.unique_id, indexed.model.title)],
+            index_style=button_index_style,
+            max_title_length=selection_button_title_max,
+        )
+        await message.answer_photo(
+            photo=URLInputFile(indexed.model.img_user_url),
+            caption=caption or None,
+            reply_markup=keyboard,
+        )
 
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
@@ -194,18 +276,12 @@ def setup_router(
         await _send_models(message, user_id, filters, state)
         logger.info("%s Photo received from %s", EVENT_ID["PHOTO_RECEIVED"], user_id)
 
-    @router.callback_query(StateFilter(TryOnStates.SHOW_RECS), F.data == "more_models")
-    async def more_models(callback: CallbackQuery, state: FSMContext) -> None:
-        user_id = callback.from_user.id
-        filters = await _ensure_filters(user_id, state)
-        await _send_models(callback.message, user_id, filters, state)
-        await callback.answer()
-
     @router.callback_query(StateFilter(TryOnStates.SHOW_RECS), F.data.startswith("pick|"))
     async def choose_model(callback: CallbackQuery, state: FSMContext) -> None:
         model_id = callback.data.replace("pick|", "")
         data = await state.get_data()
         models_data: List[GlassModel] = data.get("current_models", [])
+        batch: List[IndexedModel] = data.get("last_batch", [])
         selected = next((model for model in models_data if model.unique_id == model_id), None)
         if not selected:
             await callback.answer("Модель недоступна", show_alert=True)
@@ -216,7 +292,15 @@ def setup_router(
             await callback.message.answer(msg.LIMIT_REACHED, reply_markup=limit_reached_keyboard())
             await callback.answer()
             return
-        await state.update_data(selected_model=selected)
+        selected_index = next(
+            (item.index for item in batch if item.model.unique_id == model_id),
+            None,
+        )
+        await state.update_data(
+            selected_model=selected,
+            selected_index=selected_index,
+            last_batch=[],
+        )
         await state.set_state(TryOnStates.GENERATING)
         await callback.message.answer(msg.GENERATING)
         await callback.answer()
@@ -247,24 +331,33 @@ def setup_router(
             return
         await repository.inc_used_on_success(user_id)
         await state.set_state(TryOnStates.RESULT)
-        await message.answer(msg.GENERATION_SUCCESS)
-        for result_path in results:
-            await message.answer_photo(FSInputFile(path=str(result_path)))
-        ref_link = build_ref_link(bot_username, user_id)
-        await message.answer(
-            "Поделиться ссылкой: " + ref_link,
-            reply_markup=result_keyboard(model.site_url, ref_link),
-        )
+        if not results:
+            await message.answer(msg.GENERATION_FAILED, reply_markup=retry_keyboard())
+            await state.set_state(TryOnStates.ERROR)
+            return
+        primary_result = results[0]
         remaining = await repository.remaining_tries(user_id)
+        keyboard = generation_result_keyboard(model.site_url, remaining)
+        await message.answer_photo(
+            FSInputFile(path=str(primary_result)),
+            caption=msg.GENERATION_SUCCESS,
+            reply_markup=keyboard,
+        )
         if remaining <= 0:
             await state.set_state(TryOnStates.LIMIT_REACHED)
             await message.answer(msg.LIMIT_REACHED, reply_markup=limit_reached_keyboard())
             logger.info("%s Limit reached post generation %s", EVENT_ID["LIMIT_REACHED"], user_id)
         logger.info("%s Generation succeeded for %s", EVENT_ID["GENERATION_SUCCESS"], user_id)
 
-    @router.callback_query(StateFilter(TryOnStates.RESULT), F.data == "result_more")
+    @router.callback_query(StateFilter(TryOnStates.RESULT), F.data.startswith("more|"))
     async def result_more(callback: CallbackQuery, state: FSMContext) -> None:
         user_id = callback.from_user.id
+        remaining = await repository.remaining_tries(user_id)
+        if remaining <= 0:
+            await state.set_state(TryOnStates.LIMIT_REACHED)
+            await callback.message.answer(msg.LIMIT_REACHED, reply_markup=limit_reached_keyboard())
+            await callback.answer()
+            return
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
         await callback.message.answer("Ищу свежие модели...")

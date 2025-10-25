@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+from typing import Sequence
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+
+_EMOJI_DIGITS = {
+    1: "1️⃣",
+    2: "2️⃣",
+    3: "3️⃣",
+    4: "4️⃣",
+}
 
 
 def start_keyboard() -> InlineKeyboardMarkup:
@@ -57,37 +67,66 @@ def style_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def model_card_keyboard(unique_id: str, title: str, site_url: str) -> InlineKeyboardMarkup:
-    """Keyboard attached to a catalog card."""
+def pair_selection_keyboard(
+    models: Sequence[tuple[int, str, str]],
+    *,
+    index_style: str = "emoji",
+    max_title_length: int = 24,
+) -> InlineKeyboardMarkup:
+    """Keyboard for selecting one of the models in a pair."""
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"Выбрать «{title}»", callback_data=f"pick|{unique_id}")],
-            [InlineKeyboardButton(text="Подробнее о модели", url=site_url)],
-        ]
-    )
+    if not models:
+        return InlineKeyboardMarkup(inline_keyboard=[])
+
+    buttons: list[InlineKeyboardButton] = []
+    normalized_style = (index_style or "emoji").lower()
+    for ordinal, unique_id, title in models:
+        prefix = _prefix_for_index(ordinal, normalized_style)
+        truncated = _truncate_title(title, max_title_length)
+        if prefix:
+            text = f"{prefix} Выбрать: {truncated}"
+        else:
+            text = f"Выбрать: {truncated}"
+        buttons.append(
+            InlineKeyboardButton(
+                text=text,
+                callback_data=f"pick|{unique_id}",
+            )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
-def more_models_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard offering to fetch more models."""
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Ещё 4", callback_data="more_models")]
-        ]
-    )
+def _truncate_title(title: str, max_length: int) -> str:
+    if len(title) <= max_length:
+        return title
+    if max_length <= 1:
+        return "…"
+    return title[: max_length - 1] + "…"
 
 
-def result_keyboard(product_url: str, ref_url: str) -> InlineKeyboardMarkup:
-    """Keyboard for the result screen."""
+def _prefix_for_index(index: int, style: str) -> str:
+    if style == "none":
+        return ""
+    if style == "emoji":
+        return _EMOJI_DIGITS.get(index, f"{index}️⃣")
+    # treat both ascii and legacy numeric values as bracketed numbers
+    if style in {"ascii", "numeric"}:
+        return f"[{index}]"
+    return f"[{index}]"
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Ещё", callback_data="result_more")],
-            [InlineKeyboardButton(text="Посмотреть/Купить", url=product_url)],
-            [InlineKeyboardButton(text="Поделиться", url=ref_url)],
-        ]
-    )
+
+def generation_result_keyboard(site_url: str, remaining: int) -> InlineKeyboardMarkup:
+    """Keyboard attached to the generation result message."""
+
+    buttons = [InlineKeyboardButton(text="Подробнее о модели", url=site_url)]
+    if remaining > 0:
+        buttons.append(
+            InlineKeyboardButton(
+                text=f"Ещё варианты (осталось {remaining})",
+                callback_data=f"more|{remaining}",
+            )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 def limit_reached_keyboard() -> InlineKeyboardMarkup:

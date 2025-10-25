@@ -28,6 +28,21 @@ class Settings(BaseSettings):
     results_root: Path = Field(Path("./results"), env="RESULTS_ROOT")
     csv_fetch_ttl_sec: int = Field(60, env="CSV_FETCH_TTL_SEC")
     csv_fetch_retries: int = Field(3, env="CSV_FETCH_RETRIES")
+    collage_enabled: bool = Field(True, env="COLLAGE_ENABLED")
+    collage_max_width: int = Field(1280, env="COLLAGE_MAX_WIDTH")
+    collage_padding_px: int = Field(20, env="COLLAGE_PADDING_PX")
+    collage_cache_ttl_sec: int = Field(300, env="COLLAGE_CACHE_TTL_SEC")
+    collage_draw_divider: bool = Field(True, env="COLLAGE_DRAW_DIVIDER")
+    collage_draw_badges: bool = Field(True, env="COLLAGE_DRAW_BADGES")
+    index_size_px: int = Field(64, env="INDEX_SIZE_PX")
+    index_pad_px: int = Field(16, env="INDEX_PAD_PX")
+    index_bg: str = Field("#000000", env="INDEX_BG")
+    index_bg_alpha: float = Field(0.65, env="INDEX_BG_ALPHA")
+    index_text_color: str = Field("#FFFFFF", env="INDEX_TEXT_COLOR")
+    index_text_size: int = Field(36, env="INDEX_TEXT_SIZE")
+    index_stroke: int = Field(3, env="INDEX_STROKE")
+    button_index_style: str = Field("emoji", env="BUTTON_INDEX_STYLE")
+    button_title_max: int = Field(24, env="BUTTON_TITLE_MAX")
     nano_api_url: Optional[str] = Field(None, env="NANO_API_URL")
     nano_api_key: Optional[str] = Field(None, env="NANO_API_KEY")
     drive_public_base_url: Optional[str] = Field(None, env="DRIVE_PUBLIC_BASE_URL")
@@ -37,6 +52,14 @@ class Settings(BaseSettings):
         """Convert string values to Path objects."""
 
         return Path(value)
+
+    @field_validator("button_index_style", mode="before")
+    def _normalize_button_index_style(cls, value: str) -> str:  # type: ignore[override]
+        normalized = (value or "emoji").strip().lower()
+        allowed = {"emoji", "ascii", "none"}
+        if normalized not in allowed:
+            raise ValueError("BUTTON_INDEX_STYLE must be 'emoji', 'ascii', or 'none'")
+        return normalized
 
     model_config = SettingsConfigDict(
         env_file=".env",

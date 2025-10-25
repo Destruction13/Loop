@@ -14,6 +14,7 @@ from app.fsm import setup_router
 from app.keyboards import start_keyboard
 from app.logging_conf import EVENT_ID, setup_logging
 from app.services.catalog_google import GoogleCatalogConfig, GoogleSheetCatalog
+from app.services.collage import CollageService
 from app.services.repository import Repository
 from app.services.scheduler import ReminderScheduler
 from app.services.storage_local import LocalStorage
@@ -51,16 +52,31 @@ async def main() -> None:
             api_key=settings.nano_api_key or "",
         )
 
-    me = await bot.get_me()
-    bot_username = me.username or "loop_bot"
+    collage_service = CollageService(
+        enabled=settings.collage_enabled,
+        max_width=settings.collage_max_width,
+        padding_px=settings.collage_padding_px,
+        cache_ttl_sec=settings.collage_cache_ttl_sec,
+        draw_divider=settings.collage_draw_divider,
+        draw_badges=settings.collage_draw_badges,
+        index_size_px=settings.index_size_px,
+        index_pad_px=settings.index_pad_px,
+        index_bg=settings.index_bg,
+        index_bg_alpha=settings.index_bg_alpha,
+        index_text_color=settings.index_text_color,
+        index_text_size=settings.index_text_size,
+        index_stroke=settings.index_stroke,
+    )
 
     router = setup_router(
         repository=repository,
         catalog=catalog_service,
         tryon=tryon_service,
         storage=storage,
+        collage=collage_service,
         reminder_hours=settings.reminder_hours,
-        bot_username=bot_username,
+        selection_button_title_max=settings.button_title_max,
+        selection_button_index_style=settings.button_index_style,
     )
     dp.include_router(router)
 
@@ -78,7 +94,7 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         await scheduler.stop()
-        await catalog_service.aclose()
+        await asyncio.gather(catalog_service.aclose(), collage_service.aclose())
         await bot.session.close()
 
 
