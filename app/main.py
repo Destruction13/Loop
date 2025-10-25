@@ -58,14 +58,6 @@ async def main() -> None:
         padding_px=settings.collage_padding_px,
         cache_ttl_sec=settings.collage_cache_ttl_sec,
         draw_divider=settings.collage_draw_divider,
-        draw_badges=settings.collage_draw_badges,
-        index_size_px=settings.index_size_px,
-        index_pad_px=settings.index_pad_px,
-        index_bg=settings.index_bg,
-        index_bg_alpha=settings.index_bg_alpha,
-        index_text_color=settings.index_text_color,
-        index_text_size=settings.index_text_size,
-        index_stroke=settings.index_stroke,
     )
 
     router = setup_router(
@@ -76,7 +68,6 @@ async def main() -> None:
         collage=collage_service,
         reminder_hours=settings.reminder_hours,
         selection_button_title_max=settings.button_title_max,
-        selection_button_index_style=settings.button_index_style,
     )
     dp.include_router(router)
 

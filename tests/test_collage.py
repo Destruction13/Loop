@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import asyncio
 import io
 
 import httpx
 from PIL import Image
 
-from app.services.collage import CollageItem, CollageResult, CollageService
+from app.services.collage import CollageResult, CollageService
 
 
 def _make_image_bytes(size: tuple[int, int], color: str) -> bytes:
@@ -16,26 +18,21 @@ def _make_image_bytes(size: tuple[int, int], color: str) -> bytes:
 
 async def _build_collage(
     transport: httpx.MockTransport,
-    items: list[CollageItem],
+    left_url: str | None,
+    right_url: str | None,
     *,
     draw_divider: bool = True,
-    draw_badges: bool = True,
 ) -> CollageResult | None:
     async with httpx.AsyncClient(transport=transport) as client:
-        CollageService._font_warning_emitted = False
         service = CollageService(
             enabled=True,
             max_width=600,
             padding_px=20,
             cache_ttl_sec=300,
             draw_divider=draw_divider,
-            draw_badges=draw_badges,
-            index_size_px=48,
-            index_pad_px=12,
-            index_text_size=28,
             client=client,
         )
-        return await service.build_collage(items)
+        return await service.build_collage(left_url, right_url)
 
 
 def test_collage_combines_two_images() -> None:
@@ -53,10 +50,8 @@ def test_collage_combines_two_images() -> None:
     result = asyncio.run(
         _build_collage(
             transport,
-            [
-                CollageItem("https://example.com/img1.jpg", 1),
-                CollageItem("https://example.com/img2.jpg", 2),
-            ],
+            "https://example.com/img1.jpg",
+            "https://example.com/img2.jpg",
         )
     )
 
@@ -79,10 +74,8 @@ def test_collage_handles_partial_download() -> None:
     result = asyncio.run(
         _build_collage(
             transport,
-            [
-                CollageItem("https://example.com/img1.jpg", 1),
-                CollageItem("https://example.com/img2.jpg", 2),
-            ],
+            "https://example.com/img1.jpg",
+            "https://example.com/img2.jpg",
         )
     )
 
@@ -93,7 +86,7 @@ def test_collage_handles_partial_download() -> None:
         assert collage.height > 0
 
 
-def test_collage_draws_numeric_badges_and_divider() -> None:
+def test_collage_draws_divider_when_enabled() -> None:
     image_one = _make_image_bytes((200, 200), "red")
     image_two = _make_image_bytes((200, 200), "green")
 
@@ -108,12 +101,9 @@ def test_collage_draws_numeric_badges_and_divider() -> None:
     result = asyncio.run(
         _build_collage(
             transport,
-            [
-                CollageItem("https://example.com/one.jpg", 1),
-                CollageItem("https://example.com/two.jpg", 2),
-            ],
+            "https://example.com/one.jpg",
+            "https://example.com/two.jpg",
             draw_divider=True,
-            draw_badges=True,
         )
     )
 
@@ -124,35 +114,35 @@ def test_collage_draws_numeric_badges_and_divider() -> None:
         middle_y = height // 2
         divider_pixel = collage.getpixel((line_x, middle_y))
         assert max(divider_pixel) < 250
-        badge_x = 20 + 12 + 5
-        badge_y = 20 + 12 + 5
-        badge_pixel = collage.getpixel((badge_x, badge_y))
-        assert badge_pixel != (255, 255, 255)
 
 
-def test_collage_badges_fallback_to_default_font(monkeypatch) -> None:
-    image_one = _make_image_bytes((180, 180), "#CCCCCC")
-    image_two = _make_image_bytes((180, 180), "#999999")
+def test_collage_does_not_add_overlays() -> None:
+    image_one = _make_image_bytes((200, 200), "red")
+    image_two = _make_image_bytes((200, 200), "green")
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("one.png"):
-            return httpx.Response(200, content=image_one, headers={"content-type": "image/png"})
-        if request.url.path.endswith("two.png"):
-            return httpx.Response(200, content=image_two, headers={"content-type": "image/png"})
+        if request.url.path.endswith("one.jpg"):
+            return httpx.Response(200, content=image_one, headers={"content-type": "image/jpeg"})
+        if request.url.path.endswith("two.jpg"):
+            return httpx.Response(200, content=image_two, headers={"content-type": "image/jpeg"})
         return httpx.Response(404)
-
-    monkeypatch.setattr(CollageService, "_find_font_path", lambda self, filename: None)
 
     transport = httpx.MockTransport(handler)
     result = asyncio.run(
         _build_collage(
             transport,
-            [
-                CollageItem("https://example.com/one.png", 1),
-                CollageItem("https://example.com/two.png", 2),
-            ],
+            "https://example.com/one.jpg",
+            "https://example.com/two.jpg",
         )
     )
 
     assert result is not None
-    assert CollageService._font_warning_emitted
+    with Image.open(io.BytesIO(result.image_bytes)) as collage:
+        # Sample a pixel inside the left image near the top-left corner to ensure
+        # no badge or overlay has been drawn on top of the model photo.
+        sample_x = 20 + 5
+        sample_y = 20 + 5
+        pixel = collage.getpixel((sample_x, sample_y))[:3]
+        assert pixel[0] > 200
+        assert pixel[1] < 20
+        assert pixel[2] < 20
