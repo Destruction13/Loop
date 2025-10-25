@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import abc
-from typing import Iterable
+from dataclasses import dataclass
+from typing import Iterable, List
 
 from app.models import GlassModel
+
+
+@dataclass(slots=True)
+class CatalogSnapshot:
+    """Immutable view of the catalog data."""
+
+    models: List[GlassModel]
+    version_hash: str
 
 
 class CatalogError(RuntimeError):
@@ -27,3 +36,7 @@ class CatalogService(abc.ABC):
         """Optional hook for graceful shutdown."""
 
         return None
+
+    @abc.abstractmethod
+    async def snapshot(self) -> CatalogSnapshot:
+        """Return cached catalog data with version hash."""

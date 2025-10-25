@@ -53,6 +53,13 @@ class Config:
     nano_api_url: Optional[str]
     nano_api_key: Optional[str]
     collage: CollageConfig
+    reco_batch_total: int
+    reco_batch_gender: int
+    reco_batch_unisex: int
+    reco_unique_scope: str
+    reco_clear_on_catalog_change: bool
+    reco_topup_from_any: bool
+    reco_no_more_key: str
 
 
 def _get(name: str, default: Optional[str] = None, *, required: bool = False) -> Optional[str]:
@@ -100,6 +107,16 @@ def _as_path(value: Optional[str], fallback: str) -> Path:
     return Path(value or fallback)
 
 
+def _as_unique_scope(value: Optional[str], fallback: str) -> str:
+    allowed = {"24h", "7d", "all"}
+    if not value:
+        return fallback
+    normalized = value.strip().lower()
+    if normalized in allowed:
+        return normalized
+    return fallback
+
+
 def load_config(env_file: str | None = None) -> Config:
     """Load configuration from the provided .env file (or default location)."""
 
@@ -141,6 +158,13 @@ def load_config(env_file: str | None = None) -> Config:
         nano_api_url=_get("NANO_API_URL"),
         nano_api_key=_get("NANO_API_KEY"),
         collage=collage,
+        reco_batch_total=_as_int(_get("RECO_BATCH_TOTAL", "4"), 4),
+        reco_batch_gender=_as_int(_get("RECO_BATCH_GENDER", "2"), 2),
+        reco_batch_unisex=_as_int(_get("RECO_BATCH_UNISEX", "2"), 2),
+        reco_unique_scope=_as_unique_scope(_get("RECO_UNIQUE_SCOPE", "24h"), "24h"),
+        reco_clear_on_catalog_change=_as_bool(_get("RECO_CLEAR_ON_CATALOG_CHANGE", "1"), True),
+        reco_topup_from_any=_as_bool(_get("RECO_TOPUP_FROM_ANY", "0"), False),
+        reco_no_more_key=_get("MSG_NO_MORE_KEY", "all_seen") or "all_seen",
     )
 
 

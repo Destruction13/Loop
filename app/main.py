@@ -21,6 +21,11 @@ from app.services.tryon_mock import MockTryOnService
 from app.services.tryon_nanobanana import NanoBananaTryOnService
 from app.texts import messages as msg
 from app.utils.paths import ensure_dir
+from app.services.recommendation import (
+    RecommendationService,
+    RecommendationSettings,
+    UniqueScope,
+)
 
 
 async def main() -> None:
@@ -44,6 +49,20 @@ async def main() -> None:
     )
     catalog_service = GoogleSheetCatalog(catalog_config)
 
+    recommendation_settings = RecommendationSettings(
+        batch_total=config.reco_batch_total,
+        batch_gender=config.reco_batch_gender,
+        batch_unisex=config.reco_batch_unisex,
+        unique_scope=UniqueScope.from_string(config.reco_unique_scope),
+        clear_on_catalog_change=config.reco_clear_on_catalog_change,
+        topup_from_any=config.reco_topup_from_any,
+    )
+    recommender = RecommendationService(
+        catalog=catalog_service,
+        repository=repository,
+        settings=recommendation_settings,
+    )
+
     if config.mock_tryon:
         tryon_service = MockTryOnService(storage)
     else:
@@ -54,7 +73,7 @@ async def main() -> None:
 
     router = setup_router(
         repository=repository,
-        catalog=catalog_service,
+        recommender=recommender,
         tryon=tryon_service,
         storage=storage,
         collage_config=config.collage,
@@ -63,6 +82,7 @@ async def main() -> None:
         selection_button_title_max=config.button_title_max,
         landing_url=str(config.landing_url),
         promo_code=config.promo_code,
+        no_more_message_key=config.reco_no_more_key,
     )
     dp.include_router(router)
 

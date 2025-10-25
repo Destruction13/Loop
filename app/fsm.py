@@ -26,6 +26,7 @@ from aiogram.types import (
 from aiogram.types.input_file import BufferedInputFile, FSInputFile, URLInputFile
 
 from app.keyboards import (
+    all_seen_keyboard,
     gender_keyboard,
     generation_result_keyboard,
     limit_reached_keyboard,
@@ -36,7 +37,7 @@ from app.keyboards import (
 )
 from app.logging_conf import EVENT_ID
 from app.models import FilterOptions, GlassModel
-from app.services.catalog_base import CatalogError, CatalogService
+from app.services.catalog_base import CatalogError
 from app.config import CollageConfig
 from app.services.collage import (
     CollageProcessingError,
@@ -46,6 +47,7 @@ from app.services.collage import (
 from app.services.repository import Repository
 from app.services.storage_base import StorageService
 from app.services.tryon_base import TryOnService
+from app.services.recommendation import RecommendationService
 from app.texts import messages as msg
 
 
@@ -104,7 +106,7 @@ def pair_models(models: Sequence[GlassModel]) -> list[tuple[GlassModel, ...]]:
 def setup_router(
     *,
     repository: Repository,
-    catalog: CatalogService,
+    recommender: RecommendationService,
     tryon: TryOnService,
     storage: StorageService,
     collage_config: CollageConfig,
@@ -113,18 +115,10 @@ def setup_router(
     selection_button_title_max: int,
     landing_url: str,
     promo_code: str,
+    no_more_message_key: str,
 ) -> Router:
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
-
-    def _catalog_gender(value: str) -> str:
-        mapping = {
-            "male": "Мужской",
-            "female": "Женский",
-            "unisex": "Унисекс",
-        }
-        normalized = (value or "").lower()
-        return mapping.get(normalized, "Унисекс")
 
     async def _ensure_filters(user_id: int, state: FSMContext) -> FilterOptions:
         data = await state.get_data()
@@ -133,11 +127,8 @@ def setup_router(
     async def _send_models(
         message: Message, user_id: int, filters: FilterOptions, state: FSMContext
     ) -> None:
-        profile = await repository.ensure_user(user_id)
-        seen_ids = set(profile.seen_models if profile else [])
-        gender = _catalog_gender(filters.gender)
         try:
-            models = await catalog.pick_four(gender, seen_ids)
+            models = await recommender.recommend_for_user(user_id, filters.gender)
         except CatalogError as exc:
             logger.error("%s Failed to fetch catalog: %s", EVENT_ID["MODELS_SENT"], exc)
             await message.answer(msg.CATALOG_TEMPORARILY_UNAVAILABLE)
@@ -145,11 +136,17 @@ def setup_router(
             await _delete_state_message(message, state, "preload_message_id")
             return
         if not models:
-            await message.answer(msg.CATALOG_TEMPORARILY_UNAVAILABLE)
-            await state.update_data(current_models=[])
+            try:
+                marketing_message = msg.marketing_text(no_more_message_key)
+            except KeyError:
+                marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
+            await message.answer(
+                marketing_message,
+                reply_markup=all_seen_keyboard(landing_url),
+            )
+            await state.update_data(current_models=[], last_batch=[])
             await _delete_state_message(message, state, "preload_message_id")
             return
-        await repository.add_seen_models(user_id, [model.unique_id for model in models])
         batch = list(models)
         await state.update_data(current_models=batch, last_batch=batch)
         await _send_model_pairs(message, batch)

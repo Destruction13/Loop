@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Optional
 
 
 @dataclass(slots=True)
@@ -24,7 +24,7 @@ class GlassModel:
     site_url: str
     img_user_url: str
     img_nano_url: str
-    gender: Literal["Мужской", "Женский", "Унисекс"]
+    gender: str
 
 
 @dataclass(slots=True)
