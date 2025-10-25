@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     mock_tryon: bool = Field(True, env="MOCK_TRYON")
     uploads_root: Path = Field(Path("./uploads"), env="UPLOADS_ROOT")
     results_root: Path = Field(Path("./results"), env="RESULTS_ROOT")
+    csv_fetch_ttl_sec: int = Field(60, env="CSV_FETCH_TTL_SEC")
+    csv_fetch_retries: int = Field(3, env="CSV_FETCH_RETRIES")
     nano_api_url: Optional[str] = Field(None, env="NANO_API_URL")
     nano_api_key: Optional[str] = Field(None, env="NANO_API_KEY")
     drive_public_base_url: Optional[str] = Field(None, env="DRIVE_PUBLIC_BASE_URL")

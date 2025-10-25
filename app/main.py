@@ -36,7 +36,11 @@ async def main() -> None:
     await repository.init()
 
     storage = LocalStorage(settings.uploads_root, settings.results_root)
-    catalog_config = GoogleCatalogConfig(csv_url=str(settings.sheet_csv_url))
+    catalog_config = GoogleCatalogConfig(
+        csv_url=str(settings.sheet_csv_url),
+        cache_ttl_seconds=settings.csv_fetch_ttl_sec,
+        retries=settings.csv_fetch_retries,
+    )
     catalog_service = GoogleSheetCatalog(catalog_config)
 
     if settings.mock_tryon:

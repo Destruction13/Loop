@@ -9,7 +9,8 @@ import io
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, List
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -30,6 +31,10 @@ class GoogleCatalogConfig:
     backoff_base: float = 0.5
 
 
+class NotCSVError(CatalogError):
+    """Raised when downloaded content is not a CSV."""
+
+
 class GoogleSheetCatalog(CatalogService):
     """Retrieve catalog data from a published Google Sheet CSV."""
 
@@ -40,7 +45,18 @@ class GoogleSheetCatalog(CatalogService):
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._config = config
-        self._client = client or httpx.AsyncClient(timeout=15.0)
+        if client is None:
+            timeout = httpx.Timeout(15.0, connect=15.0, read=15.0)
+            self._client = httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": "Loop/1.0",
+                    "Accept": "text/csv,*/*;q=0.1",
+                },
+            )
+        else:
+            self._client = client
         self._client_owner = client is None
         self._cache: tuple[float, list[GlassModel]] | None = None
         self._lock = asyncio.Lock()
@@ -80,25 +96,101 @@ class GoogleSheetCatalog(CatalogService):
             csv_content = await self._fetch_csv()
             models = self._parse_csv(csv_content)
             self._cache = (time.monotonic(), models)
-            LOGGER.info("Catalog cache refreshed with %s entries", len(models))
+            LOGGER.info(
+                "Catalog cache refreshed with %s entries (payload %s bytes)",
+                len(models),
+                len(csv_content.encode("utf-8")),
+            )
             return list(models)
 
     async def _fetch_csv(self) -> str:
+        urls: List[str] = [self._config.csv_url]
+        fallback_urls = _build_fallback_urls(self._config.csv_url)
+        if fallback_urls:
+            urls.extend(fallback_urls)
+
+        last_error: Exception | None = None
+        for index, url in enumerate(urls):
+            try:
+                return await self._fetch_with_retries(url)
+            except CatalogError as exc:
+                last_error = exc
+                if index < len(urls) - 1:
+                    LOGGER.warning(
+                        "Primary catalog URL failed (%s). Falling back to %s",
+                        exc,
+                        urls[index + 1],
+                    )
+                    continue
+                LOGGER.error("Failed to fetch catalog CSV after fallbacks: %s", exc)
+                raise
+        raise CatalogError(f"Failed to fetch catalog CSV: {last_error}")
+
+    async def _fetch_with_retries(self, url: str) -> str:
         delay = self._config.backoff_base
         last_error: Exception | None = None
         for attempt in range(1, self._config.retries + 1):
             try:
-                response = await self._client.get(self._config.csv_url)
-                response.raise_for_status()
-                LOGGER.info("Fetched catalog CSV on attempt %s", attempt)
-                return response.text
-            except (httpx.HTTPError, asyncio.TimeoutError) as exc:  # pragma: no cover - network errors
+                response = await self._client.get(url)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = exc
-                LOGGER.warning("Failed to fetch CSV (attempt %s/%s): %s", attempt, self._config.retries, exc)
+                LOGGER.warning(
+                    "Network error fetching CSV (attempt %s/%s): %s",
+                    attempt,
+                    self._config.retries,
+                    exc,
+                )
                 if attempt < self._config.retries:
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, 2.0)
-        raise CatalogError(f"Failed to fetch catalog CSV: {last_error}")
+                    continue
+                break
+
+            status = response.status_code
+            if 200 <= status < 300:
+                self._log_redirect_chain(url, response)
+                text = response.text
+                if _looks_like_html(text):
+                    last_error = NotCSVError("Not CSV content received")
+                    LOGGER.warning(
+                        "Received non-CSV content for %s (attempt %s/%s)",
+                        url,
+                        attempt,
+                        self._config.retries,
+                    )
+                else:
+                    LOGGER.info("Fetched catalog CSV from %s", response.url)
+                    return text
+            elif status == 429 or status >= 500:
+                last_error = CatalogError(f"Server responded with status {status}")
+                LOGGER.warning(
+                    "Server error fetching CSV (status %s, attempt %s/%s)",
+                    status,
+                    attempt,
+                    self._config.retries,
+                )
+            else:
+                raise CatalogError(f"Unexpected status {status} fetching CSV from {url}")
+
+            if attempt < self._config.retries:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 2.0)
+
+        if last_error:
+            raise CatalogError(str(last_error))
+        raise CatalogError("Failed to fetch catalog CSV")
+
+    def _log_redirect_chain(self, requested_url: str, response: httpx.Response) -> None:
+        if not response.history:
+            LOGGER.debug("Catalog fetch URL %s responded without redirects", requested_url)
+            return
+        chain = [requested_url]
+        for redirect_response in response.history:
+            location = redirect_response.headers.get("location")
+            if location:
+                chain.append(location)
+        chain.append(str(response.url))
+        LOGGER.debug("Catalog fetch redirect chain: %s", " -> ".join(chain))
 
     def _parse_csv(self, csv_content: str) -> list[GlassModel]:
         stream = io.StringIO(csv_content)
@@ -158,3 +250,34 @@ def _normalize_gender(value: str) -> str:
 def _make_fallback_id(title: str, site_url: str) -> str:
     digest = hashlib.sha256(f"{title}|{site_url}".encode("utf-8")).hexdigest()
     return digest[:16]
+
+
+def _looks_like_html(payload: str) -> bool:
+    sample = payload.lstrip()[:256].lower()
+    return "<html" in sample or "<!doctype" in sample
+
+
+def _build_fallback_urls(original_url: str) -> list[str]:
+    parsed = urlparse(original_url)
+    if parsed.netloc != "docs.google.com":
+        return []
+    parts = [segment for segment in parsed.path.split("/") if segment]
+    if "spreadsheets" not in parts:
+        return []
+    try:
+        d_index = parts.index("d")
+    except ValueError:
+        return []
+    if len(parts) <= d_index + 1:
+        return []
+    sheet_id = parts[d_index + 1]
+    if sheet_id == "e" and len(parts) > d_index + 2:
+        sheet_id = parts[d_index + 2]
+    if not sheet_id:
+        return []
+    query = parse_qs(parsed.query)
+    gid = query.get("gid", ["0"])[0]
+    base = "https://docs.google.com/spreadsheets/d"
+    gviz = f"{base}/{sheet_id}/gviz/tq?tqx=out:csv&gid={gid}"
+    export = f"{base}/{sheet_id}/export?format=csv&gid={gid}"
+    return [gviz, export]
