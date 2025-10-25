@@ -17,26 +17,14 @@ pip install -r requirements.txt
 
 ## Настройка окружения
 
-Создайте `.env` на основе следующего шаблона и заполните значения:
+Скопируйте `.env.example` → `.env` и заполните значения. В шаблоне у каждой переменной есть комментарий:
+- токен бота, ссылка на Google Sheets CSV и URL лендинга;
+- лимиты, TTL кэша, параметры напоминаний;
+- переключатель мок-генерации и креды NanoBanana;
+- пути к папкам `uploads/` и `results/`.
 
-```dotenv
-BOT_TOKEN=123456:ABCDEF
-SHEET_CSV_URL=https://docs.google.com/spreadsheets/d/e/2PACX-1vRT2CXRcmWxmWHKADYfHTadlxBUZ-R7nEX7HcAqrBo_PzSKYrCln4HFeCUJTB2q_C7asfwO7AOLNiwh/pub?output=csv
-DAILY_TRY_LIMIT=7
-REMINDER_HOURS=24
-MOCK_TRYON=1
-UPLOADS_ROOT=./uploads
-RESULTS_ROOT=./results
-CSV_FETCH_TTL_SEC=60
-CSV_FETCH_RETRIES=3
-PROMO_CODE="DEMO 10"
-# Будущие интеграции:
-NANO_API_URL=
-NANO_API_KEY=
-DRIVE_PUBLIC_BASE_URL=
-```
-
-`SHEET_CSV_URL` можно не указывать, если используете значение по умолчанию. Настройки загружаются через Pydantic и `python-dotenv`.
+Все переменные подхватываются через `load_config` (`app/config.py`) и превращаются в dataclass `Config`, так что
+никаких «спрятанных» параметров нет — правки делаются только в `.env`.
 
 ## Как работает каталог
 
@@ -47,7 +35,7 @@ DRIVE_PUBLIC_BASE_URL=
 - Фильтрация идёт по колонке «Пол»; если моделей мало, добавляются «Унисекс».
 - Кнопки «Подробнее о модели» открывают ссылку из таблицы.
 
-> ⚠️ Ограничение Telegram Bot API: бот не может открыть нативный выбор файлов по нажатию кнопки. Поэтому для подсказки пользователю используется reply-клавиатура с кнопкой «Прикрепить фотку», а сам файл нужно выбрать через стандартную «скрепку» в чате.
+> ⚠️ Telegram не позволяет программно открыть системный выбор файлов, поэтому пользователю всё равно нужно отправлять фото вручную через стандартную «скрепку» в чате.
 
 ## Запуск
 
@@ -69,6 +57,7 @@ pytest
 - `app/services/repository.py` — SQLite-хранилище пользователей и дневных лимитов.
 - `app/services/tryon_mock.py` — mock-генерация результатов (белые изображения).
 - `app/fsm.py` — конечный автомат aiogram, который обращается к каталогу и управляет UX.
+- `app/texts/messages.py` — единый файл с текстами и подписями для нетехнарей.
 - `app/utils/drive.py` — преобразование ссылок Google Drive.
 
 ## План развития
