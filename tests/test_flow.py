@@ -5,14 +5,13 @@ from dataclasses import fields
 from datetime import datetime
 from typing import Optional
 
-from app import messages_ru as msg
+from app.texts import messages as msg
 from app.fsm import (
     GenerationOutcome,
     next_first_flag_value,
     resolve_generation_followup,
 )
 from app.keyboards import (
-    attach_photo_keyboard,
     generation_result_keyboard,
     limit_reached_keyboard,
     promo_keyboard,
@@ -28,26 +27,21 @@ def test_filter_options_only_gender() -> None:
     assert field_names == ["gender"]
 
 
-def test_photo_instruction_text_and_keyboard() -> None:
+def test_photo_instruction_text() -> None:
     expected_text = (
         "Кинь нам селфи или любую чёткую фотку, где видно лицо прямо. "
         "Можно взять из “Избранного” — не обязательно себя сейчас фоткать. "
         "Главное — лицо в кадре"
     )
-    assert msg.PHOTO_INSTRUCTIONS == expected_text
-
-    keyboard = attach_photo_keyboard()
-    assert keyboard.keyboard[0][0].text == msg.ATTACH_PHOTO_BUTTON
-    assert keyboard.resize_keyboard is True
-    assert keyboard.one_time_keyboard is False
+    assert msg.PHOTO_INSTRUCTION == expected_text
 
 
 def test_generation_result_keyboard_layout() -> None:
     keyboard = generation_result_keyboard("https://site", remaining=3)
     row = keyboard.inline_keyboard[0]
     assert [button.text for button in row] == [
-        msg.DETAILS_BUTTON,
-        f"{msg.MORE_VARIANTS_BUTTON} (осталось 3)",
+        msg.DETAILS_BUTTON_TEXT,
+        f"{msg.MORE_VARIANTS_BUTTON_TEXT} (осталось 3)",
     ]
     assert row[0].url == "https://site"
     assert row[1].callback_data == "more|3"
@@ -82,7 +76,7 @@ def test_limit_flow_keyboards() -> None:
 
 
 def test_promo_message_inserts_code() -> None:
-    text = msg.PROMO_MESSAGE_TEMPLATE.format(code="DEMO 10")
+    text = msg.PROMO_MESSAGE_TEMPLATE.format(promo_code="DEMO 10")
 
     assert "“DEMO 10”" in text
     assert text.endswith("снова примерить оправы 👓")
@@ -123,7 +117,7 @@ def test_reminder_scheduler_sends_message_with_keyboard() -> None:
         assert bot.sent[0][0] == 42
         assert bot.sent[0][1] == msg.REMINDER_MESSAGE
         keyboard = bot.sent[0][2]
-        assert keyboard.inline_keyboard[0][0].text == msg.REMINDER_PROMPT_BUTTON
+        assert keyboard.inline_keyboard[0][0].text == msg.REMINDER_BUTTON_TEXT
 
     asyncio.run(scenario())
 

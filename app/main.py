@@ -8,8 +8,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 
-from app import messages_ru as msg
-from app.config import load_settings
+from app.config import load_config
 from app.fsm import setup_router
 from app.keyboards import reminder_keyboard, start_keyboard
 from app.logging_conf import EVENT_ID, setup_logging
@@ -20,44 +19,45 @@ from app.services.scheduler import ReminderScheduler
 from app.services.storage_local import LocalStorage
 from app.services.tryon_mock import MockTryOnService
 from app.services.tryon_nanobanana import NanoBananaTryOnService
+from app.texts import messages as msg
 from app.utils.paths import ensure_dir
 
 
 async def main() -> None:
-    settings = load_settings()
+    config = load_config()
     logger = setup_logging()
 
-    ensure_dir(settings.uploads_root)
-    ensure_dir(settings.results_root)
+    ensure_dir(config.uploads_root)
+    ensure_dir(config.results_root)
 
-    bot = Bot(token=settings.bot_token, parse_mode=ParseMode.HTML)
+    bot = Bot(token=config.bot_token, parse_mode=ParseMode.HTML)
     dp = Dispatcher()
 
-    repository = Repository(Path("loop.db"), settings.daily_try_limit)
+    repository = Repository(Path("loop.db"), config.daily_try_limit)
     await repository.init()
 
-    storage = LocalStorage(settings.uploads_root, settings.results_root)
+    storage = LocalStorage(config.uploads_root, config.results_root)
     catalog_config = GoogleCatalogConfig(
-        csv_url=str(settings.sheet_csv_url),
-        cache_ttl_seconds=settings.csv_fetch_ttl_sec,
-        retries=settings.csv_fetch_retries,
+        csv_url=str(config.sheet_csv_url),
+        cache_ttl_seconds=config.csv_fetch_ttl_sec,
+        retries=config.csv_fetch_retries,
     )
     catalog_service = GoogleSheetCatalog(catalog_config)
 
-    if settings.mock_tryon:
+    if config.mock_tryon:
         tryon_service = MockTryOnService(storage)
     else:
         tryon_service = NanoBananaTryOnService(
-            api_url=settings.nano_api_url or "",
-            api_key=settings.nano_api_key or "",
+            api_url=config.nano_api_url or "",
+            api_key=config.nano_api_key or "",
         )
 
     collage_service = CollageService(
-        enabled=settings.collage_enabled,
-        max_width=settings.collage_max_width,
-        padding_px=settings.collage_padding_px,
-        cache_ttl_sec=settings.collage_cache_ttl_sec,
-        draw_divider=settings.collage_draw_divider,
+        enabled=config.collage.enabled,
+        max_width=config.collage.max_width,
+        padding_px=config.collage.padding_px,
+        cache_ttl_sec=config.collage.cache_ttl_sec,
+        draw_divider=config.collage.draw_divider,
     )
 
     router = setup_router(
@@ -66,10 +66,10 @@ async def main() -> None:
         tryon=tryon_service,
         storage=storage,
         collage=collage_service,
-        reminder_hours=settings.reminder_hours,
-        selection_button_title_max=settings.button_title_max,
-        landing_url=str(settings.landing_url),
-        promo_code=settings.promo_code,
+        reminder_hours=config.reminder_hours,
+        selection_button_title_max=config.button_title_max,
+        landing_url=str(config.landing_url),
+        promo_code=config.promo_code,
     )
     dp.include_router(router)
 
