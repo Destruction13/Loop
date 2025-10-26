@@ -51,7 +51,6 @@ class Config:
     batch_size: int
     batch_layout_cols: int
     pick_scheme: str
-    reco_unique_context: str
     reco_clear_on_catalog_change: bool
     reco_no_more_key: str
 
@@ -126,7 +125,6 @@ def load_config(env_file: str | None = None) -> Config:
         batch_layout_cols=batch_columns,
         pick_scheme=_get("PICK_SCHEME", "GENDER_OR_GENDER_UNISEX")
         or "GENDER_OR_GENDER_UNISEX",
-        reco_unique_context=_get("UNIQ_SCOPE", "batch2") or "batch2",
         reco_clear_on_catalog_change=_as_bool(_get("RECO_CLEAR_ON_CATALOG_CHANGE", "1"), True),
         reco_no_more_key=_get("MSG_NO_MORE_KEY", "all_seen") or "all_seen",
     )

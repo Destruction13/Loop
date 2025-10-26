@@ -71,16 +71,13 @@ def test_catalog_parses_and_filters_by_gender() -> None:
             assert male_models[1].gender == "Унисекс"
             female_models = await catalog.list_by_gender("female")
             assert [model.title for model in female_models] == ["Bravo", "Charlie"]
-            seen_first = {female_models[0].unique_id}
             batch = await catalog.pick_batch(
                 gender="female",
                 batch_size=2,
                 scheme="GENDER_OR_GENDER_UNISEX",
-                seen_ids=seen_first,
                 rng=random.Random(42),
             )
             assert batch.items
-            assert batch.items[0].unique_id != female_models[0].unique_id
             await catalog.aclose()
 
     asyncio.run(_run())

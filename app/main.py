@@ -52,7 +52,6 @@ async def main() -> None:
     recommendation_settings = RecommendationSettings(
         batch_size=config.batch_size,
         pick_scheme=PickScheme.from_string(config.pick_scheme),
-        unique_context=config.reco_unique_context,
         clear_on_catalog_change=config.reco_clear_on_catalog_change,
     )
     recommender = RecommendationService(

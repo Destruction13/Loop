@@ -1,11 +1,10 @@
-"""Recommendation service implementing gender/unisex batching with uniqueness."""
+"""Recommendation service implementing gender/unisex batching."""
 
 from __future__ import annotations
 
 import logging
 import random
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from enum import Enum
 
 from app.models import GlassModel
@@ -33,7 +32,6 @@ class RecommendationSettings:
 
     batch_size: int
     pick_scheme: PickScheme
-    unique_context: str
     clear_on_catalog_change: bool
 
 
@@ -67,9 +65,8 @@ class RecommendationService:
     async def recommend_for_user(
         self, user_id: int, selected_gender: str
     ) -> RecommendationResult:
-        """Return models for the user based on configured quotas and uniqueness."""
+        """Return models for the user based on configured quotas."""
 
-        now = datetime.now(timezone.utc)
         snapshot = await self._catalog.snapshot()
         changed, cleared = await self._repository.sync_catalog_version(
             snapshot.version_hash,
@@ -85,16 +82,10 @@ class RecommendationService:
         normalized_gender = self._normalize_group_key(
             selected_gender, log_unknown=False
         )
-        unique_context = f"{self._settings.unique_context}:{normalized_gender}"
-        seen_ids = await self._repository.list_seen_models(
-            user_id, context=unique_context
-        )
-
         batch = await self._catalog.pick_batch(
             gender=selected_gender,
             batch_size=self._batch_size,
             scheme=self._scheme.value,
-            seen_ids=seen_ids,
             rng=self._rng,
             snapshot=snapshot,
         )
@@ -104,13 +95,6 @@ class RecommendationService:
 
         if not picks:
             return RecommendationResult(models=[], exhausted=exhausted)
-
-        await self._repository.record_seen_models(
-            user_id,
-            [model.unique_id for model in picks],
-            when=now,
-            context=unique_context,
-        )
         self._logger.debug(
             "Selected models for user %s: %s",
             user_id,

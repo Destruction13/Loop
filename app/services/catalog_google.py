@@ -10,7 +10,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import Iterable, List
+from typing import List
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -84,7 +84,6 @@ class GoogleSheetCatalog(CatalogService):
         gender: str,
         batch_size: int,
         scheme: str,
-        seen_ids: Iterable[str],
         rng: random.Random | None = None,
         snapshot: CatalogSnapshot | None = None,
     ) -> CatalogBatch:
@@ -97,7 +96,6 @@ class GoogleSheetCatalog(CatalogService):
         models = list(unique_models.values())
 
         normalized_gender = _normalize_gender(gender)
-        seen = set(seen_ids)
         gender_pool: list[GlassModel] = []
         unisex_pool: list[GlassModel] = []
 
@@ -107,9 +105,6 @@ class GoogleSheetCatalog(CatalogService):
                 gender_pool.append(model)
             elif group == "Унисекс":
                 unisex_pool.append(model)
-
-        gender_pool = [model for model in gender_pool if model.unique_id not in seen]
-        unisex_pool = [model for model in unisex_pool if model.unique_id not in seen]
 
         if normalized_gender == "Унисекс":
             picks, exhausted = _pick_unisex_batch(rng, unisex_pool, batch_size)

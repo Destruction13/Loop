@@ -5,7 +5,7 @@ from __future__ import annotations
 import abc
 import random
 from dataclasses import dataclass
-from typing import Iterable, List
+from typing import List
 
 from app.models import GlassModel
 
@@ -52,7 +52,6 @@ class CatalogService(abc.ABC):
         gender: str,
         batch_size: int,
         scheme: str,
-        seen_ids: Iterable[str],
         rng: random.Random | None = None,
         snapshot: CatalogSnapshot | None = None,
     ) -> CatalogBatch:

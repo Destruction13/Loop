@@ -58,6 +58,9 @@ class DummyMessage:
     ) -> None:
         self.answer_photos.append((photo, caption, reply_markup))
 
+    async def delete(self) -> None:
+        await self.bot.delete_message(self.chat.id, self.message_id)
+
 
 @dataclass
 class DummySentMessage:
@@ -336,10 +339,7 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
         assert len(builder.calls) == 2
         assert len(message.answer_photos) == 2
         captions = [caption for _, caption, _ in message.answer_photos]
-        assert captions == [
-            msg.BATCH_TITLE.format(index=1, total=2),
-            msg.BATCH_TITLE.format(index=2, total=2),
-        ]
+        assert captions == [None, None]
         button_counts = []
         for _, _, markup in message.answer_photos:
             assert isinstance(markup, InlineKeyboardMarkup)
@@ -417,7 +417,7 @@ def test_collage_source_unavailable_falls_back_to_text(tmp_path: Path) -> None:
         assert len(builder.calls) == 1
         assert not message.answer_photos
         fallback_text, markup = message.answers[-1]
-        assert msg.COLLAGE_IMAGES_UNAVAILABLE in fallback_text
+        assert fallback_text == msg.COLLAGE_IMAGES_UNAVAILABLE
         assert isinstance(markup, InlineKeyboardMarkup)
         assert len(markup.inline_keyboard[0]) == 2
 
@@ -469,7 +469,7 @@ def test_collage_processing_error_sends_individual_photos(tmp_path: Path) -> Non
         second_photo = message.answer_photos[1]
         assert first_photo[1] is None
         assert first_photo[2] is None
-        assert second_photo[1] == msg.BATCH_TITLE.format(index=1, total=1)
+        assert second_photo[1] is None
         markup = second_photo[2]
         assert isinstance(markup, InlineKeyboardMarkup)
         assert len(markup.inline_keyboard[0]) == 2
@@ -502,15 +502,20 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
 
         data = await state.get_data()
         assert data.get("upload")
+        initial_photo_count = len(upload_message.answer_photos)
 
         callback = DummyCallback("pick:src=batch2:m1", upload_message)
         await handler_choose(callback, state)
 
         generation_id = upload_message.message_id + 2
         assert (55, generation_id) in bot.deleted
+        assert (55, upload_message.message_id) in bot.deleted
         assert state.data.get("generation_message_id") is None
         assert repository.daily_used == 1
         assert state.state is TryOnStates.RESULT
+        assert len(upload_message.answer_photos) == initial_photo_count + 2
+        collage_entry = upload_message.answer_photos[initial_photo_count]
+        assert collage_entry[1] is None
         assert upload_message.answer_photos[-1][1] == "".join(msg.FIRST_RESULT_CAPTION)
         assert tryon.calls  # ensure generation was triggered
 

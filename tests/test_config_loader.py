@@ -25,7 +25,6 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 "BATCH_SIZE=5",
                 "BATCH_LAYOUT_COLS=3",
                 "PICK_SCHEME=GENDER_OR_GENDER_UNISEX",
-                "UNIQ_SCOPE=my_scope",
                 "CANVAS_WIDTH=1500",
                 "CANVAS_HEIGHT=500",
                 "CANVAS_BG=#EFEFEF",
@@ -58,7 +57,6 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.batch_size == 5
     assert config.batch_layout_cols == 3
     assert config.pick_scheme == "GENDER_OR_GENDER_UNISEX"
-    assert config.reco_unique_context == "my_scope"
     assert config.collage.width == 1500
     assert config.collage.height == 500
     assert config.collage.columns == 3

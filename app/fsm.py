@@ -170,11 +170,9 @@ def setup_router(
 
     async def _send_model_batches(message: Message, batch: list[GlassModel]) -> None:
         groups = chunk_models(batch, batch_size)
-        total_groups = len(groups) if groups else 0
-        for index, group in enumerate(groups, start=1):
-            label_text = msg.BATCH_TITLE.format(index=index, total=total_groups)
+        for group in groups:
             try:
-                await _send_batch_message(message, group, label_text)
+                await _send_batch_message(message, group)
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "%s Failed to send model batch %s: %s",
@@ -184,7 +182,7 @@ def setup_router(
                 )
 
     async def _send_batch_message(
-        message: Message, group: tuple[GlassModel, ...], label_text: str
+        message: Message, group: tuple[GlassModel, ...]
     ) -> None:
         keyboard = batch_selection_keyboard(
             [(item.unique_id, item.title) for item in group],
@@ -196,7 +194,7 @@ def setup_router(
             buffer = await collage_builder(urls, collage_config)
         except CollageSourceUnavailable:
             await message.answer(
-                f"{label_text}\n\n{msg.COLLAGE_IMAGES_UNAVAILABLE}",
+                msg.COLLAGE_IMAGES_UNAVAILABLE,
                 reply_markup=keyboard,
             )
             return
@@ -207,7 +205,7 @@ def setup_router(
                 exc,
             )
             await _send_batch_as_photos(
-                message, group, label_text=label_text, reply_markup=keyboard
+                message, group, reply_markup=keyboard
             )
             return
         except Exception as exc:  # noqa: BLE001
@@ -217,7 +215,7 @@ def setup_router(
                 exc,
             )
             await _send_batch_as_photos(
-                message, group, label_text=label_text, reply_markup=keyboard
+                message, group, reply_markup=keyboard
             )
             return
 
@@ -226,7 +224,7 @@ def setup_router(
         buffer.close()
         await message.answer_photo(
             photo=BufferedInputFile(collage_bytes, filename=filename),
-            caption=label_text,
+            caption=None,
             reply_markup=keyboard,
         )
         logger.info(
@@ -241,12 +239,11 @@ def setup_router(
         message: Message,
         group: tuple[GlassModel, ...],
         *,
-        label_text: str,
         reply_markup: InlineKeyboardMarkup,
     ) -> None:
         last_index = len(group) - 1
         for index, item in enumerate(group):
-            caption = label_text if index == last_index else None
+            caption = None
             markup = reply_markup if index == last_index else None
             await message.answer_photo(
                 photo=URLInputFile(item.img_user_url),
@@ -374,11 +371,21 @@ def setup_router(
             )
             await callback.answer()
             return
-        await state.update_data(selected_model=selected, last_batch=[])
+        filters = await _ensure_filters(callback.from_user.id, state)
+        await callback.answer()
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest as exc:
+            logger.warning(
+                "Failed to delete recommendation message %s: %s",
+                callback.message.message_id,
+                exc,
+            )
+        await _send_models(callback.message, callback.from_user.id, filters, state)
+        await state.update_data(selected_model=selected)
         await state.set_state(TryOnStates.GENERATING)
         generation_message = await callback.message.answer(msg.GENERATING_PROMPT)
         await state.update_data(generation_message_id=generation_message.message_id)
-        await callback.answer()
         await _perform_generation(callback.message, state, selected)
 
     async def _perform_generation(message: Message, state: FSMContext, model: GlassModel) -> None:
