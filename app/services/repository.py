@@ -63,11 +63,13 @@ class Repository:
             profile.daily_used += 1
             await asyncio.to_thread(self._upsert_user, profile)
 
-    async def add_seen_models(self, user_id: int, model_ids: Iterable[str]) -> None:
+    async def add_seen_models(
+        self, user_id: int, model_ids: Iterable[str], *, context: str = "global"
+    ) -> None:
         ids = list(dict.fromkeys(model_ids))
         if not ids:
             return
-        await self.record_seen_models(user_id, ids)
+        await self.record_seen_models(user_id, ids, context=context)
         profile = await self.ensure_daily_reset(user_id)
         lock = self._ensure_lock()
         async with lock:
@@ -82,16 +84,18 @@ class Repository:
         model_ids: Iterable[str],
         *,
         when: datetime | None = None,
+        context: str = "global",
     ) -> None:
         ids = list(dict.fromkeys(model_ids))
         if not ids:
             return
         timestamp = (when or datetime.now(timezone.utc)).isoformat()
-        await asyncio.to_thread(self._record_seen_models_sync, user_id, ids, timestamp)
+        await asyncio.to_thread(
+            self._record_seen_models_sync, user_id, ids, timestamp, context
+        )
 
-    async def list_seen_models(self, user_id: int, *, since: datetime | None) -> set[str]:
-        since_iso = since.isoformat() if since else None
-        return await asyncio.to_thread(self._list_seen_models_sync, user_id, since_iso)
+    async def list_seen_models(self, user_id: int, *, context: str) -> set[str]:
+        return await asyncio.to_thread(self._list_seen_models_sync, user_id, context)
 
     async def sync_catalog_version(
         self, version_hash: str, *, clear_on_change: bool
@@ -135,16 +139,7 @@ class Repository:
                 )
                 """
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS user_seen_models (
-                    user_id INTEGER NOT NULL,
-                    model_id TEXT NOT NULL,
-                    seen_at TEXT NOT NULL,
-                    PRIMARY KEY (user_id, model_id)
-                )
-                """
-            )
+            self._ensure_seen_table(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS catalog_meta (
@@ -236,35 +231,27 @@ class Repository:
         return result
 
     def _record_seen_models_sync(
-        self, user_id: int, model_ids: list[str], timestamp: str
+        self, user_id: int, model_ids: list[str], timestamp: str, context: str
     ) -> None:
         if not model_ids:
             return
         with self._connection() as conn:
             conn.executemany(
                 """
-                INSERT INTO user_seen_models (user_id, model_id, seen_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id, model_id) DO UPDATE SET seen_at=excluded.seen_at
+                INSERT INTO user_seen_models (user_id, context, model_id, seen_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, context, model_id) DO UPDATE SET seen_at=excluded.seen_at
                 """,
-                [(user_id, model_id, timestamp) for model_id in model_ids],
+                [(user_id, context, model_id, timestamp) for model_id in model_ids],
             )
             conn.commit()
 
-    def _list_seen_models_sync(
-        self, user_id: int, since_iso: str | None
-    ) -> set[str]:
+    def _list_seen_models_sync(self, user_id: int, context: str) -> set[str]:
         with self._connection() as conn:
-            if since_iso:
-                cur = conn.execute(
-                    "SELECT model_id FROM user_seen_models WHERE user_id = ? AND seen_at >= ?",
-                    (user_id, since_iso),
-                )
-            else:
-                cur = conn.execute(
-                    "SELECT model_id FROM user_seen_models WHERE user_id = ?",
-                    (user_id,),
-                )
+            cur = conn.execute(
+                "SELECT model_id FROM user_seen_models WHERE user_id = ? AND context = ?",
+                (user_id, context),
+            )
             rows = cur.fetchall()
         return {row[0] for row in rows}
 
@@ -295,6 +282,43 @@ class Repository:
                 )
             conn.commit()
         return changed, cleared
+
+    def _ensure_seen_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_seen_models (
+                user_id INTEGER NOT NULL,
+                context TEXT NOT NULL DEFAULT 'global',
+                model_id TEXT NOT NULL,
+                seen_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, context, model_id)
+            )
+            """,
+        )
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(user_seen_models)").fetchall()
+        }
+        if "context" not in columns:
+            conn.execute("ALTER TABLE user_seen_models RENAME TO user_seen_models_legacy")
+            conn.execute(
+                """
+                CREATE TABLE user_seen_models (
+                    user_id INTEGER NOT NULL,
+                    context TEXT NOT NULL DEFAULT 'global',
+                    model_id TEXT NOT NULL,
+                    seen_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, context, model_id)
+                )
+                """,
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO user_seen_models (user_id, context, model_id, seen_at)
+                SELECT user_id, 'global', model_id, seen_at FROM user_seen_models_legacy
+                """,
+            )
+            conn.execute("DROP TABLE user_seen_models_legacy")
 
     def _ensure_lock(self) -> asyncio.Lock:
         if self._lock is None:

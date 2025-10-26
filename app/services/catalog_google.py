@@ -7,6 +7,7 @@ import csv
 import hashlib
 import io
 import logging
+import random
 import time
 from dataclasses import dataclass
 from typing import Iterable, List
@@ -15,7 +16,12 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 
 from app.models import GlassModel
-from app.services.catalog_base import CatalogError, CatalogService, CatalogSnapshot
+from app.services.catalog_base import (
+    CatalogBatch,
+    CatalogError,
+    CatalogService,
+    CatalogSnapshot,
+)
 from app.utils.drive import DriveFolderUrlError, DriveUrlError, drive_view_to_direct
 
 LOGGER = logging.getLogger("loop_bot.catalog.google")
@@ -72,32 +78,53 @@ class GoogleSheetCatalog(CatalogService):
             allowed = {normalized, "Унисекс"}
         return [model for model in models if model.gender in allowed]
 
-    async def pick_four(self, gender: str, seen_ids: Iterable[str]) -> list[GlassModel]:
-        candidates = await self.list_by_gender(gender)
+    async def pick_batch(
+        self,
+        *,
+        gender: str,
+        batch_size: int,
+        scheme: str,
+        seen_ids: Iterable[str],
+        rng: random.Random | None = None,
+        snapshot: CatalogSnapshot | None = None,
+    ) -> CatalogBatch:
+        rng = rng or random.Random()
+        snapshot = snapshot or await self.snapshot()
+
+        unique_models: dict[str, GlassModel] = {}
+        for model in snapshot.models:
+            unique_models.setdefault(model.unique_id, model)
+        models = list(unique_models.values())
+
+        normalized_gender = _normalize_gender(gender)
         seen = set(seen_ids)
-        normalized = _normalize_gender(gender)
-        gender_pool = [
-            model for model in candidates if model.gender == normalized and model.unique_id not in seen
-        ]
-        unisex_pool = [
-            model for model in candidates if model.gender == "Унисекс" and model.unique_id not in seen
-        ]
-        picks: list[GlassModel] = []
-        max_batch = 3
-        if normalized == "Унисекс":
-            picks.extend(unisex_pool[:max_batch])
+        gender_pool: list[GlassModel] = []
+        unisex_pool: list[GlassModel] = []
+
+        for model in models:
+            group = _normalize_gender(model.gender)
+            if group == normalized_gender:
+                gender_pool.append(model)
+            elif group == "Унисекс":
+                unisex_pool.append(model)
+
+        gender_pool = [model for model in gender_pool if model.unique_id not in seen]
+        unisex_pool = [model for model in unisex_pool if model.unique_id not in seen]
+
+        if normalized_gender == "Унисекс":
+            picks, exhausted = _pick_unisex_batch(rng, unisex_pool, batch_size)
         else:
-            picks.extend(gender_pool[:2])
-            remaining = max_batch - len(picks)
-            if remaining > 0:
-                picks.extend(unisex_pool[:remaining])
-            remaining = max_batch - len(picks)
-            if remaining > 0:
-                fallback_pool = [model for model in gender_pool if model not in picks]
-                fallback_pool.extend(model for model in unisex_pool if model not in picks)
-                picks.extend(fallback_pool[:remaining])
-        LOGGER.info("Catalog returned %s models for gender=%s", len(picks), gender)
-        return picks
+            picks, exhausted = _pick_gender_batch(
+                rng, gender_pool, unisex_pool, batch_size, scheme
+            )
+
+        LOGGER.info(
+            "Catalog returned batch items=%s exhausted=%s for gender=%s",
+            [model.unique_id for model in picks],
+            exhausted,
+            gender,
+        )
+        return CatalogBatch(items=picks, exhausted=exhausted)
 
     async def aclose(self) -> None:  # noqa: D401 - inherited docstring
         if self._client_owner:
@@ -301,6 +328,109 @@ def _normalize_gender(value: str) -> str:
     if prepared:
         LOGGER.warning("Unknown gender value '%s' in catalog, treating as Other", value)
     return "Other"
+
+
+def _sample(
+    rng: random.Random, items: Iterable[GlassModel], count: int
+) -> list[GlassModel]:
+    pool = list(items)
+    if count <= 0:
+        return []
+    if len(pool) <= count:
+        return list(pool)
+    return rng.sample(pool, count)
+
+
+def _pick_unisex_batch(
+    rng: random.Random, pool: list[GlassModel], batch_size: int
+) -> tuple[list[GlassModel], bool]:
+    selection = _sample(rng, pool, min(batch_size, len(pool)))
+    used_ids = {model.unique_id for model in selection}
+    remaining = [model for model in pool if model.unique_id not in used_ids]
+    exhausted = len(remaining) < batch_size
+    return selection, exhausted
+
+
+def _pick_gender_batch(
+    rng: random.Random,
+    gender_pool: list[GlassModel],
+    unisex_pool: list[GlassModel],
+    batch_size: int,
+    scheme: str,
+) -> tuple[list[GlassModel], bool]:
+    normalized_scheme = (scheme or "GENDER_OR_GENDER_UNISEX").strip().upper()
+    picks: list[GlassModel] = []
+    used_ids: set[str] = set()
+
+    schemes: list[str] = []
+    if len(gender_pool) >= 2:
+        schemes.append("GG")
+    if len(gender_pool) >= 1 and len(unisex_pool) >= 1:
+        schemes.append("GU")
+
+    chosen_scheme: str | None = None
+    if normalized_scheme == "GENDER_OR_GENDER_UNISEX" and schemes:
+        if len(schemes) == 1:
+            chosen_scheme = schemes[0]
+        else:
+            chosen_scheme = rng.choice(schemes)
+
+    if chosen_scheme == "GG":
+        selection = _sample(rng, gender_pool, min(2, len(gender_pool)))
+        picks.extend(selection)
+        used_ids.update(model.unique_id for model in selection)
+    elif chosen_scheme == "GU":
+        gender_selection = _sample(rng, gender_pool, 1)
+        picks.extend(gender_selection)
+        used_ids.update(model.unique_id for model in gender_selection)
+        remaining_unisex = [
+            model for model in unisex_pool if model.unique_id not in used_ids
+        ]
+        unisex_selection = _sample(rng, remaining_unisex, 1)
+        picks.extend(unisex_selection)
+        used_ids.update(model.unique_id for model in unisex_selection)
+    else:
+        if gender_pool:
+            gender_selection = _sample(
+                rng, gender_pool, min(batch_size, len(gender_pool))
+            )
+            picks.extend(gender_selection)
+            used_ids.update(model.unique_id for model in gender_selection)
+        elif unisex_pool:
+            unisex_selection = _sample(
+                rng, unisex_pool, min(batch_size, len(unisex_pool))
+            )
+            picks.extend(unisex_selection)
+            used_ids.update(model.unique_id for model in unisex_selection)
+
+    if len(picks) < batch_size and unisex_pool:
+        remaining_slots = batch_size - len(picks)
+        remaining_unisex = [
+            model for model in unisex_pool if model.unique_id not in used_ids
+        ]
+        if remaining_unisex:
+            unisex_selection = _sample(
+                rng, remaining_unisex, min(remaining_slots, len(remaining_unisex))
+            )
+            picks.extend(unisex_selection)
+            used_ids.update(model.unique_id for model in unisex_selection)
+
+    if len(picks) < batch_size and gender_pool:
+        remaining_slots = batch_size - len(picks)
+        remaining_gender = [
+            model for model in gender_pool if model.unique_id not in used_ids
+        ]
+        if remaining_gender:
+            gender_selection = _sample(
+                rng, remaining_gender, min(remaining_slots, len(remaining_gender))
+            )
+            picks.extend(gender_selection)
+            used_ids.update(model.unique_id for model in gender_selection)
+
+    remaining_gender = [model for model in gender_pool if model.unique_id not in used_ids]
+    remaining_unisex = [model for model in unisex_pool if model.unique_id not in used_ids]
+    exhausted = (len(remaining_gender) + len(remaining_unisex)) < batch_size
+    return picks, exhausted
 
 
 def _make_fallback_id(title: str, site_url: str) -> str:

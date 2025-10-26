@@ -17,7 +17,7 @@ DEFAULT_SHEET_URL = (
 
 @dataclass(slots=True)
 class CollageConfig:
-    """Rendering options for horizontal three-tile collages."""
+    """Rendering options for horizontal collages."""
 
     width: int
     height: int
@@ -50,10 +50,9 @@ class Config:
     collage: CollageConfig
     batch_size: int
     batch_layout_cols: int
-    pick_rule: str
-    reco_unique_scope: str
+    pick_scheme: str
+    reco_unique_context: str
     reco_clear_on_catalog_change: bool
-    reco_topup_from_any: bool
     reco_no_more_key: str
 
 
@@ -86,16 +85,6 @@ def _as_path(value: Optional[str], fallback: str) -> Path:
     return Path(value or fallback)
 
 
-def _as_unique_scope(value: Optional[str], fallback: str) -> str:
-    allowed = {"24h", "7d", "all"}
-    if not value:
-        return fallback
-    normalized = value.strip().lower()
-    if normalized in allowed:
-        return normalized
-    return fallback
-
-
 def load_config(env_file: str | None = None) -> Config:
     """Load configuration from the provided .env file (or default location)."""
 
@@ -104,14 +93,14 @@ def load_config(env_file: str | None = None) -> Config:
     else:
         load_dotenv()
 
-    batch_size = _as_int(_get("BATCH_SIZE", "3"), 3)
-    batch_columns = _as_int(_get("BATCH_LAYOUT_COLS", "3"), 3)
+    batch_size = max(_as_int(_get("BATCH_SIZE", "2"), 2), 1)
+    batch_columns = max(_as_int(_get("BATCH_LAYOUT_COLS", "2"), 2), 1)
     collage = CollageConfig(
-        width=_as_int(_get("CANVAS_WIDTH", "1800"), 1800),
-        height=_as_int(_get("CANVAS_HEIGHT", "600"), 600),
-        columns=max(batch_columns, 1),
+        width=_as_int(_get("CANVAS_WIDTH", "1600"), 1600),
+        height=_as_int(_get("CANVAS_HEIGHT", "800"), 800),
+        columns=batch_columns,
         margin=_as_int(_get("TILE_MARGIN", "30"), 30),
-        divider_width=_as_int(_get("DIVIDER_WIDTH", "4"), 4),
+        divider_width=_as_int(_get("DIVIDER_WIDTH", "6"), 6),
         divider_color=_get("DIVIDER_COLOR", "#E5E5E5") or "#E5E5E5",
         background=_get("CANVAS_BG", "#FFFFFF") or "#FFFFFF",
         jpeg_quality=_as_int(_get("JPEG_QUALITY", "88"), 88),
@@ -133,12 +122,12 @@ def load_config(env_file: str | None = None) -> Config:
         nano_api_url=_get("NANO_API_URL"),
         nano_api_key=_get("NANO_API_KEY"),
         collage=collage,
-        batch_size=max(batch_size, 1),
-        batch_layout_cols=max(batch_columns, 1),
-        pick_rule=_get("PICK_RULE", "2_1") or "2_1",
-        reco_unique_scope=_as_unique_scope(_get("RECO_UNIQUE_SCOPE", "24h"), "24h"),
+        batch_size=batch_size,
+        batch_layout_cols=batch_columns,
+        pick_scheme=_get("PICK_SCHEME", "GENDER_OR_GENDER_UNISEX")
+        or "GENDER_OR_GENDER_UNISEX",
+        reco_unique_context=_get("UNIQ_SCOPE", "batch2") or "batch2",
         reco_clear_on_catalog_change=_as_bool(_get("RECO_CLEAR_ON_CATALOG_CHANGE", "1"), True),
-        reco_topup_from_any=_as_bool(_get("RECO_TOPUP_FROM_ANY", "0"), False),
         reco_no_more_key=_get("MSG_NO_MORE_KEY", "all_seen") or "all_seen",
     )
 
