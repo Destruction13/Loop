@@ -53,6 +53,10 @@ class Config:
     pick_scheme: str
     reco_clear_on_catalog_change: bool
     reco_no_more_key: str
+    contact_reward_rub: int
+    promo_contact_code: str
+    leads_sheet_name: str
+    enable_leads_export: bool
 
 
 def _get(name: str, default: Optional[str] = None, *, required: bool = False) -> Optional[str]:
@@ -105,11 +109,21 @@ def load_config(env_file: str | None = None) -> Config:
         jpeg_quality=_as_int(_get("JPEG_QUALITY", "88"), 88),
     )
 
+    promo_code = _get("PROMO_CODE", "DEMO 10") or "DEMO 10"
+    promo_contact_raw = _get("PROMO_CONTACT_CODE")
+    if promo_contact_raw is None:
+        promo_contact_code = promo_code or "CONTACT1000"
+    else:
+        promo_contact_code = promo_contact_raw or (promo_code or "CONTACT1000")
+    contact_reward_rub = _as_int(_get("CONTACT_REWARD_RUB", "1000"), 1000)
+    leads_sheet_name = _get("LEADS_SHEET_NAME", "Leads") or "Leads"
+    enable_leads_export = _as_bool(_get("ENABLE_LEADS_EXPORT", "1"), True)
+
     return Config(
         bot_token=_get("BOT_TOKEN", required=True),
         sheet_csv_url=_get("SHEET_CSV_URL", DEFAULT_SHEET_URL) or DEFAULT_SHEET_URL,
         landing_url=_get("LANDING_URL", "https://example.com/booking") or "https://example.com/booking",
-        promo_code=_get("PROMO_CODE", "DEMO 10") or "DEMO 10",
+        promo_code=promo_code,
         daily_try_limit=_as_int(_get("DAILY_TRY_LIMIT", "7"), 7),
         reminder_hours=_as_int(_get("REMINDER_HOURS", "24"), 24),
         csv_fetch_ttl_sec=_as_int(_get("CSV_FETCH_TTL_SEC", "60"), 60),
@@ -127,6 +141,10 @@ def load_config(env_file: str | None = None) -> Config:
         or "GENDER_OR_GENDER_UNISEX",
         reco_clear_on_catalog_change=_as_bool(_get("RECO_CLEAR_ON_CATALOG_CHANGE", "1"), True),
         reco_no_more_key=_get("MSG_NO_MORE_KEY", "all_seen") or "all_seen",
+        contact_reward_rub=contact_reward_rub,
+        promo_contact_code=promo_contact_code,
+        leads_sheet_name=leads_sheet_name,
+        enable_leads_export=enable_leads_export,
     )
 
 

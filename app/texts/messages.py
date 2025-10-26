@@ -137,3 +137,23 @@ def marketing_text(key: str) -> str:
     if not factory:
         raise KeyError(f"Unknown marketing text key: {key}")
     return factory()
+# Диалог запроса телефона.
+ASK_PHONE_TITLE = "Скидка за номер телефона"
+ASK_PHONE_BODY = (
+    "Дарим {rub} ₽ скидки на оправу за ваш номер телефона.\n"
+    "Можете поделиться номером из аккаунта или ввести вручную.\n\n"
+    "Это поможет нам связаться для подбора времени и подтверждения заказа."
+)
+ASK_PHONE_BUTTON_SHARE = "Поделиться номером"
+ASK_PHONE_BUTTON_SKIP = "Не сейчас"
+ASK_PHONE_BUTTON_NEVER = "Никогда"
+ASK_PHONE_PROMPT_MANUAL = (
+    "Отправьте номер в формате +79991234567 (или поделитесь кнопкой ниже)"
+)
+ASK_PHONE_INVALID = (
+    "Не похоже на номер. Проверьте формат (лучше с +7) или нажмите «Поделиться номером»."
+)
+ASK_PHONE_THANKS = "Спасибо! Начислил скидку {rub} ₽. Ваш промокод: {promo}"
+ASK_PHONE_ALREADY_HAVE = "Контакт уже сохранён ✅"
+ASK_PHONE_SKIP_ACK = "Хорошо, вернёмся к номеру позже."
+ASK_PHONE_NEVER_ACK = "Понял, больше не буду спрашивать."

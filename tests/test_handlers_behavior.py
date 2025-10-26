@@ -106,9 +106,20 @@ class StubRepository:
         self.updated_filters: list[tuple[int, str]] = []
         self.reminder: Optional[Any] = None
         self.synced_versions: list[str] = []
+        self.gen_counts: dict[int, int] = {}
+        self.contact_skip: dict[int, bool] = {}
+        self.contact_never: dict[int, bool] = {}
+        self.contacts: dict[int, Any] = {}
 
     async def ensure_user(self, user_id: int) -> Any:
-        return SimpleNamespace(gender=self.gender, daily_used=self.daily_used, seen_models=list(self.seen_models))
+        return SimpleNamespace(
+            gender=self.gender,
+            daily_used=self.daily_used,
+            seen_models=list(self.seen_models),
+            gen_count=self.gen_counts.get(user_id, 0),
+            contact_skip_once=self.contact_skip.get(user_id, False),
+            contact_never=self.contact_never.get(user_id, False),
+        )
 
     async def update_filters(self, user_id: int, gender: str) -> None:
         self.updated_filters.append((user_id, gender))
@@ -139,6 +150,35 @@ class StubRepository:
 
     async def inc_used_on_success(self, user_id: int) -> None:
         self.daily_used += 1
+
+    async def increment_generation_count(self, user_id: int) -> int:
+        self.gen_counts[user_id] = self.gen_counts.get(user_id, 0) + 1
+        return self.gen_counts[user_id]
+
+    async def set_contact_skip_once(self, user_id: int, value: bool) -> None:
+        self.contact_skip[user_id] = value
+
+    async def set_contact_never(self, user_id: int, value: bool) -> None:
+        self.contact_never[user_id] = value
+
+    async def get_user_contact(self, user_id: int) -> Optional[Any]:
+        return self.contacts.get(user_id)
+
+    async def upsert_user_contact(self, contact: Any) -> None:
+        self.contacts[contact.tg_user_id] = SimpleNamespace(
+            phone_e164=contact.phone_e164,
+            source=contact.source,
+            consent=contact.consent,
+            consent_ts=contact.consent_ts,
+            reward_granted=contact.reward_granted,
+        )
+        self.contact_skip[contact.tg_user_id] = False
+        self.contact_never[contact.tg_user_id] = False
+
+    async def mark_contact_reward_granted(self, user_id: int) -> None:
+        contact = self.contacts.get(user_id)
+        if contact:
+            contact.reward_granted = True
 
     async def set_referrer(self, user_id: int, ref_id: int) -> None:  # noqa: D401 - no-op
         return None
@@ -184,6 +224,15 @@ class StubStorage:
         return self.uploads_dir / filename
 
 
+class StubLeadsExporter:
+    def __init__(self) -> None:
+        self.payloads: list[Any] = []
+
+    async def export_lead_to_sheet(self, payload: Any) -> bool:
+        self.payloads.append(payload)
+        return True
+
+
 class StubCollageBuilder:
     def __init__(self) -> None:
         self.calls: list[list[Optional[str]]] = []
@@ -218,6 +267,7 @@ def build_router(
     tryon = StubTryOn(result_path=result_path)
     storage = StubStorage(tmp_path / "uploads")
     builder = collage_builder or StubCollageBuilder()
+    leads_exporter = StubLeadsExporter()
     collage_config = CollageConfig(
         width=1600,
         height=800,
@@ -242,6 +292,9 @@ def build_router(
         landing_url="https://example.com",
         promo_code="PROMO",
         no_more_message_key="all_seen",
+        contact_reward_rub=1000,
+        promo_contact_code="PROMO1000",
+        leads_exporter=leads_exporter,
     )
     return router, repository, tryon, builder, recommender
 

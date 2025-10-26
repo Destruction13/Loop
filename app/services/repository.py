@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Generator, Iterable, List, Optional, Tuple
 
-from app.models import UserProfile
+from app.models import UserContact, UserProfile
 
 
 class Repository:
@@ -62,6 +63,48 @@ class Repository:
         async with lock:
             profile.daily_used += 1
             await asyncio.to_thread(self._upsert_user, profile)
+
+    async def get_generation_count(self, user_id: int) -> int:
+        profile = await self.ensure_user(user_id)
+        return profile.gen_count
+
+    async def increment_generation_count(self, user_id: int) -> int:
+        lock = self._ensure_lock()
+        async with lock:
+            profile = await self.ensure_user(user_id)
+            profile.gen_count += 1
+            await asyncio.to_thread(self._upsert_user, profile)
+            return profile.gen_count
+
+    async def set_generation_count(self, user_id: int, value: int) -> None:
+        lock = self._ensure_lock()
+        async with lock:
+            profile = await self.ensure_user(user_id)
+            profile.gen_count = max(value, 0)
+            await asyncio.to_thread(self._upsert_user, profile)
+
+    async def set_contact_skip_once(self, user_id: int, value: bool) -> None:
+        lock = self._ensure_lock()
+        async with lock:
+            profile = await self.ensure_user(user_id)
+            profile.contact_skip_once = value
+            await asyncio.to_thread(self._upsert_user, profile)
+
+    async def set_contact_never(self, user_id: int, value: bool) -> None:
+        lock = self._ensure_lock()
+        async with lock:
+            profile = await self.ensure_user(user_id)
+            profile.contact_never = value
+            await asyncio.to_thread(self._upsert_user, profile)
+
+    async def get_user_contact(self, user_id: int) -> Optional[UserContact]:
+        return await asyncio.to_thread(self._get_user_contact_sync, user_id)
+
+    async def upsert_user_contact(self, contact: UserContact) -> None:
+        await asyncio.to_thread(self._upsert_user_contact_sync, contact)
+
+    async def mark_contact_reward_granted(self, user_id: int) -> None:
+        await asyncio.to_thread(self._mark_contact_reward_sync, user_id)
 
     async def add_seen_models(
         self, user_id: int, model_ids: Iterable[str], *, context: str = "global"
@@ -139,6 +182,7 @@ class Repository:
                 )
                 """
             )
+            self._ensure_user_columns(conn)
             self._ensure_seen_table(conn)
             conn.execute(
                 """
@@ -148,6 +192,7 @@ class Repository:
                 )
                 """
             )
+            self._ensure_contact_table(conn)
             conn.commit()
 
     def _get_user_sync(self, user_id: int) -> Optional[UserProfile]:
@@ -172,6 +217,9 @@ class Repository:
             seen_models=seen_models,
             remind_at=remind_at,
             referrer_id=row["referrer_id"],
+            gen_count=row["gen_count"] if row["gen_count"] is not None else 0,
+            contact_skip_once=bool(row["contact_skip_once"] or 0),
+            contact_never=bool(row["contact_never"] or 0),
         )
 
     def _update_filters_sync(self, user_id: int, gender: Optional[str]) -> None:
@@ -187,8 +235,34 @@ class Repository:
         with self._connection() as conn:
             conn.execute(
                 """
-                INSERT INTO users (user_id, gender, age_bucket, style, daily_used, last_reset_at, seen_models, remind_at, referrer_id)
-                VALUES (:user_id, :gender, :age_bucket, :style, :daily_used, :last_reset_at, :seen_models, :remind_at, :referrer_id)
+                INSERT INTO users (
+                    user_id,
+                    gender,
+                    age_bucket,
+                    style,
+                    daily_used,
+                    last_reset_at,
+                    seen_models,
+                    remind_at,
+                    referrer_id,
+                    gen_count,
+                    contact_skip_once,
+                    contact_never
+                )
+                VALUES (
+                    :user_id,
+                    :gender,
+                    :age_bucket,
+                    :style,
+                    :daily_used,
+                    :last_reset_at,
+                    :seen_models,
+                    :remind_at,
+                    :referrer_id,
+                    :gen_count,
+                    :contact_skip_once,
+                    :contact_never
+                )
                 ON CONFLICT(user_id) DO UPDATE SET
                     gender=excluded.gender,
                     age_bucket=excluded.age_bucket,
@@ -197,7 +271,10 @@ class Repository:
                     last_reset_at=excluded.last_reset_at,
                     seen_models=excluded.seen_models,
                     remind_at=excluded.remind_at,
-                    referrer_id=excluded.referrer_id
+                    referrer_id=excluded.referrer_id,
+                    gen_count=excluded.gen_count,
+                    contact_skip_once=excluded.contact_skip_once,
+                    contact_never=excluded.contact_never
                 """,
                 {
                     "user_id": data["user_id"],
@@ -211,6 +288,9 @@ class Repository:
                     "seen_models": json.dumps(data["seen_models"]),
                     "remind_at": data["remind_at"].isoformat() if data["remind_at"] else None,
                     "referrer_id": data["referrer_id"],
+                    "gen_count": data["gen_count"],
+                    "contact_skip_once": 1 if data["contact_skip_once"] else 0,
+                    "contact_never": 1 if data["contact_never"] else 0,
                 },
             )
             conn.commit()
@@ -254,6 +334,68 @@ class Repository:
             )
             rows = cur.fetchall()
         return {row[0] for row in rows}
+
+    def _get_user_contact_sync(self, user_id: int) -> Optional[UserContact]:
+        with self._connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                """
+                SELECT tg_user_id, phone_e164, source, consent, consent_ts, reward_granted
+                FROM user_contacts
+                WHERE tg_user_id = ?
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return UserContact(
+            tg_user_id=row["tg_user_id"],
+            phone_e164=row["phone_e164"],
+            source=row["source"],
+            consent=bool(row["consent"]),
+            consent_ts=row["consent_ts"],
+            reward_granted=bool(row["reward_granted"]),
+        )
+
+    def _upsert_user_contact_sync(self, contact: UserContact) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_contacts (
+                    tg_user_id,
+                    phone_e164,
+                    source,
+                    consent,
+                    consent_ts,
+                    reward_granted
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tg_user_id) DO UPDATE SET
+                    phone_e164=excluded.phone_e164,
+                    source=excluded.source,
+                    consent=excluded.consent,
+                    consent_ts=excluded.consent_ts,
+                    reward_granted=excluded.reward_granted
+                """,
+                (
+                    contact.tg_user_id,
+                    contact.phone_e164,
+                    contact.source,
+                    1 if contact.consent else 0,
+                    contact.consent_ts,
+                    1 if contact.reward_granted else 0,
+                ),
+            )
+            conn.commit()
+
+    def _mark_contact_reward_sync(self, user_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE user_contacts SET reward_granted = 1 WHERE tg_user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
 
     def _sync_catalog_version_sync(
         self, version_hash: str, clear_on_change: bool
@@ -319,6 +461,38 @@ class Repository:
                 """,
             )
             conn.execute("DROP TABLE user_seen_models_legacy")
+
+    def _ensure_user_columns(self, conn: sqlite3.Connection) -> None:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "gen_count" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN gen_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "contact_skip_once" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN contact_skip_once INTEGER NOT NULL DEFAULT 0"
+            )
+        if "contact_never" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN contact_never INTEGER NOT NULL DEFAULT 0"
+            )
+
+    def _ensure_contact_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_contacts (
+                tg_user_id INTEGER PRIMARY KEY,
+                phone_e164 TEXT NOT NULL,
+                source TEXT NOT NULL,
+                consent INTEGER NOT NULL,
+                consent_ts INTEGER NOT NULL,
+                reward_granted INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
 
     def _ensure_lock(self) -> asyncio.Lock:
         if self._lock is None:

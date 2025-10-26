@@ -40,8 +40,23 @@ class UserProfile:
     seen_models: list[str] = field(default_factory=list)
     remind_at: Optional[datetime] = None
     referrer_id: Optional[int] = None
+    gen_count: int = 0
+    contact_skip_once: bool = False
+    contact_never: bool = False
 
     def remaining(self, limit: int) -> int:
         """Return remaining tries for the day."""
 
         return max(limit - self.daily_used, 0)
+
+
+@dataclass(slots=True)
+class UserContact:
+    """Stored phone number for a Telegram user."""
+
+    tg_user_id: int
+    phone_e164: str
+    source: str
+    consent: bool
+    consent_ts: int
+    reward_granted: bool = False

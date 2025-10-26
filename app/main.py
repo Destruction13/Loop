@@ -14,6 +14,7 @@ from app.keyboards import reminder_keyboard, start_keyboard
 from app.logging_conf import EVENT_ID, setup_logging
 from app.services.catalog_google import GoogleCatalogConfig, GoogleSheetCatalog
 from app.services.collage import build_three_tile_collage
+from app.services.leads_export import LeadsExporter
 from app.services.repository import Repository
 from app.services.scheduler import ReminderScheduler
 from app.services.storage_local import LocalStorage
@@ -60,6 +61,12 @@ async def main() -> None:
         settings=recommendation_settings,
     )
 
+    leads_exporter = LeadsExporter(
+        enabled=config.enable_leads_export,
+        sheet_name=config.leads_sheet_name,
+        promo_code=config.promo_contact_code,
+    )
+
     if config.mock_tryon:
         tryon_service = MockTryOnService(storage)
     else:
@@ -81,6 +88,9 @@ async def main() -> None:
         landing_url=str(config.landing_url),
         promo_code=config.promo_code,
         no_more_message_key=config.reco_no_more_key,
+        contact_reward_rub=config.contact_reward_rub,
+        promo_contact_code=config.promo_contact_code,
+        leads_exporter=leads_exporter,
     )
     dp.include_router(router)
 
