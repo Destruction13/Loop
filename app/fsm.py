@@ -129,7 +129,7 @@ def setup_router(
         data = await state.get_data()
         return FilterOptions(gender=data.get("gender", "unisex"))
 
-    batch_source = "batch3"
+    batch_source = "src=batch2"
 
     async def _send_models(
         message: Message, user_id: int, filters: FilterOptions, state: FSMContext

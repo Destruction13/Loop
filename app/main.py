@@ -22,9 +22,9 @@ from app.services.tryon_nanobanana import NanoBananaTryOnService
 from app.texts import messages as msg
 from app.utils.paths import ensure_dir
 from app.services.recommendation import (
+    PickScheme,
     RecommendationService,
     RecommendationSettings,
-    UniqueScope,
 )
 
 
@@ -51,10 +51,9 @@ async def main() -> None:
 
     recommendation_settings = RecommendationSettings(
         batch_size=config.batch_size,
-        pick_rule=config.pick_rule,
-        unique_scope=UniqueScope.from_string(config.reco_unique_scope),
+        pick_scheme=PickScheme.from_string(config.pick_scheme),
+        unique_context=config.reco_unique_context,
         clear_on_catalog_change=config.reco_clear_on_catalog_change,
-        topup_from_any=config.reco_topup_from_any,
     )
     recommender = RecommendationService(
         catalog=catalog_service,

@@ -13,11 +13,11 @@ from app.services.collage import CollageSourceUnavailable, build_three_tile_coll
 
 def _default_cfg() -> CollageConfig:
     return CollageConfig(
-        width=600,
-        height=300,
-        columns=3,
-        margin=20,
-        divider_width=4,
+        width=1600,
+        height=800,
+        columns=2,
+        margin=30,
+        divider_width=6,
         divider_color="#E5E5E5",
         background="#FFFFFF",
         jpeg_quality=88,
@@ -59,19 +59,16 @@ async def _render_collage(
         return await build_three_tile_collage(urls, cfg, client=client)
 
 
-def test_collage_renders_three_tiles() -> None:
+def test_collage_1x2_geometry() -> None:
     config = _default_cfg()
     red = _make_image_bytes((400, 400), "red")
     green = _make_image_bytes((400, 400), "green")
-    blue = _make_image_bytes((400, 400), "blue")
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("a.jpg"):
             return httpx.Response(200, content=red, headers={"content-type": "image/jpeg"})
         if request.url.path.endswith("b.jpg"):
             return httpx.Response(200, content=green, headers={"content-type": "image/jpeg"})
-        if request.url.path.endswith("c.jpg"):
-            return httpx.Response(200, content=blue, headers={"content-type": "image/jpeg"})
         return httpx.Response(404)
 
     transport = httpx.MockTransport(handler)
@@ -81,7 +78,6 @@ def test_collage_renders_three_tiles() -> None:
             [
                 "https://example.com/a.jpg",
                 "https://example.com/b.jpg",
-                "https://example.com/c.jpg",
             ],
             config,
         )
@@ -93,10 +89,8 @@ def test_collage_renders_three_tiles() -> None:
         centers = [((left + right) // 2, (top + bottom) // 2) for left, top, right, bottom in boxes]
         first_pixel = collage.getpixel(centers[0])
         second_pixel = collage.getpixel(centers[1])
-        third_pixel = collage.getpixel(centers[2])
         assert first_pixel[0] > 150 and first_pixel[1] < 100 and first_pixel[2] < 100
         assert second_pixel[1] > 120 and second_pixel[0] < 120
-        assert third_pixel[2] > 120 and third_pixel[0] < 120
 
 
 def test_collage_draws_dividers() -> None:
@@ -116,7 +110,7 @@ def test_collage_draws_dividers() -> None:
     buffer = asyncio.run(
         _render_collage(
             transport,
-            ["https://example.com/1.jpg", "https://example.com/2.jpg", "https://example.com/3.jpg"],
+            ["https://example.com/1.jpg", "https://example.com/2.jpg"],
             config,
         )
     )
@@ -124,10 +118,10 @@ def test_collage_draws_dividers() -> None:
     divider_rgb = ImageColor.getrgb(config.divider_color)
     with Image.open(buffer) as collage:
         boxes = _tile_boxes(config)
-        for box in boxes[:-1]:
-            sample_x = box[2] + config.divider_width // 2
-            sample = collage.getpixel((sample_x, config.height // 2))
-            assert all(abs(channel - ref) <= 5 for channel, ref in zip(sample, divider_rgb))
+        divider_left = boxes[0][2]
+        sample_x = divider_left + config.divider_width // 2
+        sample = collage.getpixel((sample_x, config.height // 2))
+        assert all(abs(channel - ref) <= 5 for channel, ref in zip(sample, divider_rgb))
 
 
 def test_collage_handles_missing_sources() -> None:
@@ -141,7 +135,7 @@ def test_collage_handles_missing_sources() -> None:
     buffer = asyncio.run(
         _render_collage(
             transport,
-            ["https://example.com/a.jpg", None, None],
+            ["https://example.com/a.jpg", None],
             config,
         )
     )
@@ -150,9 +144,9 @@ def test_collage_handles_missing_sources() -> None:
         boxes = _tile_boxes(config)
         background_rgb = ImageColor.getrgb(config.background)
         left_pixel = collage.getpixel(((boxes[0][0] + boxes[0][2]) // 2, (boxes[0][1] + boxes[0][3]) // 2))
-        middle_pixel = collage.getpixel(((boxes[1][0] + boxes[1][2]) // 2, (boxes[1][1] + boxes[1][3]) // 2))
+        right_pixel = collage.getpixel(((boxes[1][0] + boxes[1][2]) // 2, (boxes[1][1] + boxes[1][3]) // 2))
         assert left_pixel[0] > 150
-        assert middle_pixel == background_rgb
+        assert right_pixel == background_rgb
 
 
 def test_collage_raises_when_all_sources_missing() -> None:
@@ -167,7 +161,7 @@ def test_collage_raises_when_all_sources_missing() -> None:
         asyncio.run(
             _render_collage(
                 transport,
-                [None, None, None],
+                [None, None],
                 config,
             )
         )

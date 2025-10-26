@@ -118,11 +118,16 @@ class StubRepository:
         return max(self.daily_limit - self.daily_used, 0)
 
     async def record_seen_models(
-        self, user_id: int, model_ids: Iterable[str], *, when: Optional[Any] = None
+        self,
+        user_id: int,
+        model_ids: Iterable[str],
+        *,
+        when: Optional[Any] = None,
+        context: str = "global",
     ) -> None:
         self.seen_models.extend(model_ids)
 
-    async def list_seen_models(self, user_id: int, *, since: Optional[Any]) -> set[str]:
+    async def list_seen_models(self, user_id: int, *, context: str) -> set[str]:
         return set()
 
     async def sync_catalog_version(self, version_hash: str, *, clear_on_change: bool) -> tuple[bool, bool]:
@@ -211,10 +216,10 @@ def build_router(
     storage = StubStorage(tmp_path / "uploads")
     builder = collage_builder or StubCollageBuilder()
     collage_config = CollageConfig(
-        width=640,
-        height=320,
-        columns=3,
-        margin=24,
+        width=1600,
+        height=800,
+        columns=2,
+        margin=30,
         divider_width=6,
         divider_color="#E6E9EF",
         background="#FFFFFF",
@@ -228,7 +233,7 @@ def build_router(
         storage=storage,
         collage_config=collage_config,
         collage_builder=builder,
-        batch_size=3,
+        batch_size=2,
         reminder_hours=24,
         selection_button_title_max=28,
         landing_url="https://example.com",
@@ -340,12 +345,12 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
             assert isinstance(markup, InlineKeyboardMarkup)
             assert len(markup.inline_keyboard) == 1
             button_counts.append(len(markup.inline_keyboard[0]))
-        assert button_counts == [3, 1]
+        assert button_counts == [2, 2]
 
     asyncio.run(scenario())
 
 
-def test_exhausted_catalog_sends_marketing_message(tmp_path: Path) -> None:
+def test_exhausted_message_flow(tmp_path: Path) -> None:
     async def scenario() -> None:
         router, _, _, _, recommender = build_router(tmp_path)
         recommender.queue.append(RecommendationResult(models=[], exhausted=True))
@@ -498,7 +503,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         data = await state.get_data()
         assert data.get("upload")
 
-        callback = DummyCallback("pick:m1", upload_message)
+        callback = DummyCallback("pick:src=batch2:m1", upload_message)
         await handler_choose(callback, state)
 
         generation_id = upload_message.message_id + 2
@@ -512,7 +517,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         callback_follow = DummyCallback("more|1", upload_message)
         handler_more = get_callback_handler(router, "result_more")
         await handler_more(callback_follow, state)
-        callback_second = DummyCallback("pick:m1", upload_message)
+        callback_second = DummyCallback("pick:src=batch2:m1", upload_message)
         await handler_choose(callback_second, state)
         assert upload_message.answer_photos[-1][1] == "".join(msg.NEXT_RESULT_CAPTION)
 

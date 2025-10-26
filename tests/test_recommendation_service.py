@@ -6,12 +6,8 @@ from pathlib import Path
 from typing import Iterable, List
 
 from app.models import GlassModel
-from app.services.catalog_base import CatalogService, CatalogSnapshot
-from app.services.recommendation import (
-    RecommendationService,
-    RecommendationSettings,
-    UniqueScope,
-)
+from app.services.catalog_base import CatalogBatch, CatalogService, CatalogSnapshot
+from app.services.recommendation import PickScheme, RecommendationService, RecommendationSettings
 from app.services.repository import Repository
 
 
@@ -28,11 +24,53 @@ class DummyCatalog(CatalogService):
             version_hash=self._snapshot.version_hash,
         )
 
-    async def list_by_gender(self, gender: str) -> List[GlassModel]:  # noqa: D401 - not used in tests
-        return []
+    async def list_by_gender(self, gender: str) -> List[GlassModel]:  # noqa: D401 - not used
+        normalized = _normalize_gender(gender)
+        if normalized == "Унисекс":
+            allowed = {"Унисекс"}
+        else:
+            allowed = {normalized, "Унисекс"}
+        return [model for model in self._snapshot.models if model.gender in allowed]
 
-    async def pick_four(self, gender: str, seen_ids: Iterable[str]) -> List[GlassModel]:  # noqa: D401 - not used
-        return []
+    async def pick_batch(
+        self,
+        *,
+        gender: str,
+        batch_size: int,
+        scheme: str,
+        seen_ids: Iterable[str],
+        rng: random.Random | None = None,
+        snapshot: CatalogSnapshot | None = None,
+    ) -> CatalogBatch:
+        rng = rng or random.Random()
+        snapshot = snapshot or self._snapshot
+        unique_models: dict[str, GlassModel] = {}
+        for model in snapshot.models:
+            unique_models.setdefault(model.unique_id, model)
+        models = list(unique_models.values())
+
+        normalized_gender = _normalize_gender(gender)
+        seen = set(seen_ids)
+        gender_pool = [
+            model
+            for model in models
+            if _normalize_gender(model.gender) == normalized_gender
+            and model.unique_id not in seen
+        ]
+        unisex_pool = [
+            model
+            for model in models
+            if _normalize_gender(model.gender) == "Унисекс"
+            and model.unique_id not in seen
+        ]
+
+        if normalized_gender == "Унисекс":
+            picks, exhausted = _pick_unisex_batch(rng, unisex_pool, batch_size)
+        else:
+            picks, exhausted = _pick_gender_batch(
+                rng, gender_pool, unisex_pool, batch_size, scheme
+            )
+        return CatalogBatch(items=picks, exhausted=exhausted)
 
 
 def make_model(uid: str, gender: str) -> GlassModel:
@@ -47,14 +85,101 @@ def make_model(uid: str, gender: str) -> GlassModel:
     )
 
 
-def _count_by_gender(models: List[GlassModel], value: str) -> int:
-    prefix = value.strip().lower()[:3]
-    return sum(1 for model in models if (model.gender or "").strip().lower().startswith(prefix))
+def _normalize_gender(value: str) -> str:
+    prepared = (value or "").strip().lower()
+    if prepared.startswith("муж") or prepared in {"m", "male"}:
+        return "Мужской"
+    if prepared.startswith("жен") or prepared in {"f", "female"}:
+        return "Женский"
+    if prepared.startswith("уни") or prepared.startswith("uni") or prepared in {"u", "unisex"}:
+        return "Унисекс"
+    return "Other"
 
 
-def test_recommendation_returns_expected_mix(tmp_path: Path) -> None:
+def _sample(rng: random.Random, items: Iterable[GlassModel], count: int) -> list[GlassModel]:
+    pool = list(items)
+    if count <= 0:
+        return []
+    if len(pool) <= count:
+        return list(pool)
+    return rng.sample(pool, count)
+
+
+def _pick_unisex_batch(
+    rng: random.Random, pool: list[GlassModel], batch_size: int
+) -> tuple[list[GlassModel], bool]:
+    selection = _sample(rng, pool, min(batch_size, len(pool)))
+    used = {model.unique_id for model in selection}
+    remaining = [model for model in pool if model.unique_id not in used]
+    return selection, len(remaining) < batch_size
+
+
+def _pick_gender_batch(
+    rng: random.Random,
+    gender_pool: list[GlassModel],
+    unisex_pool: list[GlassModel],
+    batch_size: int,
+    scheme: str,
+) -> tuple[list[GlassModel], bool]:
+    normalized_scheme = (scheme or "GENDER_OR_GENDER_UNISEX").strip().upper()
+    picks: list[GlassModel] = []
+    used: set[str] = set()
+
+    schemes: list[str] = []
+    if len(gender_pool) >= 2:
+        schemes.append("GG")
+    if len(gender_pool) >= 1 and len(unisex_pool) >= 1:
+        schemes.append("GU")
+
+    chosen: str | None = None
+    if normalized_scheme == "GENDER_OR_GENDER_UNISEX" and schemes:
+        chosen = schemes[0] if len(schemes) == 1 else rng.choice(schemes)
+
+    if chosen == "GG":
+        gender_selection = _sample(rng, gender_pool, min(2, len(gender_pool)))
+        picks.extend(gender_selection)
+        used.update(model.unique_id for model in gender_selection)
+    elif chosen == "GU":
+        gender_selection = _sample(rng, gender_pool, 1)
+        picks.extend(gender_selection)
+        used.update(model.unique_id for model in gender_selection)
+        remaining_unisex = [model for model in unisex_pool if model.unique_id not in used]
+        unisex_selection = _sample(rng, remaining_unisex, 1)
+        picks.extend(unisex_selection)
+        used.update(model.unique_id for model in unisex_selection)
+    else:
+        if gender_pool:
+            gender_selection = _sample(rng, gender_pool, min(batch_size, len(gender_pool)))
+            picks.extend(gender_selection)
+            used.update(model.unique_id for model in gender_selection)
+        elif unisex_pool:
+            unisex_selection = _sample(rng, unisex_pool, min(batch_size, len(unisex_pool)))
+            picks.extend(unisex_selection)
+            used.update(model.unique_id for model in unisex_selection)
+
+    if len(picks) < batch_size and unisex_pool:
+        remaining = [model for model in unisex_pool if model.unique_id not in used]
+        if remaining:
+            extra = _sample(rng, remaining, min(batch_size - len(picks), len(remaining)))
+            picks.extend(extra)
+            used.update(model.unique_id for model in extra)
+
+    if len(picks) < batch_size and gender_pool:
+        remaining = [model for model in gender_pool if model.unique_id not in used]
+        if remaining:
+            extra = _sample(rng, remaining, min(batch_size - len(picks), len(remaining)))
+            picks.extend(extra)
+            used.update(model.unique_id for model in extra)
+
+    remaining_gender = [model for model in gender_pool if model.unique_id not in used]
+    remaining_unisex = [model for model in unisex_pool if model.unique_id not in used]
+    exhausted = (len(remaining_gender) + len(remaining_unisex)) < batch_size
+    return picks, exhausted
+
+
+def test_pick_scheme_gender_or_unisex(tmp_path: Path) -> None:
     async def scenario() -> None:
-        repo = Repository(tmp_path / "rec1.db", daily_limit=5)
+        repo = Repository(tmp_path / "scheme.db", daily_limit=5)
         await repo.init()
         models = [
             make_model("m1", "Мужской"),
@@ -62,70 +187,70 @@ def test_recommendation_returns_expected_mix(tmp_path: Path) -> None:
             make_model("m3", "Мужской"),
             make_model("u1", "Унисекс"),
             make_model("u2", "Унисекс"),
-            make_model("u3", "Унисекс"),
-            make_model("f1", "Женский"),
         ]
         catalog = DummyCatalog(models)
+
         settings = RecommendationSettings(
-            batch_size=3,
-            pick_rule="2_1",
-            unique_scope=UniqueScope.ALL,
+            batch_size=2,
+            pick_scheme=PickScheme.GENDER_OR_GENDER_UNISEX,
+            unique_context="batch2",
             clear_on_catalog_change=False,
-            topup_from_any=False,
         )
         service = RecommendationService(
             catalog=catalog,
             repository=repo,
             settings=settings,
-            rng=random.Random(42),
+            rng=random.Random(7),
         )
 
-        result = await service.recommend_for_user(1, "male")
-        picks = result.models
+        counts = {"GG": 0, "GU": 0}
+        for _ in range(200):
+            batch = await catalog.pick_batch(
+                gender="male",
+                batch_size=2,
+                scheme="GENDER_OR_GENDER_UNISEX",
+                seen_ids=[],
+                rng=random.Random(_),
+                snapshot=await catalog.snapshot(),
+            )
+            genders = {model.gender for model in batch.items}
+            if genders == {"Мужской"}:
+                counts["GG"] += 1
+            elif "Унисекс" in genders:
+                counts["GU"] += 1
+        assert counts["GG"] > 0 and counts["GU"] > 0
+        assert abs(counts["GG"] - counts["GU"]) < 60
 
-        assert len(picks) == 3
-        assert len({model.unique_id for model in picks}) == 3
-        assert _count_by_gender(picks, "мужской") == 2
-        assert _count_by_gender(picks, "унисекс") == 1
+        # Fallback when no unisex available
+        catalog.update([make_model("m4", "Мужской"), make_model("m5", "Мужской")], "v2")
+        batch = await catalog.pick_batch(
+            gender="male",
+            batch_size=2,
+            scheme="GENDER_OR_GENDER_UNISEX",
+            seen_ids=[],
+            rng=random.Random(1),
+        )
+        assert all(model.gender == "Мужской" for model in batch.items)
+
+        # Fallback when only unisex remains
+        catalog.update([make_model("u9", "Унисекс")], "v3")
+        batch = await catalog.pick_batch(
+            gender="male",
+            batch_size=2,
+            scheme="GENDER_OR_GENDER_UNISEX",
+            seen_ids=[],
+            rng=random.Random(2),
+        )
+        assert len(batch.items) == 1
+        assert batch.exhausted is True
+        assert batch.items[0].gender == "Унисекс"
 
     asyncio.run(scenario())
 
 
-def test_recommendation_enforces_uniqueness(tmp_path: Path) -> None:
+def test_unique_two_items_no_repeats(tmp_path: Path) -> None:
     async def scenario() -> None:
-        repo = Repository(tmp_path / "rec2.db", daily_limit=5)
-        await repo.init()
-        models = [
-            make_model(f"m{i}", "Мужской") for i in range(1, 5)
-        ] + [
-            make_model(f"u{i}", "Унисекс") for i in range(1, 5)
-        ]
-        catalog = DummyCatalog(models)
-        settings = RecommendationSettings(
-            batch_size=3,
-            pick_rule="2_1",
-            unique_scope=UniqueScope.ALL,
-            clear_on_catalog_change=False,
-            topup_from_any=False,
-        )
-        service = RecommendationService(
-            catalog=catalog,
-            repository=repo,
-            settings=settings,
-            rng=random.Random(123),
-        )
-
-        first = (await service.recommend_for_user(77, "male")).models
-        second = (await service.recommend_for_user(77, "male")).models
-
-        assert not set(model.unique_id for model in first) & set(model.unique_id for model in second)
-
-    asyncio.run(scenario())
-
-
-def test_catalog_version_change_clears_history(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        repo = Repository(tmp_path / "rec3.db", daily_limit=5)
+        repo = Repository(tmp_path / "unique.db", daily_limit=5)
         await repo.init()
         models = [
             make_model("m1", "Мужской"),
@@ -133,19 +258,54 @@ def test_catalog_version_change_clears_history(tmp_path: Path) -> None:
             make_model("u1", "Унисекс"),
             make_model("u2", "Унисекс"),
         ]
-        catalog = DummyCatalog(models, version_hash="v1")
-        settings = RecommendationSettings(
-            batch_size=3,
-            pick_rule="2_1",
-            unique_scope=UniqueScope.ALL,
-            clear_on_catalog_change=True,
-            topup_from_any=False,
-        )
+        catalog = DummyCatalog(models)
         service = RecommendationService(
             catalog=catalog,
             repository=repo,
-            settings=settings,
+            settings=RecommendationSettings(
+                batch_size=2,
+                pick_scheme=PickScheme.GENDER_OR_GENDER_UNISEX,
+                unique_context="batch2",
+                clear_on_catalog_change=False,
+            ),
             rng=random.Random(0),
+        )
+
+        seen: set[str] = set()
+        for _ in range(3):
+            result = await service.recommend_for_user(10, "male")
+            seen.update(model.unique_id for model in result.models)
+            if result.exhausted:
+                break
+
+        assert seen == {"m1", "m2", "u1", "u2"}
+        exhausted = await service.recommend_for_user(10, "male")
+        assert exhausted.models == []
+        assert exhausted.exhausted is True
+
+    asyncio.run(scenario())
+
+
+def test_catalog_version_change_clears_history(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        repo = Repository(tmp_path / "version.db", daily_limit=5)
+        await repo.init()
+        models = [
+            make_model("m1", "Мужской"),
+            make_model("m2", "Мужской"),
+            make_model("u1", "Унисекс"),
+        ]
+        catalog = DummyCatalog(models, version_hash="v1")
+        service = RecommendationService(
+            catalog=catalog,
+            repository=repo,
+            settings=RecommendationSettings(
+                batch_size=2,
+                pick_scheme=PickScheme.GENDER_OR_GENDER_UNISEX,
+                unique_context="batch2",
+                clear_on_catalog_change=True,
+            ),
+            rng=random.Random(5),
         )
 
         first = await service.recommend_for_user(99, "male")
@@ -154,42 +314,34 @@ def test_catalog_version_change_clears_history(tmp_path: Path) -> None:
         second = await service.recommend_for_user(99, "male")
         assert second.models
 
-        # Without clearing the history the second batch would have been empty
-        assert {model.unique_id for model in second.models}
-
     asyncio.run(scenario())
 
 
-def test_recommendation_exhaustion_returns_empty(tmp_path: Path) -> None:
+def test_recommendation_respects_unisex_selection(tmp_path: Path) -> None:
     async def scenario() -> None:
-        repo = Repository(tmp_path / "rec4.db", daily_limit=5)
+        repo = Repository(tmp_path / "unisex.db", daily_limit=5)
         await repo.init()
         models = [
-            make_model("m1", "Мужской"),
-            make_model("m2", "Мужской"),
             make_model("u1", "Унисекс"),
             make_model("u2", "Унисекс"),
+            make_model("u3", "Унисекс"),
         ]
         catalog = DummyCatalog(models)
-        settings = RecommendationSettings(
-            batch_size=3,
-            pick_rule="2_1",
-            unique_scope=UniqueScope.ALL,
-            clear_on_catalog_change=False,
-            topup_from_any=False,
-        )
         service = RecommendationService(
             catalog=catalog,
             repository=repo,
-            settings=settings,
-            rng=random.Random(5),
+            settings=RecommendationSettings(
+                batch_size=2,
+                pick_scheme=PickScheme.GENDER_OR_GENDER_UNISEX,
+                unique_context="batch2",
+                clear_on_catalog_change=False,
+            ),
+            rng=random.Random(11),
         )
 
-        first = await service.recommend_for_user(55, "male")
-        assert len(first.models) == 3
-        assert first.exhausted is False
-        second = await service.recommend_for_user(55, "male")
-        assert len(second.models) == 1
-        assert second.exhausted is True
+        result = await service.recommend_for_user(44, "unisex")
+        assert len(result.models) == 2
+        assert all(model.gender == "Унисекс" for model in result.models)
 
     asyncio.run(scenario())
+
