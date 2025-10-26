@@ -1,4 +1,4 @@
-"""Utilities for building two-up collages used in model recommendations."""
+"""Utilities for building three-tile collages used in model recommendations."""
 
 from __future__ import annotations
 
@@ -9,15 +9,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import httpx
-from PIL import (
-    Image,
-    ImageColor,
-    ImageDraw,
-    ImageFilter,
-    ImageFont,
-    ImageOps,
-    UnidentifiedImageError,
-)
+from PIL import Image, ImageColor, ImageDraw, ImageOps, UnidentifiedImageError
 
 from app.config import CollageConfig
 
@@ -40,23 +32,19 @@ class _CollageSource:
     data: bytes | None
 
 
-async def build_two_up_collage(
-    left_url: str | None,
-    right_url: str | None,
+async def build_three_tile_collage(
+    image_urls: Sequence[str | None],
     cfg: CollageConfig,
     *,
     client: httpx.AsyncClient | None = None,
 ) -> io.BytesIO:
-    """Build a two-image collage according to the provided configuration.
+    """Build a 1×N collage (default 1×3) with vertical dividers between tiles."""
 
-    The function downloads both images, fills missing slots with placeholders and
-    composes them into a single JPEG. When both images are unavailable the
-    ``CollageSourceUnavailable`` exception is raised. Fatal Pillow errors during
-    composition are surfaced as ``CollageProcessingError``.
-    """
-
-    sources = [left_url, right_url]
-    if not any(sources):
+    columns = max(cfg.columns, 1)
+    padded_sources = list(image_urls[:columns])
+    if len(padded_sources) < columns:
+        padded_sources.extend([None] * (columns - len(padded_sources)))
+    if not any(padded_sources):
         raise CollageSourceUnavailable("No image URLs provided")
 
     owns_client = client is None
@@ -65,13 +53,13 @@ async def build_two_up_collage(
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
 
     try:
-        downloaded = await _download_sources(client, sources)
+        downloaded = await _download_sources(client, padded_sources)
     finally:
         if owns_client:
             await client.aclose()
 
     if not any(source.data for source in downloaded):
-        raise CollageSourceUnavailable("Failed to download both collage images")
+        raise CollageSourceUnavailable("Failed to download collage images")
 
     try:
         buffer = await asyncio.to_thread(_compose_collage, downloaded, cfg)
@@ -118,63 +106,52 @@ async def _download_sources(
 def _compose_collage(sources: Iterable[_CollageSource], cfg: CollageConfig) -> io.BytesIO:
     background = ImageColor.getrgb(cfg.background)
     divider_color = ImageColor.getrgb(cfg.divider_color)
-    cell_border_color = ImageColor.getrgb(cfg.cell_border_color)
     width = max(cfg.width, 1)
     height = max(cfg.height, 1)
-    padding = max(cfg.padding, 0)
-    gap = max(cfg.gap, 0)
-    cell_width = max((width - 2 * padding - gap) // 2, 1)
-    cell_height = max(height - 2 * padding, 1)
+    margin = max(cfg.margin, 0)
+    columns = max(cfg.columns, 1)
+    divider_width = max(cfg.divider_width, 0)
+
+    usable_width = max(width - 2 * margin - divider_width * (columns - 1), 1)
+    tile_height = max(height - 2 * margin, 1)
+    tile_width_float = usable_width / columns
 
     canvas = Image.new("RGB", (width, height), color=background)
     draw = ImageDraw.Draw(canvas)
 
-    cell_boxes = [
-        (
-            padding + index * (cell_width + gap),
-            padding,
-            padding + index * (cell_width + gap) + cell_width,
-            padding + cell_height,
-        )
-        for index in range(2)
-    ]
+    tile_boxes: list[tuple[int, int, int, int]] = []
+    current_left = margin
+    for index in range(columns):
+        left = int(round(current_left))
+        if index == columns - 1:
+            right = width - margin
+        else:
+            right = int(round(current_left + tile_width_float))
+        if right <= left:
+            right = left + 1
+        tile_boxes.append((left, margin, right, margin + tile_height))
+        current_left = right + divider_width
 
     for index, source in enumerate(sources):
-        image = _load_source_image(source, (cell_width, cell_height), cfg, background)
-        cell_left, _, _, _ = cell_boxes[index]
-        offset_x = cell_left
-        pos_x = offset_x + max((cell_width - image.width) // 2, 0)
-        pos_y = padding + max((cell_height - image.height) // 2, 0)
+        if index >= len(tile_boxes):
+            break
+        image = _load_source_image(source, tile_boxes[index], background)
+        if image is None:
+            continue
+        tile_left, tile_top, tile_right, tile_bottom = tile_boxes[index]
+        cell_width = tile_right - tile_left
+        cell_height = tile_bottom - tile_top
+        pos_x = tile_left + max((cell_width - image.width) // 2, 0)
+        pos_y = tile_top + max((cell_height - image.height) // 2, 0)
         canvas.paste(image, (pos_x, pos_y))
         image.close()
 
-    divider_width = max(cfg.divider, 0)
     if divider_width > 0:
-        divider_radius = max(cfg.divider_radius, 0)
-        divider_left = padding + cell_width + (gap - divider_width) // 2
-        divider_left = max(padding, min(divider_left, width - padding - divider_width))
-        divider_right = divider_left + divider_width
-        divider_box = (divider_left, padding, divider_right, padding + cell_height)
-        if divider_radius > 0:
-            draw.rounded_rectangle(
-                divider_box,
-                radius=min(divider_radius, min(cell_height, divider_width) // 2),
-                fill=divider_color,
-            )
-        else:
+        for index in range(1, columns):
+            divider_left = tile_boxes[index - 1][2]
+            divider_right = divider_left + divider_width
+            divider_box = (divider_left, margin, divider_right, margin + tile_height)
             draw.rectangle(divider_box, fill=divider_color)
-
-    border_width = max(cfg.cell_border, 0)
-    if border_width > 0:
-        for cell_box in cell_boxes:
-            draw.rectangle(cell_box, outline=cell_border_color, width=border_width)
-
-    sharpen_amount = max(0.0, min(cfg.sharpen, 1.0))
-    if sharpen_amount > 0:
-        percent = int(150 * sharpen_amount)
-        canvas = canvas.filter(
-            ImageFilter.UnsharpMask(radius=2, percent=max(percent, 1), threshold=3)
-        )
 
     buffer = io.BytesIO()
     canvas.save(
@@ -191,17 +168,21 @@ def _compose_collage(sources: Iterable[_CollageSource], cfg: CollageConfig) -> i
 
 def _load_source_image(
     source: _CollageSource,
-    cell_size: tuple[int, int],
-    cfg: CollageConfig,
+    cell_box: tuple[int, int, int, int],
     background: tuple[int, int, int],
-) -> Image.Image:
+) -> Image.Image | None:
     if source.data is None:
-        return _build_placeholder(cell_size, background)
+        return None
+
+    cell_width = max(cell_box[2] - cell_box[0], 1)
+    cell_height = max(cell_box[3] - cell_box[1], 1)
 
     try:
         with Image.open(io.BytesIO(source.data)) as original:
             converted = original.convert("RGB")
-            fitted = _fit_image(converted, cell_size, cfg.fit_mode)
+            fitted = ImageOps.contain(
+                converted, (cell_width, cell_height), method=Image.LANCZOS
+            )
             if fitted is not converted:
                 converted.close()
             return fitted
@@ -209,42 +190,4 @@ def _load_source_image(
         LOGGER.warning("Collage image %s is not a valid image", source.url)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Failed to prepare collage image %s: %s", source.url, exc)
-    return _build_placeholder(cell_size, background)
-
-
-def _fit_image(image: Image.Image, cell_size: tuple[int, int], fit_mode: str) -> Image.Image:
-    target = tuple(max(value, 1) for value in cell_size)
-    if fit_mode == "cover":
-        return ImageOps.fit(image, target, method=Image.LANCZOS, centering=(0.5, 0.5))
-    return ImageOps.contain(image, target, method=Image.LANCZOS)
-
-
-def _build_placeholder(
-    cell_size: tuple[int, int], background: tuple[int, int, int]
-) -> Image.Image:
-    width, height = cell_size
-    border_color = (200, 200, 200)
-    text_color = (160, 160, 160)
-
-    image = Image.new("RGB", (width, height), color=background)
-    draw = ImageDraw.Draw(image)
-    border_width = max(min(width, height) // 30, 2)
-    inner_box = (
-        border_width // 2,
-        border_width // 2,
-        width - border_width // 2 - 1,
-        height - border_width // 2 - 1,
-    )
-    draw.rectangle(inner_box, outline=border_color, width=border_width)
-
-    text = "NO IMAGE"
-    font = ImageFont.load_default()
-    text_box = draw.textbbox((0, 0), text, font=font)
-    text_width = text_box[2] - text_box[0]
-    text_height = text_box[3] - text_box[1]
-    if text_width < width and text_height < height:
-        text_x = (width - text_width) // 2
-        text_y = (height - text_height) // 2
-        draw.text((text_x, text_y), text, fill=text_color, font=font)
-
-    return image
+    return None

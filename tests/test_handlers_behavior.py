@@ -3,7 +3,7 @@ import io
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardRemove
 from PIL import Image
@@ -12,6 +12,7 @@ from app.config import CollageConfig
 from app.fsm import TryOnStates, setup_router
 from app.models import GlassModel
 from app.services.collage import CollageProcessingError, CollageSourceUnavailable
+from app.services.recommendation import RecommendationResult
 from app.texts import messages as msg
 
 
@@ -144,14 +145,16 @@ class StubRepository:
 class StubRecommendationService:
     def __init__(self, models: list[GlassModel]) -> None:
         self.default = list(models)
-        self.queue: list[list[GlassModel]] = []
+        self.queue: list[RecommendationResult] = []
         self.calls: list[tuple[int, str]] = []
 
-    async def recommend_for_user(self, user_id: int, gender: str) -> list[GlassModel]:
+    async def recommend_for_user(
+        self, user_id: int, gender: str
+    ) -> RecommendationResult:
         self.calls.append((user_id, gender))
         if self.queue:
             return self.queue.pop(0)
-        return list(self.default)
+        return RecommendationResult(models=list(self.default), exhausted=False)
 
 
 class StubTryOn:
@@ -175,14 +178,14 @@ class StubStorage:
 
 class StubCollageBuilder:
     def __init__(self) -> None:
-        self.calls: list[tuple[Optional[str], Optional[str]]] = []
+        self.calls: list[list[Optional[str]]] = []
         self.fail_processing = False
         self.fail_sources = False
 
     async def __call__(
-        self, left: Optional[str], right: Optional[str], cfg: CollageConfig
+        self, sources: Sequence[Optional[str]], cfg: CollageConfig
     ) -> io.BytesIO:
-        self.calls.append((left, right))
+        self.calls.append(list(sources))
         if self.fail_sources:
             raise CollageSourceUnavailable("sources unavailable")
         if self.fail_processing:
@@ -210,17 +213,12 @@ def build_router(
     collage_config = CollageConfig(
         width=640,
         height=320,
-        gap=16,
-        padding=24,
+        columns=3,
+        margin=24,
+        divider_width=6,
+        divider_color="#E6E9EF",
         background="#FFFFFF",
         jpeg_quality=90,
-        fit_mode="contain",
-        sharpen=0.0,
-        divider=6,
-        divider_color="#E6E9EF",
-        divider_radius=0,
-        cell_border=0,
-        cell_border_color="#D7DBE4",
     )
 
     router = setup_router(
@@ -230,6 +228,7 @@ def build_router(
         storage=storage,
         collage_config=collage_config,
         collage_builder=builder,
+        batch_size=3,
         reminder_hours=24,
         selection_button_title_max=28,
         landing_url="https://example.com",
@@ -333,13 +332,15 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
         assert len(message.answer_photos) == 2
         captions = [caption for _, caption, _ in message.answer_photos]
         assert captions == [
-            msg.PAIR_CAPTION_TEMPLATE.format(current=1, total=2),
-            msg.PAIR_CAPTION_TEMPLATE.format(current=2, total=2),
+            msg.BATCH_TITLE.format(index=1, total=2),
+            msg.BATCH_TITLE.format(index=2, total=2),
         ]
+        button_counts = []
         for _, _, markup in message.answer_photos:
             assert isinstance(markup, InlineKeyboardMarkup)
             assert len(markup.inline_keyboard) == 1
-            assert len(markup.inline_keyboard[0]) == 2
+            button_counts.append(len(markup.inline_keyboard[0]))
+        assert button_counts == [3, 1]
 
     asyncio.run(scenario())
 
@@ -347,7 +348,7 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
 def test_exhausted_catalog_sends_marketing_message(tmp_path: Path) -> None:
     async def scenario() -> None:
         router, _, _, _, recommender = build_router(tmp_path)
-        recommender.queue.append([])
+        recommender.queue.append(RecommendationResult(models=[], exhausted=True))
         handler = get_message_handler(router, "accept_photo")
 
         bot = DummyBot()
@@ -463,7 +464,7 @@ def test_collage_processing_error_sends_individual_photos(tmp_path: Path) -> Non
         second_photo = message.answer_photos[1]
         assert first_photo[1] is None
         assert first_photo[2] is None
-        assert second_photo[1] == msg.PAIR_CAPTION_TEMPLATE.format(current=1, total=1)
+        assert second_photo[1] == msg.BATCH_TITLE.format(index=1, total=1)
         markup = second_photo[2]
         assert isinstance(markup, InlineKeyboardMarkup)
         assert len(markup.inline_keyboard[0]) == 2

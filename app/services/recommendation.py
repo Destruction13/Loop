@@ -43,12 +43,19 @@ class UniqueScope(Enum):
 class RecommendationSettings:
     """Configuration options controlling recommendation batching."""
 
-    batch_total: int
-    batch_gender: int
-    batch_unisex: int
+    batch_size: int
+    pick_rule: str
     unique_scope: UniqueScope
     clear_on_catalog_change: bool
     topup_from_any: bool
+
+
+@dataclass(slots=True)
+class RecommendationResult:
+    """Result of a recommendation lookup."""
+
+    models: list[GlassModel]
+    exhausted: bool
 
 
 class RecommendationService:
@@ -67,8 +74,14 @@ class RecommendationService:
         self._settings = settings
         self._rng = rng or random.Random()
         self._logger = logging.getLogger("loop_bot.recommendation")
+        self._batch_size = max(self._settings.batch_size, 1)
+        self._gender_quota, self._unisex_quota = self._parse_pick_rule(
+            self._settings.pick_rule
+        )
 
-    async def recommend_for_user(self, user_id: int, selected_gender: str) -> list[GlassModel]:
+    async def recommend_for_user(
+        self, user_id: int, selected_gender: str
+    ) -> RecommendationResult:
         """Return models for the user based on configured quotas and uniqueness."""
 
         now = datetime.now(timezone.utc)
@@ -98,7 +111,9 @@ class RecommendationService:
         available_other: list[GlassModel] = []
 
         for model in models:
-            group = self._normalize_group_key(model.gender, log_unknown=True, model_id=model.unique_id)
+            group = self._normalize_group_key(
+                model.gender, log_unknown=True, model_id=model.unique_id
+            )
             if group == selected_key:
                 available_gender.append(model)
             elif group == "унисекс":
@@ -110,49 +125,84 @@ class RecommendationService:
         available_unisex = [m for m in available_unisex if m.unique_id not in seen_ids]
         available_other = [m for m in available_other if m.unique_id not in seen_ids]
 
-        if len(available_gender) < self._settings.batch_gender:
+        if selected_key != "унисекс" and len(available_gender) < self._gender_quota:
             self._logger.info(
                 "not enough candidates for gender (need %s, got %s)",
-                self._settings.batch_gender,
+                self._gender_quota,
                 len(available_gender),
             )
-        if len(available_unisex) < self._settings.batch_unisex:
+        if len(available_unisex) < self._unisex_quota:
             self._logger.info(
                 "not enough candidates for unisex (need %s, got %s)",
-                self._settings.batch_unisex,
+                self._unisex_quota,
                 len(available_unisex),
             )
 
         picks: list[GlassModel] = []
         picked_ids: set[str] = set()
-        target_total = max(self._settings.batch_total, 0)
 
-        gender_quota = min(self._settings.batch_gender, target_total)
-        gender_selection = self._sample(available_gender, gender_quota)
-        picks.extend(gender_selection)
-        picked_ids.update(model.unique_id for model in gender_selection)
+        if selected_key == "унисекс":
+            unisex_selection = self._sample(
+                available_unisex,
+                min(self._batch_size, len(available_unisex)),
+            )
+            picks.extend(unisex_selection)
+            picked_ids.update(model.unique_id for model in unisex_selection)
+        else:
+            gender_target = min(self._gender_quota, self._batch_size)
+            gender_selection = self._sample(
+                available_gender,
+                min(gender_target, len(available_gender)),
+            )
+            picks.extend(gender_selection)
+            picked_ids.update(model.unique_id for model in gender_selection)
 
-        remaining_slots = max(target_total - len(picks), 0)
-        unisex_quota = min(self._settings.batch_unisex, remaining_slots)
-        unisex_candidates = [model for model in available_unisex if model.unique_id not in picked_ids]
-        unisex_selection = self._sample(unisex_candidates, unisex_quota)
-        picks.extend(unisex_selection)
-        picked_ids.update(model.unique_id for model in unisex_selection)
+            remaining_slots = max(self._batch_size - len(picks), 0)
+            unisex_target = min(self._unisex_quota, remaining_slots)
+            unisex_candidates = [
+                model for model in available_unisex if model.unique_id not in picked_ids
+            ]
+            unisex_selection = self._sample(
+                unisex_candidates,
+                min(unisex_target, len(unisex_candidates)),
+            )
+            picks.extend(unisex_selection)
+            picked_ids.update(model.unique_id for model in unisex_selection)
 
-        remaining_slots = max(target_total - len(picks), 0)
-        if remaining_slots > 0 and self._settings.topup_from_any:
-            pool: list[GlassModel] = []
-            for source in (available_gender, available_unisex, available_other):
-                for model in source:
-                    if model.unique_id in picked_ids:
-                        continue
-                    pool.append(model)
-            topup_selection = self._sample(pool, min(remaining_slots, len(pool)))
-            picks.extend(topup_selection)
-            picked_ids.update(model.unique_id for model in topup_selection)
+            remaining_slots = max(self._batch_size - len(picks), 0)
+            if remaining_slots > 0:
+                fill_pool: list[GlassModel] = []
+                fill_pool.extend(
+                    model
+                    for model in available_gender
+                    if model.unique_id not in picked_ids
+                )
+                fill_pool.extend(
+                    model
+                    for model in available_unisex
+                    if model.unique_id not in picked_ids
+                )
+                if self._settings.topup_from_any:
+                    fill_pool.extend(
+                        model
+                        for model in available_other
+                        if model.unique_id not in picked_ids
+                    )
+                if fill_pool:
+                    topup_selection = self._sample(
+                        fill_pool, min(remaining_slots, len(fill_pool))
+                    )
+                    picks.extend(topup_selection)
+                    picked_ids.update(model.unique_id for model in topup_selection)
+
+        exhausted = False
+        if selected_key == "унисекс":
+            exhausted = len(available_unisex) < self._batch_size
+        else:
+            exhausted = (len(available_gender) + len(available_unisex)) < self._batch_size
 
         if not picks:
-            return []
+            return RecommendationResult(models=[], exhausted=exhausted)
 
         shuffled = list(picks)
         self._rng.shuffle(shuffled)
@@ -166,7 +216,7 @@ class RecommendationService:
             user_id,
             [model.unique_id for model in shuffled],
         )
-        return shuffled
+        return RecommendationResult(models=shuffled, exhausted=exhausted)
 
     def _normalize_group_key(
         self,
@@ -199,9 +249,28 @@ class RecommendationService:
             return list(items)
         return self._rng.sample(list(items), count)
 
+    def _parse_pick_rule(self, rule: str) -> tuple[int, int]:
+        raw = (rule or "").strip()
+        if not raw:
+            return self._batch_size, 0
+        parts = raw.split("_", 1)
+        try:
+            primary = int(parts[0])
+        except ValueError:
+            primary = self._batch_size
+        if len(parts) > 1:
+            try:
+                secondary = int(parts[1])
+            except ValueError:
+                secondary = 0
+        else:
+            secondary = 0
+        return max(primary, 0), max(secondary, 0)
+
 
 __all__ = [
     "RecommendationService",
     "RecommendationSettings",
+    "RecommendationResult",
     "UniqueScope",
 ]

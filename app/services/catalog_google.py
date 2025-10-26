@@ -75,16 +75,29 @@ class GoogleSheetCatalog(CatalogService):
     async def pick_four(self, gender: str, seen_ids: Iterable[str]) -> list[GlassModel]:
         candidates = await self.list_by_gender(gender)
         seen = set(seen_ids)
-        unseen = [model for model in candidates if model.unique_id not in seen]
-        picked: list[GlassModel] = unseen[:4]
-        if len(picked) < 4:
-            fallback = [model for model in candidates if model.unique_id not in {m.unique_id for m in picked}]
-            for model in fallback:
-                if len(picked) >= 4:
-                    break
-                picked.append(model)
-        LOGGER.info("Catalog returned %s models for gender=%s", len(picked), gender)
-        return picked
+        normalized = _normalize_gender(gender)
+        gender_pool = [
+            model for model in candidates if model.gender == normalized and model.unique_id not in seen
+        ]
+        unisex_pool = [
+            model for model in candidates if model.gender == "Унисекс" and model.unique_id not in seen
+        ]
+        picks: list[GlassModel] = []
+        max_batch = 3
+        if normalized == "Унисекс":
+            picks.extend(unisex_pool[:max_batch])
+        else:
+            picks.extend(gender_pool[:2])
+            remaining = max_batch - len(picks)
+            if remaining > 0:
+                picks.extend(unisex_pool[:remaining])
+            remaining = max_batch - len(picks)
+            if remaining > 0:
+                fallback_pool = [model for model in gender_pool if model not in picks]
+                fallback_pool.extend(model for model in unisex_pool if model not in picks)
+                picks.extend(fallback_pool[:remaining])
+        LOGGER.info("Catalog returned %s models for gender=%s", len(picks), gender)
+        return picks
 
     async def aclose(self) -> None:  # noqa: D401 - inherited docstring
         if self._client_owner:

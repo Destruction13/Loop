@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from app.keyboards import generation_result_keyboard, pair_selection_keyboard
+from app.keyboards import batch_selection_keyboard, generation_result_keyboard
 
 
-def test_pair_selection_keyboard_contains_expected_buttons() -> None:
-    keyboard = pair_selection_keyboard(
+def test_batch_selection_keyboard_contains_expected_buttons() -> None:
+    keyboard = batch_selection_keyboard(
         [
             ("id1", "Garnet Black"),
             ("id2", "Antimony Grey"),
         ],
+        source="batch3",
         max_title_length=28,
     )
 
@@ -16,14 +17,36 @@ def test_pair_selection_keyboard_contains_expected_buttons() -> None:
     row = keyboard.inline_keyboard[0]
     assert len(row) == 2
     assert row[0].text == "Garnet Black"
-    assert row[0].callback_data == "pick:id1"
+    assert row[0].callback_data == "pick:batch3:id1"
     assert row[1].text == "Antimony Grey"
-    assert row[1].callback_data == "pick:id2"
+    assert row[1].callback_data == "pick:batch3:id2"
 
 
-def test_pair_selection_keyboard_truncates_titles() -> None:
-    keyboard = pair_selection_keyboard(
+def test_batch_selection_keyboard_three_buttons_single_row() -> None:
+    keyboard = batch_selection_keyboard(
+        [
+            ("id1", "Garnet Black"),
+            ("id2", "Antimony Grey"),
+            ("id3", "Quartz Silver"),
+        ],
+        source="batch3",
+        max_title_length=28,
+    )
+
+    assert len(keyboard.inline_keyboard) == 1
+    row = keyboard.inline_keyboard[0]
+    assert len(row) == 3
+    assert [button.callback_data for button in row] == [
+        "pick:batch3:id1",
+        "pick:batch3:id2",
+        "pick:batch3:id3",
+    ]
+
+
+def test_batch_selection_keyboard_truncates_titles() -> None:
+    keyboard = batch_selection_keyboard(
         [("id1", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")],
+        source="batch3",
         max_title_length=10,
     )
 
@@ -33,9 +56,10 @@ def test_pair_selection_keyboard_truncates_titles() -> None:
     assert row[0].text == "ABCDEFGHI…"
 
 
-def test_pair_selection_keyboard_single_model() -> None:
-    keyboard = pair_selection_keyboard(
+def test_batch_selection_keyboard_single_model() -> None:
+    keyboard = batch_selection_keyboard(
         [("id1", "Solo Model")],
+        source="batch3",
         max_title_length=28,
     )
 
@@ -43,7 +67,7 @@ def test_pair_selection_keyboard_single_model() -> None:
     row = keyboard.inline_keyboard[0]
     assert len(row) == 1
     assert row[0].text == "Solo Model"
-    assert row[0].callback_data == "pick:id1"
+    assert row[0].callback_data == "pick:batch3:id1"
 
 
 def test_generation_result_keyboard_with_remaining_options() -> None:

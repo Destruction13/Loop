@@ -13,7 +13,7 @@ from app.fsm import setup_router
 from app.keyboards import reminder_keyboard, start_keyboard
 from app.logging_conf import EVENT_ID, setup_logging
 from app.services.catalog_google import GoogleCatalogConfig, GoogleSheetCatalog
-from app.services.collage import build_two_up_collage
+from app.services.collage import build_three_tile_collage
 from app.services.repository import Repository
 from app.services.scheduler import ReminderScheduler
 from app.services.storage_local import LocalStorage
@@ -50,9 +50,8 @@ async def main() -> None:
     catalog_service = GoogleSheetCatalog(catalog_config)
 
     recommendation_settings = RecommendationSettings(
-        batch_total=config.reco_batch_total,
-        batch_gender=config.reco_batch_gender,
-        batch_unisex=config.reco_batch_unisex,
+        batch_size=config.batch_size,
+        pick_rule=config.pick_rule,
         unique_scope=UniqueScope.from_string(config.reco_unique_scope),
         clear_on_catalog_change=config.reco_clear_on_catalog_change,
         topup_from_any=config.reco_topup_from_any,
@@ -77,7 +76,8 @@ async def main() -> None:
         tryon=tryon_service,
         storage=storage,
         collage_config=config.collage,
-        collage_builder=build_two_up_collage,
+        collage_builder=build_three_tile_collage,
+        batch_size=config.batch_size,
         reminder_hours=config.reminder_hours,
         selection_button_title_max=config.button_title_max,
         landing_url=str(config.landing_url),

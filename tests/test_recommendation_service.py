@@ -67,9 +67,8 @@ def test_recommendation_returns_expected_mix(tmp_path: Path) -> None:
         ]
         catalog = DummyCatalog(models)
         settings = RecommendationSettings(
-            batch_total=4,
-            batch_gender=2,
-            batch_unisex=2,
+            batch_size=3,
+            pick_rule="2_1",
             unique_scope=UniqueScope.ALL,
             clear_on_catalog_change=False,
             topup_from_any=False,
@@ -81,12 +80,13 @@ def test_recommendation_returns_expected_mix(tmp_path: Path) -> None:
             rng=random.Random(42),
         )
 
-        picks = await service.recommend_for_user(1, "male")
+        result = await service.recommend_for_user(1, "male")
+        picks = result.models
 
-        assert len(picks) == 4
-        assert len({model.unique_id for model in picks}) == 4
+        assert len(picks) == 3
+        assert len({model.unique_id for model in picks}) == 3
         assert _count_by_gender(picks, "мужской") == 2
-        assert _count_by_gender(picks, "унисекс") == 2
+        assert _count_by_gender(picks, "унисекс") == 1
 
     asyncio.run(scenario())
 
@@ -102,9 +102,8 @@ def test_recommendation_enforces_uniqueness(tmp_path: Path) -> None:
         ]
         catalog = DummyCatalog(models)
         settings = RecommendationSettings(
-            batch_total=4,
-            batch_gender=2,
-            batch_unisex=2,
+            batch_size=3,
+            pick_rule="2_1",
             unique_scope=UniqueScope.ALL,
             clear_on_catalog_change=False,
             topup_from_any=False,
@@ -116,8 +115,8 @@ def test_recommendation_enforces_uniqueness(tmp_path: Path) -> None:
             rng=random.Random(123),
         )
 
-        first = await service.recommend_for_user(77, "male")
-        second = await service.recommend_for_user(77, "male")
+        first = (await service.recommend_for_user(77, "male")).models
+        second = (await service.recommend_for_user(77, "male")).models
 
         assert not set(model.unique_id for model in first) & set(model.unique_id for model in second)
 
@@ -136,9 +135,8 @@ def test_catalog_version_change_clears_history(tmp_path: Path) -> None:
         ]
         catalog = DummyCatalog(models, version_hash="v1")
         settings = RecommendationSettings(
-            batch_total=4,
-            batch_gender=2,
-            batch_unisex=2,
+            batch_size=3,
+            pick_rule="2_1",
             unique_scope=UniqueScope.ALL,
             clear_on_catalog_change=True,
             topup_from_any=False,
@@ -151,13 +149,13 @@ def test_catalog_version_change_clears_history(tmp_path: Path) -> None:
         )
 
         first = await service.recommend_for_user(99, "male")
-        assert first
+        assert first.models
         catalog.update(models, version_hash="v2")
         second = await service.recommend_for_user(99, "male")
-        assert second
+        assert second.models
 
         # Without clearing the history the second batch would have been empty
-        assert {model.unique_id for model in second}
+        assert {model.unique_id for model in second.models}
 
     asyncio.run(scenario())
 
@@ -174,9 +172,8 @@ def test_recommendation_exhaustion_returns_empty(tmp_path: Path) -> None:
         ]
         catalog = DummyCatalog(models)
         settings = RecommendationSettings(
-            batch_total=4,
-            batch_gender=2,
-            batch_unisex=2,
+            batch_size=3,
+            pick_rule="2_1",
             unique_scope=UniqueScope.ALL,
             clear_on_catalog_change=False,
             topup_from_any=False,
@@ -189,8 +186,10 @@ def test_recommendation_exhaustion_returns_empty(tmp_path: Path) -> None:
         )
 
         first = await service.recommend_for_user(55, "male")
-        assert first
+        assert len(first.models) == 3
+        assert first.exhausted is False
         second = await service.recommend_for_user(55, "male")
-        assert second == []
+        assert len(second.models) == 1
+        assert second.exhausted is True
 
     asyncio.run(scenario())
