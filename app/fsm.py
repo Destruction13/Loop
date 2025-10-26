@@ -146,30 +146,71 @@ def setup_router(
 
     batch_source = "src=batch2"
 
-    async def _delete_last_bot_message(message: Message, state: FSMContext) -> None:
+    async def _delete_last_aux_message(message: Message, state: FSMContext) -> None:
         data = await state.get_data()
-        message_id = data.get("last_bot_message_id")
+        message_id = data.get("last_aux_message_id")
         if not message_id:
             return
         try:
             await message.bot.delete_message(message.chat.id, message_id)
         except TelegramBadRequest as exc:
             logger.debug(
-                "Failed to delete last bot message %s: %s", message_id, exc
+                "Failed to delete last auxiliary message %s: %s", message_id, exc
             )
         finally:
-            await state.update_data(last_bot_message_id=None)
+            await state.update_data(last_aux_message_id=None)
 
-    async def _send_with_cleanup(
+    async def _delete_last_delivery_messages(
+        message: Message, state: FSMContext
+    ) -> None:
+        data = await state.get_data()
+        message_ids: Sequence[int] | None = data.get("last_delivery_message_ids")
+        if not message_ids:
+            return
+        remaining: list[int] = []
+        for message_id in message_ids:
+            try:
+                await message.bot.delete_message(message.chat.id, message_id)
+            except TelegramBadRequest as exc:
+                logger.debug(
+                    "Failed to delete delivery message %s: %s", message_id, exc
+                )
+                remaining.append(message_id)
+        if remaining:
+            await state.update_data(last_delivery_message_ids=remaining)
+        else:
+            await state.update_data(last_delivery_message_ids=[])
+
+    async def _send_aux_message(
         source_message: Message,
         state: FSMContext,
         send_method: Callable[..., Awaitable[Message]],
         *args,
         **kwargs,
     ) -> Message:
-        await _delete_last_bot_message(source_message, state)
+        await _delete_last_aux_message(source_message, state)
         sent_message = await send_method(*args, **kwargs)
-        await state.update_data(last_bot_message_id=sent_message.message_id)
+        await state.update_data(last_aux_message_id=sent_message.message_id)
+        return sent_message
+
+    async def _prepare_delivery(message: Message, state: FSMContext) -> None:
+        await _delete_last_delivery_messages(message, state)
+
+    async def _record_delivery_ids(
+        state: FSMContext, message_ids: Sequence[int]
+    ) -> None:
+        await state.update_data(last_delivery_message_ids=list(message_ids))
+
+    async def _send_delivery_message(
+        source_message: Message,
+        state: FSMContext,
+        send_method: Callable[..., Awaitable[Message]],
+        *args,
+        **kwargs,
+    ) -> Message:
+        await _prepare_delivery(source_message, state)
+        sent_message = await send_method(*args, **kwargs)
+        await _record_delivery_ids(state, [sent_message.message_id])
         return sent_message
 
     async def _maybe_request_contact(
@@ -212,7 +253,7 @@ def setup_router(
             update_payload["contact_pending_result_state"] = pending_state
         await state.update_data(**update_payload)
         await state.set_state(ContactRequest.waiting_for_phone)
-        await _send_with_cleanup(
+        await _send_aux_message(
             message,
             state,
             message.answer,
@@ -237,7 +278,7 @@ def setup_router(
             result = await recommender.recommend_for_user(user_id, filters.gender)
         except CatalogError as exc:
             logger.error("%s Failed to fetch catalog: %s", EVENT_ID["MODELS_SENT"], exc)
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -251,7 +292,7 @@ def setup_router(
                 marketing_message = msg.marketing_text(no_more_message_key)
             except KeyError:
                 marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -270,7 +311,7 @@ def setup_router(
                 marketing_message = msg.marketing_text(no_more_message_key)
             except KeyError:
                 marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -387,7 +428,7 @@ def setup_router(
                 full_name=full_name,
             )
         if reward_needed:
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -410,7 +451,7 @@ def setup_router(
                     followup_text = "".join(caption_source)
                 else:
                     followup_text = str(caption_source)
-                await _send_with_cleanup(
+                await _send_aux_message(
                     message,
                     state,
                     message.answer,
@@ -418,7 +459,7 @@ def setup_router(
                 )
             return
         else:
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -438,7 +479,7 @@ def setup_router(
         raw = (message.text or "").strip()
         normalized = normalize_phone(raw)
         if not normalized:
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -459,7 +500,7 @@ def setup_router(
         try:
             buffer = await collage_builder(urls, collage_config)
         except CollageSourceUnavailable:
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -497,7 +538,7 @@ def setup_router(
         filename = f"collage-{uuid.uuid4().hex}.jpg"
         collage_bytes = buffer.getvalue()
         buffer.close()
-        await _send_with_cleanup(
+        await _send_delivery_message(
             message,
             state,
             message.answer_photo,
@@ -520,8 +561,8 @@ def setup_router(
         *,
         reply_markup: InlineKeyboardMarkup,
     ) -> None:
-        await _delete_last_bot_message(message, state)
-        last_sent: Message | None = None
+        await _prepare_delivery(message, state)
+        sent_ids: list[int] = []
         last_index = len(group) - 1
         for index, item in enumerate(group):
             caption = None
@@ -531,8 +572,9 @@ def setup_router(
                 caption=caption,
                 reply_markup=markup,
             )
-        if last_sent is not None:
-            await state.update_data(last_bot_message_id=last_sent.message_id)
+            sent_ids.append(last_sent.message_id)
+        if sent_ids:
+            await _record_delivery_ids(state, sent_ids)
 
     async def _delete_state_message(message: Message, state: FSMContext, key: str) -> None:
         data = await state.get_data()
@@ -544,8 +586,12 @@ def setup_router(
         except TelegramBadRequest as exc:
             logger.warning("Failed to delete %s message %s: %s", key, message_id, exc)
         finally:
-            if data.get("last_bot_message_id") == message_id:
-                await state.update_data(last_bot_message_id=None)
+            if data.get("last_aux_message_id") == message_id:
+                await state.update_data(last_aux_message_id=None)
+            delivery_ids: Sequence[int] | None = data.get("last_delivery_message_ids")
+            if delivery_ids and message_id in delivery_ids:
+                remaining = [mid for mid in delivery_ids if mid != message_id]
+                await state.update_data(last_delivery_message_ids=remaining)
             await state.update_data(**{key: None})
 
     @router.message(CommandStart())
@@ -563,7 +609,7 @@ def setup_router(
                     except ValueError:
                         pass
         await state.set_state(TryOnStates.START)
-        await _send_with_cleanup(
+        await _send_aux_message(
             message,
             state,
             message.answer,
@@ -592,7 +638,7 @@ def setup_router(
         await state.update_data(gender=gender, first_generated_today=True)
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await _delete_state_message(callback.message, state, "gender_prompt_message_id")
-        await _send_with_cleanup(
+        await _send_aux_message(
             callback.message,
             state,
             callback.message.answer,
@@ -604,7 +650,7 @@ def setup_router(
 
     @router.message(StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT), ~F.photo)
     async def reject_non_photo(message: Message, state: FSMContext) -> None:
-        await _send_with_cleanup(
+        await _send_aux_message(
             message,
             state,
             message.answer,
@@ -625,7 +671,7 @@ def setup_router(
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -639,7 +685,7 @@ def setup_router(
         if await _maybe_request_contact(message, state, user_id):
             logger.info("%s Contact request queued for %s", EVENT_ID["MODELS_SENT"], user_id)
             return
-        preload_message = await _send_with_cleanup(
+        preload_message = await _send_aux_message(
             message,
             state,
             message.answer,
@@ -682,7 +728,7 @@ def setup_router(
         remaining = await repository.remaining_tries(callback.from_user.id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
-            await _send_with_cleanup(
+            await _send_aux_message(
                 callback.message,
                 state,
                 callback.message.answer,
@@ -702,7 +748,7 @@ def setup_router(
             )
         await state.update_data(selected_model=selected)
         await state.set_state(TryOnStates.GENERATING)
-        generation_message = await _send_with_cleanup(
+        generation_message = await _send_aux_message(
             callback.message,
             state,
             callback.message.answer,
@@ -715,7 +761,7 @@ def setup_router(
     async def contact_shared(message: Message, state: FSMContext) -> None:
         contact = message.contact
         if not contact or not contact.phone_number:
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -724,7 +770,7 @@ def setup_router(
             return
         normalized = normalize_phone(contact.phone_number)
         if not normalized:
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -739,7 +785,7 @@ def setup_router(
         user_id = message.from_user.id
         if text == msg.ASK_PHONE_BUTTON_SKIP:
             await repository.set_contact_skip_once(user_id, True)
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -752,7 +798,7 @@ def setup_router(
         if text == msg.ASK_PHONE_BUTTON_NEVER:
             await repository.set_contact_never(user_id, True)
             await repository.set_contact_skip_once(user_id, False)
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -766,7 +812,7 @@ def setup_router(
 
     @router.message(StateFilter(ContactRequest.waiting_for_phone))
     async def contact_fallback(message: Message, state: FSMContext) -> None:
-        await _send_with_cleanup(
+        await _send_aux_message(
             message,
             state,
             message.answer,
@@ -779,7 +825,7 @@ def setup_router(
         upload_value = data.get("upload")
         if not upload_value:
             await _delete_state_message(message, state, "generation_message_id")
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -801,7 +847,7 @@ def setup_router(
                 "%s Generation failed: %s", EVENT_ID["GENERATION_FAILED"], exc
             )
             await _delete_state_message(message, state, "generation_message_id")
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -812,7 +858,7 @@ def setup_router(
             return
         if not results:
             await _delete_state_message(message, state, "generation_message_id")
-            await _send_with_cleanup(
+            await _send_aux_message(
                 message,
                 state,
                 message.answer,
@@ -843,7 +889,7 @@ def setup_router(
         if plan.outcome is GenerationOutcome.LIMIT:
             caption_text = f"{caption_text}\n\n{msg.DAILY_LIMIT_MESSAGE}"
             result_markup = limit_reached_keyboard(landing_url)
-        await _send_with_cleanup(
+        await _send_delivery_message(
             message,
             state,
             message.answer_photo,
@@ -879,7 +925,7 @@ def setup_router(
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
-            await _send_with_cleanup(
+            await _send_aux_message(
                 callback.message,
                 state,
                 callback.message.answer,
@@ -896,7 +942,7 @@ def setup_router(
             await callback.answer()
             return
         await state.set_state(TryOnStates.SHOW_RECS)
-        preload_message = await _send_with_cleanup(
+        preload_message = await _send_aux_message(
             callback.message,
             state,
             callback.message.answer,
@@ -915,7 +961,7 @@ def setup_router(
     @router.callback_query(StateFilter(TryOnStates.DAILY_LIMIT_REACHED), F.data == "limit_promo")
     async def limit_promo(callback: CallbackQuery, state: FSMContext) -> None:
         text = msg.PROMO_MESSAGE_TEMPLATE.format(promo_code=promo_code)
-        await _send_with_cleanup(
+        await _send_aux_message(
             callback.message,
             state,
             callback.message.answer,
@@ -929,7 +975,7 @@ def setup_router(
         user_id = callback.from_user.id
         when = datetime.now(timezone.utc) + timedelta(hours=reminder_hours)
         await repository.set_reminder(user_id, when)
-        await _send_with_cleanup(
+        await _send_aux_message(
             callback.message,
             state,
             callback.message.answer,
@@ -947,7 +993,7 @@ def setup_router(
         await repository.set_reminder(user_id, None)
         if not profile.gender:
             await state.set_state(TryOnStates.START)
-            await _send_with_cleanup(
+            await _send_aux_message(
                 callback.message,
                 state,
                 callback.message.answer,
@@ -959,7 +1005,7 @@ def setup_router(
         first_flag = profile.daily_used == 0
         await state.update_data(gender=profile.gender, first_generated_today=first_flag)
         await state.set_state(TryOnStates.AWAITING_PHOTO)
-        await _send_with_cleanup(
+        await _send_aux_message(
             callback.message,
             state,
             callback.message.answer,
@@ -976,7 +1022,7 @@ def setup_router(
             await callback.answer("Нет выбранной модели", show_alert=True)
             return
         await state.set_state(TryOnStates.GENERATING)
-        generation_message = await _send_with_cleanup(
+        generation_message = await _send_aux_message(
             callback.message,
             state,
             callback.message.answer,
