@@ -25,7 +25,6 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 "BATCH_SIZE=5",
                 "BATCH_LAYOUT_COLS=3",
                 "PICK_SCHEME=GENDER_OR_GENDER_UNISEX",
-                "UNIQ_SCOPE=my_scope",
                 "CANVAS_WIDTH=1500",
                 "CANVAS_HEIGHT=500",
                 "CANVAS_BG=#EFEFEF",
@@ -33,6 +32,10 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 "DIVIDER_WIDTH=6",
                 "DIVIDER_COLOR=#123456",
                 "JPEG_QUALITY=82",
+                "CONTACT_REWARD_RUB=1500",
+                "PROMO_CONTACT_CODE=EXTRA500",
+                "LEADS_SHEET_NAME=LeadsSheet",
+                "ENABLE_LEADS_EXPORT=0",
             ]
         ),
         encoding="utf-8",
@@ -58,7 +61,6 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.batch_size == 5
     assert config.batch_layout_cols == 3
     assert config.pick_scheme == "GENDER_OR_GENDER_UNISEX"
-    assert config.reco_unique_context == "my_scope"
     assert config.collage.width == 1500
     assert config.collage.height == 500
     assert config.collage.columns == 3
@@ -67,3 +69,7 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.collage.divider_width == 6
     assert config.collage.divider_color == "#123456"
     assert config.collage.jpeg_quality == 82
+    assert config.contact_reward_rub == 1500
+    assert config.promo_contact_code == "EXTRA500"
+    assert config.leads_sheet_name == "LeadsSheet"
+    assert config.enable_leads_export is False

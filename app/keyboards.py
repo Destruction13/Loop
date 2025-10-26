@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from app.texts import messages as msg
 
@@ -186,4 +191,25 @@ def all_seen_keyboard(landing_url: str) -> InlineKeyboardMarkup:
                 ),
             ]
         ]
+    )
+
+
+def contact_request_keyboard() -> ReplyKeyboardMarkup:
+    """Reply keyboard prompting the user to share their phone number."""
+
+    return ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        keyboard=[
+            [
+                KeyboardButton(
+                    text=msg.ASK_PHONE_BUTTON_SHARE,
+                    request_contact=True,
+                )
+            ],
+            [
+                KeyboardButton(text=msg.ASK_PHONE_BUTTON_SKIP),
+                KeyboardButton(text=msg.ASK_PHONE_BUTTON_NEVER),
+            ],
+        ],
     )

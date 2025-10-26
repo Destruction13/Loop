@@ -9,7 +9,7 @@ from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardRemove
 from PIL import Image
 
 from app.config import CollageConfig
-from app.fsm import TryOnStates, setup_router
+from app.fsm import ContactRequest, TryOnStates, setup_router
 from app.models import GlassModel
 from app.services.collage import CollageProcessingError, CollageSourceUnavailable
 from app.services.recommendation import RecommendationResult
@@ -58,6 +58,9 @@ class DummyMessage:
     ) -> None:
         self.answer_photos.append((photo, caption, reply_markup))
 
+    async def delete(self) -> None:
+        await self.bot.delete_message(self.chat.id, self.message_id)
+
 
 @dataclass
 class DummySentMessage:
@@ -93,6 +96,9 @@ class DummyState:
     async def set_state(self, value: Any) -> None:
         self.state = value
 
+    async def get_state(self) -> Optional[Any]:
+        return self.state
+
 
 class StubRepository:
     def __init__(self) -> None:
@@ -103,9 +109,20 @@ class StubRepository:
         self.updated_filters: list[tuple[int, str]] = []
         self.reminder: Optional[Any] = None
         self.synced_versions: list[str] = []
+        self.gen_counts: dict[int, int] = {}
+        self.contact_skip: dict[int, bool] = {}
+        self.contact_never: dict[int, bool] = {}
+        self.contacts: dict[int, Any] = {}
 
     async def ensure_user(self, user_id: int) -> Any:
-        return SimpleNamespace(gender=self.gender, daily_used=self.daily_used, seen_models=list(self.seen_models))
+        return SimpleNamespace(
+            gender=self.gender,
+            daily_used=self.daily_used,
+            seen_models=list(self.seen_models),
+            gen_count=self.gen_counts.get(user_id, 0),
+            contact_skip_once=self.contact_skip.get(user_id, False),
+            contact_never=self.contact_never.get(user_id, False),
+        )
 
     async def update_filters(self, user_id: int, gender: str) -> None:
         self.updated_filters.append((user_id, gender))
@@ -136,6 +153,35 @@ class StubRepository:
 
     async def inc_used_on_success(self, user_id: int) -> None:
         self.daily_used += 1
+
+    async def increment_generation_count(self, user_id: int) -> int:
+        self.gen_counts[user_id] = self.gen_counts.get(user_id, 0) + 1
+        return self.gen_counts[user_id]
+
+    async def set_contact_skip_once(self, user_id: int, value: bool) -> None:
+        self.contact_skip[user_id] = value
+
+    async def set_contact_never(self, user_id: int, value: bool) -> None:
+        self.contact_never[user_id] = value
+
+    async def get_user_contact(self, user_id: int) -> Optional[Any]:
+        return self.contacts.get(user_id)
+
+    async def upsert_user_contact(self, contact: Any) -> None:
+        self.contacts[contact.tg_user_id] = SimpleNamespace(
+            phone_e164=contact.phone_e164,
+            source=contact.source,
+            consent=contact.consent,
+            consent_ts=contact.consent_ts,
+            reward_granted=contact.reward_granted,
+        )
+        self.contact_skip[contact.tg_user_id] = False
+        self.contact_never[contact.tg_user_id] = False
+
+    async def mark_contact_reward_granted(self, user_id: int) -> None:
+        contact = self.contacts.get(user_id)
+        if contact:
+            contact.reward_granted = True
 
     async def set_referrer(self, user_id: int, ref_id: int) -> None:  # noqa: D401 - no-op
         return None
@@ -181,6 +227,15 @@ class StubStorage:
         return self.uploads_dir / filename
 
 
+class StubLeadsExporter:
+    def __init__(self) -> None:
+        self.payloads: list[Any] = []
+
+    async def export_lead_to_sheet(self, payload: Any) -> bool:
+        self.payloads.append(payload)
+        return True
+
+
 class StubCollageBuilder:
     def __init__(self) -> None:
         self.calls: list[list[Optional[str]]] = []
@@ -215,6 +270,7 @@ def build_router(
     tryon = StubTryOn(result_path=result_path)
     storage = StubStorage(tmp_path / "uploads")
     builder = collage_builder or StubCollageBuilder()
+    leads_exporter = StubLeadsExporter()
     collage_config = CollageConfig(
         width=1600,
         height=800,
@@ -239,6 +295,9 @@ def build_router(
         landing_url="https://example.com",
         promo_code="PROMO",
         no_more_message_key="all_seen",
+        contact_reward_rub=1000,
+        promo_contact_code="PROMO1000",
+        leads_exporter=leads_exporter,
     )
     return router, repository, tryon, builder, recommender
 
@@ -336,10 +395,7 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
         assert len(builder.calls) == 2
         assert len(message.answer_photos) == 2
         captions = [caption for _, caption, _ in message.answer_photos]
-        assert captions == [
-            msg.BATCH_TITLE.format(index=1, total=2),
-            msg.BATCH_TITLE.format(index=2, total=2),
-        ]
+        assert captions == [None, None]
         button_counts = []
         for _, _, markup in message.answer_photos:
             assert isinstance(markup, InlineKeyboardMarkup)
@@ -417,7 +473,7 @@ def test_collage_source_unavailable_falls_back_to_text(tmp_path: Path) -> None:
         assert len(builder.calls) == 1
         assert not message.answer_photos
         fallback_text, markup = message.answers[-1]
-        assert msg.COLLAGE_IMAGES_UNAVAILABLE in fallback_text
+        assert fallback_text == msg.COLLAGE_IMAGES_UNAVAILABLE
         assert isinstance(markup, InlineKeyboardMarkup)
         assert len(markup.inline_keyboard[0]) == 2
 
@@ -469,7 +525,7 @@ def test_collage_processing_error_sends_individual_photos(tmp_path: Path) -> Non
         second_photo = message.answer_photos[1]
         assert first_photo[1] is None
         assert first_photo[2] is None
-        assert second_photo[1] == msg.BATCH_TITLE.format(index=1, total=1)
+        assert second_photo[1] is None
         markup = second_photo[2]
         assert isinstance(markup, InlineKeyboardMarkup)
         assert len(markup.inline_keyboard[0]) == 2
@@ -502,15 +558,18 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
 
         data = await state.get_data()
         assert data.get("upload")
+        initial_photo_count = len(upload_message.answer_photos)
 
         callback = DummyCallback("pick:src=batch2:m1", upload_message)
         await handler_choose(callback, state)
 
         generation_id = upload_message.message_id + 2
         assert (55, generation_id) in bot.deleted
+        assert (55, upload_message.message_id) in bot.deleted
         assert state.data.get("generation_message_id") is None
         assert repository.daily_used == 1
         assert state.state is TryOnStates.RESULT
+        assert len(upload_message.answer_photos) == initial_photo_count + 1
         assert upload_message.answer_photos[-1][1] == "".join(msg.FIRST_RESULT_CAPTION)
         assert tryon.calls  # ensure generation was triggered
 
@@ -520,6 +579,126 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         callback_second = DummyCallback("pick:src=batch2:m1", upload_message)
         await handler_choose(callback_second, state)
         assert upload_message.answer_photos[-1][1] == "".join(msg.NEXT_RESULT_CAPTION)
+
+    asyncio.run(scenario())
+
+
+def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
+    models = [
+        GlassModel(
+            unique_id="m1",
+            title="Model 1",
+            model_code="M1",
+            site_url="https://example.com/1",
+            img_user_url="https://example.com/1.jpg",
+            img_nano_url="https://example.com/1-nano.jpg",
+            gender="Мужской",
+        ),
+        GlassModel(
+            unique_id="m2",
+            title="Model 2",
+            model_code="M2",
+            site_url="https://example.com/2",
+            img_user_url="https://example.com/2.jpg",
+            img_nano_url="https://example.com/2-nano.jpg",
+            gender="Мужской",
+        ),
+    ]
+
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path, models=models)
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+        handler_more = get_callback_handler(router, "result_more")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=777, bot=bot)
+        message.photo = [PhotoStub("photo1")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler_photo(message, state)
+
+        first_callback = DummyCallback("pick:src=batch2:m1", message)
+        await handler_choose(first_callback, state)
+        assert repository.gen_counts[777] == 1
+        assert not any(msg.ASK_PHONE_TITLE in text for text, _ in message.answers)
+
+        more_callback = DummyCallback("more|1", message)
+        await handler_more(more_callback, state)
+        assert repository.gen_counts[777] == 1
+        assert not any(msg.ASK_PHONE_TITLE in text for text, _ in message.answers)
+
+        second_callback = DummyCallback("pick:src=batch2:m1", message)
+        await handler_choose(second_callback, state)
+        assert repository.gen_counts[777] == 2
+
+        more_callback_second = DummyCallback("more|1", message)
+        await handler_more(more_callback_second, state)
+
+        assert state.state is ContactRequest.waiting_for_phone
+        assert message.answers[-1][0].startswith(f"<b>{msg.ASK_PHONE_TITLE}")
+
+    asyncio.run(scenario())
+
+
+def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> None:
+    models = [
+        GlassModel(
+            unique_id="m1",
+            title="Model 1",
+            model_code="M1",
+            site_url="https://example.com/1",
+            img_user_url="https://example.com/1.jpg",
+            img_nano_url="https://example.com/1-nano.jpg",
+            gender="Мужской",
+        ),
+        GlassModel(
+            unique_id="m2",
+            title="Model 2",
+            model_code="M2",
+            site_url="https://example.com/2",
+            img_user_url="https://example.com/2.jpg",
+            img_nano_url="https://example.com/2-nano.jpg",
+            gender="Мужской",
+        ),
+    ]
+
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path, models=models)
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+        handler_more = get_callback_handler(router, "result_more")
+        contact_handler = get_message_handler(router, "contact_shared")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=888, bot=bot)
+        message.photo = [PhotoStub("photo1")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler_photo(message, state)
+        await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
+        await handler_more(DummyCallback("more|1", message), state)
+        await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
+        await handler_more(DummyCallback("more|1", message), state)
+
+        assert state.state is ContactRequest.waiting_for_phone
+        photos_before = list(message.answer_photos)
+
+        contact_message = DummyMessage(user_id=888, bot=bot, message_id=400)
+        contact_message.contact = SimpleNamespace(phone_number="+79991234567")
+
+        await contact_handler(contact_message, state)
+
+        assert state.state is TryOnStates.RESULT
+        assert list(message.answer_photos) == photos_before
+        assert contact_message.answers[0][0] == msg.ASK_PHONE_THANKS.format(
+            rub=1000, promo="PROMO1000"
+        )
+        assert isinstance(contact_message.answers[0][1], ReplyKeyboardRemove)
+        assert contact_message.answers[1][0] == "".join(msg.NEXT_RESULT_CAPTION)
+        assert contact_message.answers[1][1] is None
 
     asyncio.run(scenario())
 
