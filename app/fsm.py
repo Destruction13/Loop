@@ -147,7 +147,11 @@ def setup_router(
     batch_source = "src=batch2"
 
     async def _maybe_request_contact(
-        message: Message, state: FSMContext, user_id: int
+        message: Message,
+        state: FSMContext,
+        user_id: int,
+        *,
+        origin_state: Optional[str] = None,
     ) -> bool:
         data = await state.get_data()
         if data.get("contact_request_active"):
@@ -165,16 +169,22 @@ def setup_router(
                 await repository.set_contact_skip_once(user_id, False)
             else:
                 return False
+        current_state = origin_state or await state.get_state()
+        pending_state = data.get("contact_pending_result_state")
+        if not pending_state and current_state == TryOnStates.RESULT.state:
+            pending_state = "result"
         prompt_text = (
             f"<b>{msg.ASK_PHONE_TITLE}</b>\n\n"
             f"{msg.ASK_PHONE_BODY.format(rub=contact_reward_rub)}\n\n"
             f"{msg.ASK_PHONE_PROMPT_MANUAL}"
         )
-        await state.update_data(
-            contact_request_active=True,
-            contact_pending_generation=True,
-            contact_pending_result_state=None,
-        )
+        update_payload = {
+            "contact_request_active": True,
+            "contact_pending_generation": True,
+        }
+        if pending_state and pending_state != data.get("contact_pending_result_state"):
+            update_payload["contact_pending_result_state"] = pending_state
+        await state.update_data(**update_payload)
         await state.set_state(ContactRequest.waiting_for_phone)
         await message.answer(prompt_text, reply_markup=contact_request_keyboard())
         logger.info("%s Contact requested for %s", EVENT_ID["MODELS_SENT"], user_id)
@@ -224,7 +234,6 @@ def setup_router(
                 marketing_message,
                 reply_markup=all_seen_keyboard(landing_url),
             )
-        await repository.increment_generation_count(user_id)
         return True
 
     async def _send_model_batches(message: Message, batch: list[GlassModel]) -> None:
@@ -345,6 +354,16 @@ def setup_router(
                 user_id,
                 source,
             )
+            await _resume_after_contact(message, state, send_generation=False)
+            current_state = await state.get_state()
+            if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
+                caption_source = msg.NEXT_RESULT_CAPTION
+                if isinstance(caption_source, (list, tuple)):
+                    followup_text = "".join(caption_source)
+                else:
+                    followup_text = str(caption_source)
+                await message.answer(followup_text)
+            return
         else:
             await message.answer(
                 msg.ASK_PHONE_ALREADY_HAVE,
@@ -569,7 +588,6 @@ def setup_router(
             )
             await callback.answer()
             return
-        filters = await _ensure_filters(callback.from_user.id, state)
         await callback.answer()
         try:
             await callback.message.delete()
@@ -579,20 +597,8 @@ def setup_router(
                 callback.message.message_id,
                 exc,
             )
-        contact_requested = await _maybe_request_contact(
-            callback.message, state, callback.from_user.id
-        )
-        if not contact_requested:
-            await _send_models(
-                callback.message,
-                callback.from_user.id,
-                filters,
-                state,
-                skip_contact_prompt=True,
-            )
         await state.update_data(selected_model=selected)
-        if not contact_requested:
-            await state.set_state(TryOnStates.GENERATING)
+        await state.set_state(TryOnStates.GENERATING)
         generation_message = await callback.message.answer(msg.GENERATING_PROMPT)
         await state.update_data(generation_message_id=generation_message.message_id)
         await _perform_generation(callback.message, state, selected)
@@ -687,6 +693,7 @@ def setup_router(
             caption=caption_text,
             reply_markup=generation_result_keyboard(model.site_url, plan.remaining),
         )
+        await repository.increment_generation_count(user_id)
         await _delete_state_message(message, state, "generation_message_id")
         new_flag = next_first_flag_value(
             data.get("first_generated_today", True), plan.outcome
@@ -725,10 +732,13 @@ def setup_router(
             await callback.answer()
             return
         filters = await _ensure_filters(user_id, state)
-        await state.set_state(TryOnStates.SHOW_RECS)
-        if await _maybe_request_contact(callback.message, state, user_id):
+        previous_state = await state.get_state()
+        if await _maybe_request_contact(
+            callback.message, state, user_id, origin_state=previous_state
+        ):
             await callback.answer()
             return
+        await state.set_state(TryOnStates.SHOW_RECS)
         preload_message = await callback.message.answer(msg.SEARCHING_MODELS_PROMPT)
         await state.update_data(preload_message_id=preload_message.message_id)
         await _send_models(
