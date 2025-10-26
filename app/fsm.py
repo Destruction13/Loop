@@ -160,27 +160,6 @@ def setup_router(
         finally:
             await state.update_data(last_aux_message_id=None)
 
-    async def _delete_last_delivery_messages(
-        message: Message, state: FSMContext
-    ) -> None:
-        data = await state.get_data()
-        message_ids: Sequence[int] | None = data.get("last_delivery_message_ids")
-        if not message_ids:
-            return
-        remaining: list[int] = []
-        for message_id in message_ids:
-            try:
-                await message.bot.delete_message(message.chat.id, message_id)
-            except TelegramBadRequest as exc:
-                logger.debug(
-                    "Failed to delete delivery message %s: %s", message_id, exc
-                )
-                remaining.append(message_id)
-        if remaining:
-            await state.update_data(last_delivery_message_ids=remaining)
-        else:
-            await state.update_data(last_delivery_message_ids=[])
-
     async def _send_aux_message(
         source_message: Message,
         state: FSMContext,
@@ -193,14 +172,6 @@ def setup_router(
         await state.update_data(last_aux_message_id=sent_message.message_id)
         return sent_message
 
-    async def _prepare_delivery(message: Message, state: FSMContext) -> None:
-        await _delete_last_delivery_messages(message, state)
-
-    async def _record_delivery_ids(
-        state: FSMContext, message_ids: Sequence[int]
-    ) -> None:
-        await state.update_data(last_delivery_message_ids=list(message_ids))
-
     async def _send_delivery_message(
         source_message: Message,
         state: FSMContext,
@@ -208,10 +179,28 @@ def setup_router(
         *args,
         **kwargs,
     ) -> Message:
-        await _prepare_delivery(source_message, state)
-        sent_message = await send_method(*args, **kwargs)
-        await _record_delivery_ids(state, [sent_message.message_id])
-        return sent_message
+        return await send_method(*args, **kwargs)
+
+    def _remove_more_button_from_markup(
+        markup: InlineKeyboardMarkup | None,
+    ) -> InlineKeyboardMarkup | None:
+        if not markup or not markup.inline_keyboard:
+            return None
+        new_rows = []
+        changed = False
+        for row in markup.inline_keyboard:
+            new_row = []
+            for button in row:
+                callback_data = getattr(button, "callback_data", None)
+                if callback_data and callback_data.startswith("more|"):
+                    changed = True
+                    continue
+                new_row.append(button)
+            if new_row:
+                new_rows.append(new_row)
+        if not changed:
+            return None
+        return InlineKeyboardMarkup(inline_keyboard=new_rows)
 
     async def _maybe_request_contact(
         message: Message,
@@ -561,20 +550,15 @@ def setup_router(
         *,
         reply_markup: InlineKeyboardMarkup,
     ) -> None:
-        await _prepare_delivery(message, state)
-        sent_ids: list[int] = []
         last_index = len(group) - 1
         for index, item in enumerate(group):
             caption = None
             markup = reply_markup if index == last_index else None
-            last_sent = await message.answer_photo(
+            await message.answer_photo(
                 photo=URLInputFile(item.img_user_url),
                 caption=caption,
                 reply_markup=markup,
             )
-            sent_ids.append(last_sent.message_id)
-        if sent_ids:
-            await _record_delivery_ids(state, sent_ids)
 
     async def _delete_state_message(message: Message, state: FSMContext, key: str) -> None:
         data = await state.get_data()
@@ -588,10 +572,6 @@ def setup_router(
         finally:
             if data.get("last_aux_message_id") == message_id:
                 await state.update_data(last_aux_message_id=None)
-            delivery_ids: Sequence[int] | None = data.get("last_delivery_message_ids")
-            if delivery_ids and message_id in delivery_ids:
-                remaining = [mid for mid in delivery_ids if mid != message_id]
-                await state.update_data(last_delivery_message_ids=remaining)
             await state.update_data(**{key: None})
 
     @router.message(CommandStart())
@@ -922,6 +902,18 @@ def setup_router(
     @router.callback_query(StateFilter(TryOnStates.RESULT), F.data.startswith("more|"))
     async def result_more(callback: CallbackQuery, state: FSMContext) -> None:
         user_id = callback.from_user.id
+        message = callback.message
+        if message:
+            updated_markup = _remove_more_button_from_markup(message.reply_markup)
+            if updated_markup is not None:
+                try:
+                    await message.edit_reply_markup(reply_markup=updated_markup)
+                except TelegramBadRequest as exc:
+                    logger.debug(
+                        "Failed to update keyboard for message %s: %s",
+                        message.message_id,
+                        exc,
+                    )
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
