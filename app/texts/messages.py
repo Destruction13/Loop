@@ -115,7 +115,7 @@ RETRY_GENERATION_BUTTON_TEXT = "Повторить генерацию"
 MODEL_UNAVAILABLE_ALERT = "Модель недоступна"
 
 # Шаблон подписи для подборок карточек.
-PAIR_CAPTION_TEMPLATE = "Подборка {current}/{total}"
+BATCH_TITLE = "Подборка {index}/{total}"
 
 # Сообщение, когда оба изображения коллажа недоступны.
 COLLAGE_IMAGES_UNAVAILABLE = "Не удалось показать изображения, попробуй ещё раз"

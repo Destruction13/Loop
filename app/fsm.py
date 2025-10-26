@@ -27,10 +27,10 @@ from aiogram.types.input_file import BufferedInputFile, FSInputFile, URLInputFil
 
 from app.keyboards import (
     all_seen_keyboard,
+    batch_selection_keyboard,
     gender_keyboard,
     generation_result_keyboard,
     limit_reached_keyboard,
-    pair_selection_keyboard,
     promo_keyboard,
     retry_keyboard,
     start_keyboard,
@@ -42,7 +42,7 @@ from app.config import CollageConfig
 from app.services.collage import (
     CollageProcessingError,
     CollageSourceUnavailable,
-    build_two_up_collage,
+    build_three_tile_collage,
 )
 from app.services.repository import Repository
 from app.services.storage_base import StorageService
@@ -97,10 +97,14 @@ def next_first_flag_value(current_flag: bool, outcome: GenerationOutcome) -> boo
     return current_flag
 
 
-def pair_models(models: Sequence[GlassModel]) -> list[tuple[GlassModel, ...]]:
-    """Split models into consecutive pairs preserving order."""
+def chunk_models(
+    models: Sequence[GlassModel], chunk_size: int
+) -> list[tuple[GlassModel, ...]]:
+    """Split models into consecutive chunks preserving order."""
 
-    return [tuple(models[i : i + 2]) for i in range(0, len(models), 2)]
+    if chunk_size <= 0:
+        return []
+    return [tuple(models[i : i + chunk_size]) for i in range(0, len(models), chunk_size)]
 
 
 def setup_router(
@@ -110,7 +114,8 @@ def setup_router(
     tryon: TryOnService,
     storage: StorageService,
     collage_config: CollageConfig,
-    collage_builder: Callable[[str | None, str | None, CollageConfig], Awaitable[io.BytesIO]] = build_two_up_collage,
+    collage_builder: Callable[[Sequence[str | None], CollageConfig], Awaitable[io.BytesIO]] = build_three_tile_collage,
+    batch_size: int,
     reminder_hours: int,
     selection_button_title_max: int,
     landing_url: str,
@@ -124,18 +129,20 @@ def setup_router(
         data = await state.get_data()
         return FilterOptions(gender=data.get("gender", "unisex"))
 
+    batch_source = "batch3"
+
     async def _send_models(
         message: Message, user_id: int, filters: FilterOptions, state: FSMContext
     ) -> None:
         try:
-            models = await recommender.recommend_for_user(user_id, filters.gender)
+            result = await recommender.recommend_for_user(user_id, filters.gender)
         except CatalogError as exc:
             logger.error("%s Failed to fetch catalog: %s", EVENT_ID["MODELS_SENT"], exc)
             await message.answer(msg.CATALOG_TEMPORARILY_UNAVAILABLE)
             await state.update_data(current_models=[])
             await _delete_state_message(message, state, "preload_message_id")
             return
-        if not models:
+        if not result.models:
             try:
                 marketing_message = msg.marketing_text(no_more_message_key)
             except KeyError:
@@ -147,38 +154,46 @@ def setup_router(
             await state.update_data(current_models=[], last_batch=[])
             await _delete_state_message(message, state, "preload_message_id")
             return
-        batch = list(models)
+        batch = list(result.models)
         await state.update_data(current_models=batch, last_batch=batch)
-        await _send_model_pairs(message, batch)
-        logger.info("%s Sent %s models", EVENT_ID["MODELS_SENT"], len(models))
+        await _send_model_batches(message, batch)
         await _delete_state_message(message, state, "preload_message_id")
-
-    async def _send_model_pairs(message: Message, batch: list[GlassModel]) -> None:
-        pairs = pair_models(batch)
-        total_pairs = len(pairs)
-        for index, pair in enumerate(pairs, start=1):
-            label_text = msg.PAIR_CAPTION_TEMPLATE.format(current=index, total=total_pairs)
+        if result.exhausted:
             try:
-                await _send_pair_message(message, pair, label_text)
+                marketing_message = msg.marketing_text(no_more_message_key)
+            except KeyError:
+                marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
+            await message.answer(
+                marketing_message,
+                reply_markup=all_seen_keyboard(landing_url),
+            )
+
+    async def _send_model_batches(message: Message, batch: list[GlassModel]) -> None:
+        groups = chunk_models(batch, batch_size)
+        total_groups = len(groups) if groups else 0
+        for index, group in enumerate(groups, start=1):
+            label_text = msg.BATCH_TITLE.format(index=index, total=total_groups)
+            try:
+                await _send_batch_message(message, group, label_text)
             except Exception as exc:  # noqa: BLE001
                 logger.error(
-                    "%s Failed to send model pair %s: %s",
+                    "%s Failed to send model batch %s: %s",
                     EVENT_ID["MODELS_SENT"],
-                    [model.unique_id for model in pair],
+                    [model.unique_id for model in group],
                     exc,
                 )
 
-    async def _send_pair_message(
-        message: Message, pair: tuple[GlassModel, ...], label_text: str
+    async def _send_batch_message(
+        message: Message, group: tuple[GlassModel, ...], label_text: str
     ) -> None:
-        keyboard = pair_selection_keyboard(
-            [(item.unique_id, item.title) for item in pair],
+        keyboard = batch_selection_keyboard(
+            [(item.unique_id, item.title) for item in group],
+            source=batch_source,
             max_title_length=selection_button_title_max,
         )
-        left_url = pair[0].img_user_url if len(pair) > 0 else None
-        right_url = pair[1].img_user_url if len(pair) > 1 else None
+        urls = [item.img_user_url for item in group]
         try:
-            buffer = await collage_builder(left_url, right_url, collage_config)
+            buffer = await collage_builder(urls, collage_config)
         except CollageSourceUnavailable:
             await message.answer(
                 f"{label_text}\n\n{msg.COLLAGE_IMAGES_UNAVAILABLE}",
@@ -188,21 +203,21 @@ def setup_router(
         except CollageProcessingError as exc:
             logger.warning(
                 "Collage processing failed for models %s: %s",
-                [model.unique_id for model in pair],
+                [model.unique_id for model in group],
                 exc,
             )
-            await _send_pair_as_photos(
-                message, pair, label_text=label_text, reply_markup=keyboard
+            await _send_batch_as_photos(
+                message, group, label_text=label_text, reply_markup=keyboard
             )
             return
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "Unexpected collage error for models %s: %s",
-                [model.unique_id for model in pair],
+                [model.unique_id for model in group],
                 exc,
             )
-            await _send_pair_as_photos(
-                message, pair, label_text=label_text, reply_markup=keyboard
+            await _send_batch_as_photos(
+                message, group, label_text=label_text, reply_markup=keyboard
             )
             return
 
@@ -214,16 +229,23 @@ def setup_router(
             caption=label_text,
             reply_markup=keyboard,
         )
+        logger.info(
+            "%s Collage %sx%s sent for models %s",
+            EVENT_ID["MODELS_SENT"],
+            collage_config.width,
+            collage_config.height,
+            [model.unique_id for model in group],
+        )
 
-    async def _send_pair_as_photos(
+    async def _send_batch_as_photos(
         message: Message,
-        pair: tuple[GlassModel, ...],
+        group: tuple[GlassModel, ...],
         *,
         label_text: str,
         reply_markup: InlineKeyboardMarkup,
     ) -> None:
-        last_index = len(pair) - 1
-        for index, item in enumerate(pair):
+        last_index = len(group) - 1
+        for index, item in enumerate(group):
             caption = label_text if index == last_index else None
             markup = reply_markup if index == last_index else None
             await message.answer_photo(
@@ -325,13 +347,24 @@ def setup_router(
 
     @router.callback_query(StateFilter(TryOnStates.SHOW_RECS), F.data.startswith("pick:"))
     async def choose_model(callback: CallbackQuery, state: FSMContext) -> None:
-        model_id = callback.data.replace("pick:", "", 1)
+        parts = callback.data.split(":", 2)
+        if len(parts) == 3:
+            _, batch_source_key, model_id = parts
+        else:  # fallback for legacy format
+            batch_source_key = "unknown"
+            model_id = callback.data.replace("pick:", "", 1)
         data = await state.get_data()
         models_data: List[GlassModel] = data.get("current_models", [])
         selected = next((model for model in models_data if model.unique_id == model_id), None)
         if not selected:
             await callback.answer(msg.MODEL_UNAVAILABLE_ALERT, show_alert=True)
             return
+        logger.debug(
+            "User %s selected model %s from %s",
+            callback.from_user.id,
+            model_id,
+            batch_source_key,
+        )
         remaining = await repository.remaining_tries(callback.from_user.id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)

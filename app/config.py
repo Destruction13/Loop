@@ -17,21 +17,16 @@ DEFAULT_SHEET_URL = (
 
 @dataclass(slots=True)
 class CollageConfig:
-    """Rendering options for two-up collage previews."""
+    """Rendering options for horizontal three-tile collages."""
 
     width: int
     height: int
-    gap: int
-    padding: int
+    columns: int
+    margin: int
+    divider_width: int
+    divider_color: str
     background: str
     jpeg_quality: int
-    fit_mode: str
-    sharpen: float
-    divider: int
-    divider_color: str
-    divider_radius: int
-    cell_border: int
-    cell_border_color: str
 
 
 @dataclass(slots=True)
@@ -53,9 +48,9 @@ class Config:
     nano_api_url: Optional[str]
     nano_api_key: Optional[str]
     collage: CollageConfig
-    reco_batch_total: int
-    reco_batch_gender: int
-    reco_batch_unisex: int
+    batch_size: int
+    batch_layout_cols: int
+    pick_rule: str
     reco_unique_scope: str
     reco_clear_on_catalog_change: bool
     reco_topup_from_any: bool
@@ -87,22 +82,6 @@ def _as_int(value: Optional[str], fallback: int) -> int:
         return fallback
 
 
-def _as_float(value: Optional[str], fallback: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return fallback
-
-
-def _as_fit_mode(value: Optional[str], fallback: str) -> str:
-    if not value:
-        return fallback
-    normalized = value.strip().lower()
-    if normalized in {"contain", "cover"}:
-        return normalized
-    return fallback
-
-
 def _as_path(value: Optional[str], fallback: str) -> Path:
     return Path(value or fallback)
 
@@ -125,21 +104,17 @@ def load_config(env_file: str | None = None) -> Config:
     else:
         load_dotenv()
 
+    batch_size = _as_int(_get("BATCH_SIZE", "3"), 3)
+    batch_columns = _as_int(_get("BATCH_LAYOUT_COLS", "3"), 3)
     collage = CollageConfig(
-        width=_as_int(_get("COLLAGE_WIDTH", "1280"), 1280),
-        height=_as_int(_get("COLLAGE_HEIGHT", "640"), 640),
-        gap=_as_int(_get("COLLAGE_GAP", "16"), 16),
-        padding=_as_int(_get("COLLAGE_PADDING", "24"), 24),
-        background=_get("COLLAGE_BG", "#FFFFFF") or "#FFFFFF",
-        jpeg_quality=_as_int(_get("COLLAGE_JPEG_QUALITY", "90"), 90),
-        fit_mode=_as_fit_mode(_get("COLLAGE_FIT_MODE", "contain"), "contain"),
-        sharpen=_as_float(_get("COLLAGE_SHARPEN", "0.0"), 0.0),
-        divider=_as_int(_get("COLLAGE_DIVIDER", "6"), 6),
-        divider_color=_get("COLLAGE_DIVIDER_COLOR", "#E6E9EF") or "#E6E9EF",
-        divider_radius=_as_int(_get("COLLAGE_DIVIDER_RADIUS", "0"), 0),
-        cell_border=_as_int(_get("COLLAGE_CELL_BORDER", "0"), 0),
-        cell_border_color=_get("COLLAGE_CELL_BORDER_COLOR", "#D7DBE4")
-        or "#D7DBE4",
+        width=_as_int(_get("CANVAS_WIDTH", "1800"), 1800),
+        height=_as_int(_get("CANVAS_HEIGHT", "600"), 600),
+        columns=max(batch_columns, 1),
+        margin=_as_int(_get("TILE_MARGIN", "30"), 30),
+        divider_width=_as_int(_get("DIVIDER_WIDTH", "4"), 4),
+        divider_color=_get("DIVIDER_COLOR", "#E5E5E5") or "#E5E5E5",
+        background=_get("CANVAS_BG", "#FFFFFF") or "#FFFFFF",
+        jpeg_quality=_as_int(_get("JPEG_QUALITY", "88"), 88),
     )
 
     return Config(
@@ -158,9 +133,9 @@ def load_config(env_file: str | None = None) -> Config:
         nano_api_url=_get("NANO_API_URL"),
         nano_api_key=_get("NANO_API_KEY"),
         collage=collage,
-        reco_batch_total=_as_int(_get("RECO_BATCH_TOTAL", "4"), 4),
-        reco_batch_gender=_as_int(_get("RECO_BATCH_GENDER", "2"), 2),
-        reco_batch_unisex=_as_int(_get("RECO_BATCH_UNISEX", "2"), 2),
+        batch_size=max(batch_size, 1),
+        batch_layout_cols=max(batch_columns, 1),
+        pick_rule=_get("PICK_RULE", "2_1") or "2_1",
         reco_unique_scope=_as_unique_scope(_get("RECO_UNIQUE_SCOPE", "24h"), "24h"),
         reco_clear_on_catalog_change=_as_bool(_get("RECO_CLEAR_ON_CATALOG_CHANGE", "1"), True),
         reco_topup_from_any=_as_bool(_get("RECO_TOPUP_FROM_ANY", "0"), False),

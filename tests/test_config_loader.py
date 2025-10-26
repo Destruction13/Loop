@@ -22,19 +22,16 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 "BUTTON_TITLE_MAX=42",
                 "NANO_API_URL=https://nano.example.com",
                 "NANO_API_KEY=secret",
-                "COLLAGE_WIDTH=640",
-                "COLLAGE_HEIGHT=320",
-                "COLLAGE_GAP=12",
-                "COLLAGE_PADDING=20",
-                "COLLAGE_BG=#EFEFEF",
-                "COLLAGE_JPEG_QUALITY=80",
-                "COLLAGE_FIT_MODE=cover",
-                "COLLAGE_SHARPEN=0.5",
-                "COLLAGE_DIVIDER=8",
-                "COLLAGE_DIVIDER_COLOR=#112233",
-                "COLLAGE_DIVIDER_RADIUS=4",
-                "COLLAGE_CELL_BORDER=2",
-                "COLLAGE_CELL_BORDER_COLOR=#445566",
+                "BATCH_SIZE=5",
+                "BATCH_LAYOUT_COLS=3",
+                "PICK_RULE=3_0",
+                "CANVAS_WIDTH=1500",
+                "CANVAS_HEIGHT=500",
+                "CANVAS_BG=#EFEFEF",
+                "TILE_MARGIN=40",
+                "DIVIDER_WIDTH=6",
+                "DIVIDER_COLOR=#123456",
+                "JPEG_QUALITY=82",
             ]
         ),
         encoding="utf-8",
@@ -57,16 +54,14 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.button_title_max == 42
     assert config.nano_api_url == "https://nano.example.com"
     assert config.nano_api_key == "secret"
-    assert config.collage.width == 640
-    assert config.collage.height == 320
-    assert config.collage.gap == 12
-    assert config.collage.padding == 20
+    assert config.batch_size == 5
+    assert config.batch_layout_cols == 3
+    assert config.pick_rule == "3_0"
+    assert config.collage.width == 1500
+    assert config.collage.height == 500
+    assert config.collage.columns == 3
+    assert config.collage.margin == 40
     assert config.collage.background == "#EFEFEF"
-    assert config.collage.jpeg_quality == 80
-    assert config.collage.fit_mode == "cover"
-    assert config.collage.sharpen == 0.5
-    assert config.collage.divider == 8
-    assert config.collage.divider_color == "#112233"
-    assert config.collage.divider_radius == 4
-    assert config.collage.cell_border == 2
-    assert config.collage.cell_border_color == "#445566"
+    assert config.collage.divider_width == 6
+    assert config.collage.divider_color == "#123456"
+    assert config.collage.jpeg_quality == 82

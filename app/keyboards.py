@@ -57,12 +57,13 @@ def gender_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def pair_selection_keyboard(
+def batch_selection_keyboard(
     models: Sequence[tuple[str, str]],
     *,
+    source: str,
     max_title_length: int = 28,
 ) -> InlineKeyboardMarkup:
-    """Keyboard for selecting one of the models in a pair."""
+    """Keyboard for selecting one of the models in a batch."""
 
     if not models:
         return InlineKeyboardMarkup(inline_keyboard=[])
@@ -73,7 +74,7 @@ def pair_selection_keyboard(
         buttons.append(
             InlineKeyboardButton(
                 text=truncated,
-                callback_data=f"pick:{unique_id}",
+                callback_data=f"pick:{source}:{unique_id}",
             )
         )
     return InlineKeyboardMarkup(inline_keyboard=[buttons])

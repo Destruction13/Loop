@@ -1,10 +1,10 @@
 .PHONY: run lint test
 
 run:
-python -m app.main
+	python -m app.main
 
 lint:
-python -m compileall app
+	python -m compileall app
 
 test:
-pytest
+	pytest
