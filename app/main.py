@@ -14,6 +14,7 @@ from app.keyboards import reminder_keyboard, start_keyboard
 from app.logging_conf import EVENT_ID, setup_logging
 from app.services.catalog_google import GoogleCatalogConfig, GoogleSheetCatalog
 from app.services.collage import build_three_tile_collage
+from app.services.contact_export import ContactSheetExporter
 from app.services.leads_export import LeadsExporter
 from app.services.idle_reminder import IdleReminderService
 from app.services.repository import Repository
@@ -69,6 +70,12 @@ async def main() -> None:
         promo_code=config.promo_contact_code,
     )
 
+    contact_exporter = ContactSheetExporter(
+        sheet_url=config.contacts_sheet_url or "",
+        worksheet_name="Контакты",
+        credentials_path=config.google_service_account_json,
+    )
+
     if config.mock_tryon:
         tryon_service = MockTryOnService(storage)
     else:
@@ -93,6 +100,7 @@ async def main() -> None:
         contact_reward_rub=config.contact_reward_rub,
         promo_contact_code=config.promo_contact_code,
         leads_exporter=leads_exporter,
+        contact_exporter=contact_exporter,
     )
     dp.include_router(router)
 

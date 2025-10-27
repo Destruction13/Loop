@@ -63,6 +63,8 @@ class Config:
     enable_social_ad: bool
     social_instagram_url: str
     social_tiktok_url: str
+    contacts_sheet_url: Optional[str]
+    google_service_account_json: Optional[Path]
 
 
 def _get(name: str, default: Optional[str] = None, *, required: bool = False) -> Optional[str]:
@@ -133,6 +135,14 @@ def load_config(env_file: str | None = None) -> Config:
     if idle_timeout_raw is None:
         idle_timeout_raw = _get("IDLE_REMINDER_MINUTES")
 
+    contacts_sheet_url = _get("GOOGLE_SHEET_URL")
+    google_credentials_raw = _get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    google_credentials_path = (
+        Path(google_credentials_raw)
+        if google_credentials_raw
+        else None
+    )
+
     return Config(
         bot_token=_get("BOT_TOKEN", required=True),
         sheet_csv_url=_get("SHEET_CSV_URL", DEFAULT_SHEET_URL) or DEFAULT_SHEET_URL,
@@ -167,6 +177,8 @@ def load_config(env_file: str | None = None) -> Config:
         or "https://instagram.com/loov",
         social_tiktok_url=_get("SOCIAL_TIKTOK_URL", "https://tiktok.com/@loov")
         or "https://tiktok.com/@loov",
+        contacts_sheet_url=contacts_sheet_url,
+        google_service_account_json=google_credentials_path,
     )
 
 

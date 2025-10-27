@@ -46,6 +46,7 @@ from app.services.collage import (
     CollageSourceUnavailable,
     build_three_tile_collage,
 )
+from app.services.contact_export import ContactRecord, ContactSheetExporter
 from app.services.leads_export import LeadPayload, LeadsExporter
 from app.services.repository import Repository
 from app.services.storage_base import StorageService
@@ -136,6 +137,7 @@ def setup_router(
     contact_reward_rub: int,
     promo_contact_code: str,
     leads_exporter: LeadsExporter,
+    contact_exporter: ContactSheetExporter,
 ) -> Router:
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
@@ -454,12 +456,48 @@ def setup_router(
         )
         await leads_exporter.export_lead_to_sheet(payload)
 
+    def _map_gender_label(value: str | None) -> str:
+        mapping = {
+            "male": "Мужской",
+            "female": "Женский",
+            "unisex": "Унисекс",
+            "for_who_male": "Мужской",
+            "for_who_female": "Женский",
+            "for_who_unisex": "Унисекс",
+        }
+        if not value:
+            return "Унисекс"
+        return mapping.get(value, value)
+
+    async def _export_contact_row(
+        message: Message,
+        phone_number: str,
+        gender_value: str | None,
+    ) -> None:
+        if not phone_number:
+            return
+        user = message.from_user
+        first_name = getattr(user, "first_name", "") or ""
+        username = getattr(user, "username", None)
+        if username:
+            link = f"https://t.me/{username}"
+        else:
+            link = f"tg://user?id={user.id}"
+        record = ContactRecord(
+            first_name=first_name,
+            phone_number=phone_number,
+            telegram_link=link,
+            gender=_map_gender_label(gender_value),
+        )
+        await contact_exporter.export_contact(record)
+
     async def _store_contact(
         message: Message,
         state: FSMContext,
         phone_e164: str,
         *,
         source: str,
+        original_phone: str | None = None,
     ) -> None:
         user = message.from_user
         user_id = user.id
@@ -482,6 +520,12 @@ def setup_router(
         await repository.set_contact_never(user_id, False)
         full_name = getattr(user, "full_name", None)
         username = getattr(user, "username", None)
+        state_data = await state.get_data()
+        await _export_contact_row(
+            message,
+            original_phone or phone_e164,
+            state_data.get("gender"),
+        )
         if changed:
             await _export_lead(
                 user_id,
@@ -844,7 +888,13 @@ def setup_router(
                 msg.ASK_PHONE_INVALID,
             )
             return
-        await _store_contact(message, state, normalized, source="share_button")
+        await _store_contact(
+            message,
+            state,
+            normalized,
+            source="share_button",
+            original_phone=contact.phone_number,
+        )
 
     @router.message(StateFilter(ContactRequest.waiting_for_phone), F.text)
     async def contact_text(message: Message, state: FSMContext) -> None:

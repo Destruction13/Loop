@@ -278,6 +278,15 @@ class StubLeadsExporter:
         return True
 
 
+class StubContactExporter:
+    def __init__(self) -> None:
+        self.records: list[Any] = []
+
+    async def export_contact(self, record: Any) -> bool:
+        self.records.append(record)
+        return True
+
+
 class StubCollageBuilder:
     def __init__(self) -> None:
         self.calls: list[list[Optional[str]]] = []
@@ -313,6 +322,7 @@ def build_router(
     storage = StubStorage(tmp_path / "uploads")
     builder = collage_builder or StubCollageBuilder()
     leads_exporter = StubLeadsExporter()
+    contact_exporter = StubContactExporter()
     collage_config = CollageConfig(
         width=1600,
         height=800,
@@ -340,6 +350,7 @@ def build_router(
         contact_reward_rub=1000,
         promo_contact_code="PROMO1000",
         leads_exporter=leads_exporter,
+        contact_exporter=contact_exporter,
     )
     return router, repository, tryon, builder, recommender
 
