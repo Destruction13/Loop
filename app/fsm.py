@@ -457,6 +457,14 @@ def setup_router(
                     followup_text = "".join(caption_source)
                 else:
                     followup_text = str(caption_source)
+                await state.set_state(TryOnStates.AWAITING_PHOTO)
+                await state.update_data(
+                    upload=None,
+                    current_models=[],
+                    last_batch=[],
+                    preload_message_id=None,
+                    generation_message_id=None,
+                )
                 await _send_aux_message(
                     message,
                     state,
@@ -933,6 +941,40 @@ def setup_router(
                         message.message_id,
                         exc,
                     )
+        gen_count = await repository.get_generation_count(user_id)
+        if gen_count >= 1:
+            if remove_idle_reminder and message:
+                try:
+                    await message.bot.delete_message(message.chat.id, message.message_id)
+                except TelegramBadRequest as exc:
+                    logger.debug(
+                        "Failed to delete idle reminder message %s: %s",
+                        message.message_id,
+                        exc,
+                    )
+            prompt_source = msg.NEXT_RESULT_CAPTION
+            if isinstance(prompt_source, (list, tuple)):
+                prompt_text = "".join(prompt_source)
+            else:
+                prompt_text = str(prompt_source)
+            await state.set_state(TryOnStates.AWAITING_PHOTO)
+            await state.update_data(
+                upload=None,
+                current_models=[],
+                last_batch=[],
+                preload_message_id=None,
+                generation_message_id=None,
+            )
+            if message:
+                await _send_aux_message(
+                    message,
+                    state,
+                    message.answer,
+                    prompt_text,
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+            await callback.answer()
+            return
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)

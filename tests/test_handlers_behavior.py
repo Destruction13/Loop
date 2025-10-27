@@ -164,6 +164,9 @@ class StubRepository:
     async def mark_idle_reminder_sent(self, user_id: int) -> None:
         return None
 
+    async def get_generation_count(self, user_id: int) -> int:
+        return self.gen_counts.get(user_id, 0)
+
     async def increment_generation_count(self, user_id: int) -> int:
         self.gen_counts[user_id] = self.gen_counts.get(user_id, 0) + 1
         return self.gen_counts[user_id]
@@ -586,6 +589,13 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         callback_follow = DummyCallback("more|1", upload_message)
         handler_more = get_callback_handler(router, "result_more")
         await handler_more(callback_follow, state)
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert upload_message.answers[-1][0] == "".join(msg.NEXT_RESULT_CAPTION)
+        assert isinstance(upload_message.answers[-1][1], ReplyKeyboardRemove)
+
+        upload_message.photo = [PhotoStub("upload2")]  # type: ignore[attr-defined]
+        await handler_photo(upload_message, state)
+
         callback_second = DummyCallback("pick:src=batch2:m1", upload_message)
         await handler_choose(callback_second, state)
         assert upload_message.answer_photos[-1][1] == "".join(msg.NEXT_RESULT_CAPTION)
@@ -668,8 +678,13 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
 
         more_callback = DummyCallback("more|1", message)
         await handler_more(more_callback, state)
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert message.answers[-1][0] == "".join(msg.NEXT_RESULT_CAPTION)
+        assert isinstance(message.answers[-1][1], ReplyKeyboardRemove)
+
+        message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]
+        await handler_photo(message, state)
         assert repository.gen_counts[777] == 1
-        assert not any(msg.ASK_PHONE_TITLE in text for text, _ in message.answers)
 
         second_callback = DummyCallback("pick:src=batch2:m1", message)
         await handler_choose(second_callback, state)
@@ -677,6 +692,12 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
 
         more_callback_second = DummyCallback("more|1", message)
         await handler_more(more_callback_second, state)
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert message.answers[-1][0] == "".join(msg.NEXT_RESULT_CAPTION)
+        assert isinstance(message.answers[-1][1], ReplyKeyboardRemove)
+
+        message.photo = [PhotoStub("photo3")]  # type: ignore[attr-defined]
+        await handler_photo(message, state)
 
         assert state.state is ContactRequest.waiting_for_phone
         assert message.answers[-1][0].startswith(f"<b>{msg.ASK_PHONE_TITLE}")
@@ -722,8 +743,16 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
         await handler_photo(message, state)
         await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
         await handler_more(DummyCallback("more|1", message), state)
+        assert state.state is TryOnStates.AWAITING_PHOTO
+
+        message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]
+        await handler_photo(message, state)
         await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
         await handler_more(DummyCallback("more|1", message), state)
+        assert state.state is TryOnStates.AWAITING_PHOTO
+
+        message.photo = [PhotoStub("photo3")]  # type: ignore[attr-defined]
+        await handler_photo(message, state)
 
         assert state.state is ContactRequest.waiting_for_phone
         photos_before = list(message.answer_photos)
@@ -733,7 +762,7 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
 
         await contact_handler(contact_message, state)
 
-        assert state.state is TryOnStates.RESULT
+        assert state.state is TryOnStates.AWAITING_PHOTO
         assert list(message.answer_photos) == photos_before
         assert contact_message.answers[0][0] == msg.ASK_PHONE_THANKS.format(
             rub=1000, promo="PROMO1000"
