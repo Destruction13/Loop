@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.keyboards import batch_selection_keyboard, generation_result_keyboard
+from app.texts import messages as msg
 
 
 def test_batch_selection_keyboard_contains_expected_buttons() -> None:
@@ -73,11 +74,15 @@ def test_batch_selection_keyboard_single_model() -> None:
 def test_generation_result_keyboard_with_remaining_options() -> None:
     keyboard = generation_result_keyboard("https://example.com", 3)
 
-    assert len(keyboard.inline_keyboard) == 1
-    buttons = keyboard.inline_keyboard[0]
-    assert len(buttons) == 2
-    assert buttons[0].url == "https://example.com"
-    assert buttons[1].callback_data == "more|3"
+    assert len(keyboard.inline_keyboard) == 2
+    details_row = keyboard.inline_keyboard[0]
+    more_row = keyboard.inline_keyboard[1]
+    assert [button.text for button in details_row] == [msg.DETAILS_BUTTON_TEXT]
+    assert [button.text for button in more_row] == [
+        f"{msg.MORE_VARIANTS_BUTTON_TEXT} (осталось 3)"
+    ]
+    assert details_row[0].url == "https://example.com"
+    assert more_row[0].callback_data == "more|3"
 
 
 def test_generation_result_keyboard_without_remaining_options() -> None:

@@ -52,12 +52,6 @@ def gender_keyboard() -> InlineKeyboardMarkup:
                     callback_data="gender_female",
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    text=msg.GENDER_BUTTON_UNISEX,
-                    callback_data="gender_unisex",
-                )
-            ],
         ]
     )
 
@@ -96,15 +90,17 @@ def _truncate_title(title: str, max_length: int) -> str:
 def generation_result_keyboard(site_url: str, remaining: int) -> InlineKeyboardMarkup:
     """Keyboard attached to the generation result message."""
 
-    buttons = [InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, url=site_url)]
+    rows = [[InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, url=site_url)]]
     if remaining > 0:
-        buttons.append(
-            InlineKeyboardButton(
-                text=f"{msg.MORE_VARIANTS_BUTTON_TEXT} (осталось {remaining})",
-                callback_data=f"more|{remaining}",
-            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{msg.MORE_VARIANTS_BUTTON_TEXT} (осталось {remaining})",
+                    callback_data=f"more|{remaining}",
+                )
+            ]
         )
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def limit_reached_keyboard(site_url: str) -> InlineKeyboardMarkup:
@@ -190,6 +186,25 @@ def idle_reminder_keyboard(site_url: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text=msg.IDLE_REMINDER_BUTTON_GO_SITE,
                     url=site_url,
+                )
+            ],
+        ]
+    )
+
+
+def social_ad_keyboard(
+    instagram_url: str, tiktok_url: str
+) -> InlineKeyboardMarkup:
+    """Keyboard shown in social media advertisement messages."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=msg.SOCIAL_AD_BTN_INST, url=instagram_url)],
+            [InlineKeyboardButton(text=msg.SOCIAL_AD_BTN_TIKTOK, url=tiktok_url)],
+            [
+                InlineKeyboardButton(
+                    text=msg.SOCIAL_AD_BTN_TRY,
+                    callback_data="more|social",
                 )
             ],
         ]

@@ -924,11 +924,11 @@ def setup_router(
                 await state.set_state(TryOnStates.RESULT)
         logger.info("%s Generation succeeded for %s", EVENT_ID["GENERATION_SUCCESS"], user_id)
 
-    @router.callback_query(StateFilter(TryOnStates.RESULT), F.data.startswith("more|"))
+    @router.callback_query(F.data.startswith("more|"))
     async def result_more(callback: CallbackQuery, state: FSMContext) -> None:
         user_id = callback.from_user.id
         message = callback.message
-        remove_idle_reminder = callback.data == "more|idle"
+        remove_source_message = callback.data in {"more|idle", "more|social"}
         if message:
             current_markup = getattr(message, "reply_markup", None)
             updated_markup = _remove_more_button_from_markup(current_markup)
@@ -943,12 +943,12 @@ def setup_router(
                     )
         gen_count = await repository.get_generation_count(user_id)
         if gen_count >= 1:
-            if remove_idle_reminder and message:
+            if remove_source_message and message:
                 try:
                     await message.bot.delete_message(message.chat.id, message.message_id)
                 except TelegramBadRequest as exc:
                     logger.debug(
-                        "Failed to delete idle reminder message %s: %s",
+                        "Failed to delete reminder message %s: %s",
                         message.message_id,
                         exc,
                     )
@@ -1002,12 +1002,12 @@ def setup_router(
             msg.SEARCHING_MODELS_PROMPT,
         )
         await state.update_data(preload_message_id=preload_message.message_id)
-        if remove_idle_reminder and message:
+        if remove_source_message and message:
             try:
                 await message.bot.delete_message(message.chat.id, message.message_id)
             except TelegramBadRequest as exc:
                 logger.debug(
-                    "Failed to delete idle reminder message %s: %s",
+                    "Failed to delete reminder message %s: %s",
                     message.message_id,
                     exc,
                 )

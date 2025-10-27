@@ -59,6 +59,10 @@ class Config:
     leads_sheet_name: str
     enable_leads_export: bool
     enable_idle_reminder: bool
+    social_ad_minutes: int
+    enable_social_ad: bool
+    social_instagram_url: str
+    social_tiktok_url: str
 
 
 def _get(name: str, default: Optional[str] = None, *, required: bool = False) -> Optional[str]:
@@ -157,6 +161,12 @@ def load_config(env_file: str | None = None) -> Config:
         leads_sheet_name=leads_sheet_name,
         enable_leads_export=enable_leads_export,
         enable_idle_reminder=_as_bool(_get("ENABLE_IDLE_REMINDER", "1"), True),
+        social_ad_minutes=_as_int(_get("SOCIAL_AD_MINUTES", "20"), 20),
+        enable_social_ad=_as_bool(_get("ENABLE_SOCIAL_AD", "1"), True),
+        social_instagram_url=_get("SOCIAL_INSTAGRAM_URL", "https://instagram.com/loov")
+        or "https://instagram.com/loov",
+        social_tiktok_url=_get("SOCIAL_TIKTOK_URL", "https://tiktok.com/@loov")
+        or "https://tiktok.com/@loov",
     )
 
 

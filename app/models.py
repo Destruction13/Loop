@@ -45,6 +45,7 @@ class UserProfile:
     contact_never: bool = False
     last_activity_ts: int = 0
     idle_reminder_sent: bool = False
+    social_ad_shown: bool = False
 
     def remaining(self, limit: int) -> int:
         """Return remaining tries for the day."""
