@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from app.keyboards import batch_selection_keyboard, generation_result_keyboard
+from app.keyboards import (
+    batch_selection_keyboard,
+    generation_result_keyboard,
+    main_reply_keyboard,
+)
 from app.texts import messages as msg
 
 
@@ -92,3 +96,14 @@ def test_generation_result_keyboard_without_remaining_options() -> None:
     buttons = keyboard.inline_keyboard[0]
     assert len(buttons) == 1
     assert buttons[0].url == "https://example.com"
+
+
+def test_main_reply_keyboard_layout() -> None:
+    keyboard = main_reply_keyboard()
+
+    assert keyboard.resize_keyboard is True
+    assert keyboard.one_time_keyboard is False
+    assert [[button.text for button in row] for row in keyboard.keyboard] == [
+        [msg.MAIN_MENU_TRY_BUTTON],
+        [msg.MAIN_MENU_POLICY_BUTTON],
+    ]
