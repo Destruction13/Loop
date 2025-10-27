@@ -715,23 +715,34 @@ def setup_router(
                     except ValueError:
                         pass
         await state.set_state(TryOnStates.START)
-        await _send_aux_message(
-            message,
-            state,
-            message.answer,
-            msg.START_WELCOME,
-            reply_markup=start_keyboard(),
-        )
         promo_video_path = Path("video") / "promo_start.mp4"
+        start_message_sent = False
         if promo_video_path.exists():
             try:
-                await message.answer_video(video=FSInputFile(promo_video_path))
+                await _send_aux_message(
+                    message,
+                    state,
+                    message.answer_video,
+                    video=FSInputFile(promo_video_path),
+                    caption=msg.START_WELCOME,
+                    reply_markup=start_keyboard(),
+                )
+                start_message_sent = True
             except TelegramBadRequest as exc:
                 logger.error(
                     "Failed to send promo video from %s: %s", promo_video_path, exc
                 )
         else:
             logger.warning("Promo video not found at %s", promo_video_path)
+
+        if not start_message_sent:
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.START_WELCOME,
+                reply_markup=start_keyboard(),
+            )
         await _send_delivery_message(
             message,
             state,
