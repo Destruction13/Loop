@@ -939,19 +939,27 @@ def setup_router(
             first_generated_today=data.get("first_generated_today", True),
             remaining=remaining,
         )
+        gen_count_before = await repository.get_generation_count(user_id)
+        is_second_generation = gen_count_before == 1
         caption_source = (
             msg.FIRST_RESULT_CAPTION
             if data.get("first_generated_today", True)
             else msg.NEXT_RESULT_CAPTION
         )
         caption_text = _render_text(caption_source)
-        result_markup = generation_result_keyboard(
-            model.site_url, plan.remaining
-        )
+        result_has_more = plan.remaining > 0
+        keyboard_remaining = plan.remaining if result_has_more else 0
         if plan.outcome is GenerationOutcome.LIMIT:
-            limit_text = _render_text(msg.DAILY_LIMIT_MESSAGE)
-            caption_text = f"{model.title}\n\n{limit_text}"
-            result_markup = limit_reached_keyboard(site_url)
+            caption_text = model.title
+            result_has_more = False
+            keyboard_remaining = 0
+        elif is_second_generation:
+            caption_text = model.title
+            result_has_more = False
+            keyboard_remaining = 0
+        result_markup = generation_result_keyboard(
+            model.site_url, keyboard_remaining
+        )
         result_message = await _send_delivery_message(
             message,
             state,
@@ -964,18 +972,27 @@ def setup_router(
             state,
             result_message,
             model,
-            has_more=plan.remaining > 0,
+            has_more=result_has_more,
             source_message_id=message.message_id,
         )
-        await repository.increment_generation_count(user_id)
+        new_gen_count = await repository.increment_generation_count(user_id)
         await _delete_state_message(message, state, "generation_message_id")
         new_flag = next_first_flag_value(
             data.get("first_generated_today", True), plan.outcome
         )
         await state.update_data(first_generated_today=new_flag)
-        contact_active = data.get("contact_request_active", False)
+        contact_data = await state.get_data()
+        contact_active_before = contact_data.get("contact_request_active", False)
         if plan.outcome is GenerationOutcome.LIMIT:
-            if contact_active:
+            limit_text = _render_text(msg.DAILY_LIMIT_MESSAGE)
+            await _send_delivery_message(
+                message,
+                state,
+                message.answer,
+                limit_text,
+                reply_markup=limit_reached_keyboard(site_url),
+            )
+            if contact_active_before:
                 await state.update_data(contact_pending_result_state="limit")
             else:
                 await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
@@ -983,9 +1000,28 @@ def setup_router(
                 "%s Limit reached post generation %s", EVENT_ID["LIMIT_REACHED"], user_id
             )
         else:
-            if contact_active:
+            contact_requested_now = False
+            if (
+                not contact_active_before
+                and new_gen_count >= CONTACT_INITIAL_TRIGGER
+                and (is_second_generation or new_gen_count == CONTACT_INITIAL_TRIGGER)
+            ):
+                contact_requested_now = await _maybe_request_contact(
+                    message,
+                    state,
+                    user_id,
+                    origin_state=TryOnStates.RESULT.state,
+                )
+                if contact_requested_now:
+                    logger.info(
+                        "%s Contact requested post generation %s",
+                        EVENT_ID["MODELS_SENT"],
+                        user_id,
+                    )
+
+            if contact_active_before and not contact_requested_now:
                 await state.update_data(contact_pending_result_state="result")
-            else:
+            elif not contact_requested_now:
                 await state.set_state(TryOnStates.RESULT)
         logger.info("%s Generation succeeded for %s", EVENT_ID["GENERATION_SUCCESS"], user_id)
 

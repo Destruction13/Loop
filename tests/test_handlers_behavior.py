@@ -10,7 +10,11 @@ from PIL import Image
 
 from app.config import CollageConfig
 from app.fsm import ContactRequest, TryOnStates, setup_router
-from app.keyboards import main_reply_keyboard
+from app.keyboards import (
+    contact_request_keyboard,
+    limit_reached_keyboard,
+    main_reply_keyboard,
+)
 from app.models import GlassModel
 from app.services.collage import CollageProcessingError, CollageSourceUnavailable
 from app.services.recommendation import RecommendationResult
@@ -636,7 +640,16 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
 
         callback_second = DummyCallback("pick:src=batch2:m1", upload_message)
         await handler_choose(callback_second, state)
-        assert upload_message.answer_photos[-1][1] == "".join(msg.NEXT_RESULT_CAPTION)
+        second_result = upload_message.answer_photos[-1]
+        assert second_result[1] == model.title
+        assert isinstance(second_result[2], InlineKeyboardMarkup)
+        assert [
+            button.text for button in second_result[2].inline_keyboard[0]
+        ] == [msg.DETAILS_BUTTON_TEXT]
+        assert state.state is ContactRequest.waiting_for_phone
+        assert upload_message.answers[-1][0].startswith(
+            f"<b>{msg.ASK_PHONE_TITLE}"
+        )
 
     asyncio.run(scenario())
 
@@ -728,17 +741,18 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
         await handler_choose(second_callback, state)
         assert repository.gen_counts[777] == 2
 
-        more_callback_second = DummyCallback("more|1", message)
-        await handler_more(more_callback_second, state)
-        assert state.state is TryOnStates.AWAITING_PHOTO
-        assert message.answers[-1][0] == "".join(msg.NEXT_RESULT_CAPTION)
-        assert_main_menu_keyboard(message.answers[-1][1])
-
-        message.photo = [PhotoStub("photo3")]  # type: ignore[attr-defined]
-        await handler_photo(message, state)
-
+        second_result = message.answer_photos[-1]
+        assert second_result[1] == models[0].title
+        assert isinstance(second_result[2], InlineKeyboardMarkup)
+        assert [
+            button.text for button in second_result[2].inline_keyboard[0]
+        ] == [msg.DETAILS_BUTTON_TEXT]
         assert state.state is ContactRequest.waiting_for_phone
         assert message.answers[-1][0].startswith(f"<b>{msg.ASK_PHONE_TITLE}")
+        assert (
+            message.answers[-1][1].keyboard
+            == contact_request_keyboard().keyboard
+        )
 
     asyncio.run(scenario())
 
@@ -786,11 +800,6 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
         message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]
         await handler_photo(message, state)
         await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
-        await handler_more(DummyCallback("more|1", message), state)
-        assert state.state is TryOnStates.AWAITING_PHOTO
-
-        message.photo = [PhotoStub("photo3")]  # type: ignore[attr-defined]
-        await handler_photo(message, state)
 
         assert state.state is ContactRequest.waiting_for_phone
         photos_before = list(message.answer_photos)
@@ -808,6 +817,52 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
         assert_main_menu_keyboard(contact_message.answers[0][1])
         assert contact_message.answers[1][0] == "".join(msg.NEXT_RESULT_CAPTION)
         assert_main_menu_keyboard(contact_message.answers[1][1])
+
+    asyncio.run(scenario())
+
+
+def test_limit_result_sends_card_and_summary_message(tmp_path: Path) -> None:
+    model = GlassModel(
+        unique_id="m1",
+        title="Model 1",
+        model_code="M1",
+        site_url="https://example.com/1",
+        img_user_url="https://example.com/1.jpg",
+        img_nano_url="https://example.com/1-nano.jpg",
+        gender="Мужской",
+    )
+
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path, models=[model])
+        repository.daily_limit = 1
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=999, bot=bot)
+        message.photo = [PhotoStub("limit-photo")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler_photo(message, state)
+        await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
+
+        result_photo = message.answer_photos[-1]
+        assert result_photo[1] == model.title
+        assert isinstance(result_photo[2], InlineKeyboardMarkup)
+        assert [
+            button.text for button in result_photo[2].inline_keyboard[0]
+        ] == [msg.DETAILS_BUTTON_TEXT]
+
+        limit_message = message.answers[-1]
+        assert limit_message[0] == "".join(msg.DAILY_LIMIT_MESSAGE)
+        expected_markup = limit_reached_keyboard("https://example.com")
+        assert isinstance(limit_message[1], InlineKeyboardMarkup)
+        assert (
+            limit_message[1].inline_keyboard
+            == expected_markup.inline_keyboard
+        )
+        assert state.state is TryOnStates.DAILY_LIMIT_REACHED
 
     asyncio.run(scenario())
 
