@@ -107,12 +107,12 @@ def generation_result_keyboard(site_url: str, remaining: int) -> InlineKeyboardM
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
-def limit_reached_keyboard(landing_url: str) -> InlineKeyboardMarkup:
+def limit_reached_keyboard(site_url: str) -> InlineKeyboardMarkup:
     """Keyboard displayed when daily limit is reached."""
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=msg.BOOKING_BUTTON_TEXT, url=landing_url)],
+            [InlineKeyboardButton(text=msg.BOOKING_BUTTON_TEXT, url=site_url)],
             [
                 InlineKeyboardButton(
                     text=msg.PROMO_BUTTON_TEXT,
@@ -129,12 +129,12 @@ def limit_reached_keyboard(landing_url: str) -> InlineKeyboardMarkup:
     )
 
 
-def promo_keyboard(landing_url: str) -> InlineKeyboardMarkup:
+def promo_keyboard(site_url: str) -> InlineKeyboardMarkup:
     """Keyboard attached to the promo code message."""
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=msg.BOOKING_BUTTON_TEXT, url=landing_url)],
+            [InlineKeyboardButton(text=msg.BOOKING_BUTTON_TEXT, url=site_url)],
             [
                 InlineKeyboardButton(
                     text=msg.REMIND_LATER_BUTTON_TEXT,
@@ -175,7 +175,7 @@ def reminder_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def idle_reminder_keyboard(landing_url: str) -> InlineKeyboardMarkup:
+def idle_reminder_keyboard(site_url: str) -> InlineKeyboardMarkup:
     """Keyboard shown in idle reminder messages."""
 
     return InlineKeyboardMarkup(
@@ -189,14 +189,14 @@ def idle_reminder_keyboard(landing_url: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text=msg.IDLE_REMINDER_BUTTON_GO_SITE,
-                    url=landing_url,
+                    url=site_url,
                 )
             ],
         ]
     )
 
 
-def all_seen_keyboard(landing_url: str) -> InlineKeyboardMarkup:
+def all_seen_keyboard(site_url: str) -> InlineKeyboardMarkup:
     """Keyboard shown when подборки закончились."""
 
     return InlineKeyboardMarkup(
@@ -208,7 +208,7 @@ def all_seen_keyboard(landing_url: str) -> InlineKeyboardMarkup:
                 ),
                 InlineKeyboardButton(
                     text=msg.BOOKING_BUTTON_TEXT,
-                    url=landing_url,
+                    url=site_url,
                 ),
             ]
         ]

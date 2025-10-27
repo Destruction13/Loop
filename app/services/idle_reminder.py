@@ -23,13 +23,13 @@ class IdleReminderService:
         *,
         bot: Bot,
         repository: Repository,
-        landing_url: str,
+        site_url: str,
         timeout_minutes: int,
         interval_seconds: int = 30,
     ) -> None:
         self._bot = bot
         self._repository = repository
-        self._landing_url = landing_url
+        self._site_url = site_url
         self._timeout_seconds = max(timeout_minutes * 60, 0)
         self._interval = max(interval_seconds, 1)
         self._task: Optional[asyncio.Task] = None
@@ -84,7 +84,7 @@ class IdleReminderService:
 
     async def _send_reminder(self, user_id: int) -> None:
         text = f"<b>{msg.IDLE_REMINDER_TITLE}</b>\n{msg.IDLE_REMINDER_BODY}"
-        keyboard = idle_reminder_keyboard(self._landing_url)
+        keyboard = idle_reminder_keyboard(self._site_url)
         try:
             await self._bot.send_message(
                 chat_id=user_id,

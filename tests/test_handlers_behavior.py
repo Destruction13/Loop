@@ -302,7 +302,7 @@ def build_router(
         batch_size=2,
         reminder_hours=24,
         selection_button_title_max=28,
-        landing_url="https://example.com",
+        site_url="https://example.com",
         promo_code="PROMO",
         no_more_message_key="all_seen",
         contact_reward_rub=1000,
@@ -589,6 +589,38 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         callback_second = DummyCallback("pick:src=batch2:m1", upload_message)
         await handler_choose(callback_second, state)
         assert upload_message.answer_photos[-1][1] == "".join(msg.NEXT_RESULT_CAPTION)
+
+    asyncio.run(scenario())
+
+
+def test_idle_reminder_message_removed_when_user_requests_more(tmp_path: Path) -> None:
+    models = [
+        GlassModel(
+            unique_id="m1",
+            title="Model 1",
+            model_code="M1",
+            site_url="https://example.com/1",
+            img_user_url="https://example.com/1.jpg",
+            img_nano_url="https://example.com/1-nano.jpg",
+            gender="Мужской",
+        )
+    ]
+
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path, models=models)
+        handler_more = get_callback_handler(router, "result_more")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=555, bot=bot)
+        state = DummyState()
+        await state.update_data(gender="male")
+        await state.set_state(TryOnStates.RESULT)
+
+        callback = DummyCallback("more|idle", message)
+        await handler_more(callback, state)
+
+        assert message.answers[-1][0] == msg.SEARCHING_MODELS_PROMPT
+        assert (555, message.message_id) in bot.deleted
 
     asyncio.run(scenario())
 

@@ -86,7 +86,7 @@ async def main() -> None:
         batch_size=config.batch_size,
         reminder_hours=config.reminder_hours,
         selection_button_title_max=config.button_title_max,
-        landing_url=str(config.landing_url),
+        site_url=str(config.site_url),
         promo_code=config.promo_code,
         no_more_message_key=config.reco_no_more_key,
         contact_reward_rub=config.contact_reward_rub,
@@ -109,7 +109,7 @@ async def main() -> None:
         idle_reminder = IdleReminderService(
             bot=bot,
             repository=repository,
-            landing_url=str(config.landing_url),
+            site_url=str(config.site_url),
             timeout_minutes=config.idle_reminder_minutes,
             interval_seconds=30,
         )

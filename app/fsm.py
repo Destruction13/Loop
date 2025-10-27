@@ -130,7 +130,7 @@ def setup_router(
     batch_size: int,
     reminder_hours: int,
     selection_button_title_max: int,
-    landing_url: str,
+    site_url: str,
     promo_code: str,
     no_more_message_key: str,
     contact_reward_rub: int,
@@ -303,7 +303,7 @@ def setup_router(
                 state,
                 message.answer,
                 marketing_message,
-                reply_markup=all_seen_keyboard(landing_url),
+                reply_markup=all_seen_keyboard(site_url),
             )
             await state.update_data(current_models=[], last_batch=[])
             await _delete_state_message(message, state, "preload_message_id")
@@ -322,7 +322,7 @@ def setup_router(
                 state,
                 message.answer,
                 marketing_message,
-                reply_markup=all_seen_keyboard(landing_url),
+                reply_markup=all_seen_keyboard(site_url),
             )
         return True
 
@@ -673,7 +673,7 @@ def setup_router(
                 state,
                 message.answer,
                 msg.DAILY_LIMIT_MESSAGE,
-                reply_markup=limit_reached_keyboard(landing_url),
+                reply_markup=limit_reached_keyboard(site_url),
             )
             logger.info("%s Limit reached for user %s", EVENT_ID["LIMIT_REACHED"], user_id)
             return
@@ -730,7 +730,7 @@ def setup_router(
                 state,
                 callback.message.answer,
                 msg.DAILY_LIMIT_MESSAGE,
-                reply_markup=limit_reached_keyboard(landing_url),
+            reply_markup=limit_reached_keyboard(site_url),
             )
             await callback.answer()
             return
@@ -885,7 +885,7 @@ def setup_router(
         )
         if plan.outcome is GenerationOutcome.LIMIT:
             caption_text = f"{caption_text}\n\n{msg.DAILY_LIMIT_MESSAGE}"
-            result_markup = limit_reached_keyboard(landing_url)
+            result_markup = limit_reached_keyboard(site_url)
         await _send_delivery_message(
             message,
             state,
@@ -920,6 +920,7 @@ def setup_router(
     async def result_more(callback: CallbackQuery, state: FSMContext) -> None:
         user_id = callback.from_user.id
         message = callback.message
+        remove_idle_reminder = callback.data == "more|idle"
         if message:
             current_markup = getattr(message, "reply_markup", None)
             updated_markup = _remove_more_button_from_markup(current_markup)
@@ -940,7 +941,7 @@ def setup_router(
                 state,
                 callback.message.answer,
                 msg.DAILY_LIMIT_MESSAGE,
-                reply_markup=limit_reached_keyboard(landing_url),
+                reply_markup=limit_reached_keyboard(site_url),
             )
             await callback.answer()
             return
@@ -959,6 +960,15 @@ def setup_router(
             msg.SEARCHING_MODELS_PROMPT,
         )
         await state.update_data(preload_message_id=preload_message.message_id)
+        if remove_idle_reminder and message:
+            try:
+                await message.bot.delete_message(message.chat.id, message.message_id)
+            except TelegramBadRequest as exc:
+                logger.debug(
+                    "Failed to delete idle reminder message %s: %s",
+                    message.message_id,
+                    exc,
+                )
         await _send_models(
             callback.message,
             user_id,
@@ -976,7 +986,7 @@ def setup_router(
             state,
             callback.message.answer,
             text,
-            reply_markup=promo_keyboard(landing_url),
+            reply_markup=promo_keyboard(site_url),
         )
         await callback.answer()
 
