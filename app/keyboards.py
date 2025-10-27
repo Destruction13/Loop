@@ -175,6 +175,27 @@ def reminder_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def idle_reminder_keyboard(landing_url: str) -> InlineKeyboardMarkup:
+    """Keyboard shown in idle reminder messages."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=msg.MORE_VARIANTS_BUTTON_TEXT,
+                    callback_data="more|idle",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=msg.IDLE_REMINDER_BUTTON_GO_SITE,
+                    url=landing_url,
+                )
+            ],
+        ]
+    )
+
+
 def all_seen_keyboard(landing_url: str) -> InlineKeyboardMarkup:
     """Keyboard shown when подборки закончились."""
 

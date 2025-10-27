@@ -43,6 +43,8 @@ class UserProfile:
     gen_count: int = 0
     contact_skip_once: bool = False
     contact_never: bool = False
+    last_activity_ts: int = 0
+    idle_reminder_sent: bool = False
 
     def remaining(self, limit: int) -> int:
         """Return remaining tries for the day."""

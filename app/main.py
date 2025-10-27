@@ -15,6 +15,7 @@ from app.logging_conf import EVENT_ID, setup_logging
 from app.services.catalog_google import GoogleCatalogConfig, GoogleSheetCatalog
 from app.services.collage import build_three_tile_collage
 from app.services.leads_export import LeadsExporter
+from app.services.idle_reminder import IdleReminderService
 from app.services.repository import Repository
 from app.services.scheduler import ReminderScheduler
 from app.services.storage_local import LocalStorage
@@ -103,11 +104,24 @@ async def main() -> None:
     )
     scheduler.start()
 
+    idle_reminder: IdleReminderService | None = None
+    if config.enable_idle_reminder:
+        idle_reminder = IdleReminderService(
+            bot=bot,
+            repository=repository,
+            landing_url=str(config.landing_url),
+            timeout_minutes=config.idle_reminder_minutes,
+            interval_seconds=30,
+        )
+        idle_reminder.start()
+
     logger.info("%s Bot started", EVENT_ID["START"])
     try:
         await dp.start_polling(bot)
     finally:
         await scheduler.stop()
+        if idle_reminder is not None:
+            await idle_reminder.stop()
         await catalog_service.aclose()
         await bot.session.close()
 

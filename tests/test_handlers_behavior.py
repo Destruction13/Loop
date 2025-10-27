@@ -113,6 +113,7 @@ class StubRepository:
         self.contact_skip: dict[int, bool] = {}
         self.contact_never: dict[int, bool] = {}
         self.contacts: dict[int, Any] = {}
+        self.activity: list[int] = []
 
     async def ensure_user(self, user_id: int) -> Any:
         return SimpleNamespace(
@@ -153,6 +154,15 @@ class StubRepository:
 
     async def inc_used_on_success(self, user_id: int) -> None:
         self.daily_used += 1
+
+    async def touch_activity(self, user_id: int) -> None:
+        self.activity.append(user_id)
+
+    async def list_idle_reminder_candidates(self, threshold_ts: int) -> list[Any]:
+        return []
+
+    async def mark_idle_reminder_sent(self, user_id: int) -> None:
+        return None
 
     async def increment_generation_count(self, user_id: int) -> int:
         self.gen_counts[user_id] = self.gen_counts.get(user_id, 0) + 1

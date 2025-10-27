@@ -39,6 +39,7 @@ class Config:
     promo_code: str
     daily_try_limit: int
     reminder_hours: int
+    idle_reminder_minutes: int
     csv_fetch_ttl_sec: int
     csv_fetch_retries: int
     mock_tryon: bool
@@ -57,6 +58,7 @@ class Config:
     promo_contact_code: str
     leads_sheet_name: str
     enable_leads_export: bool
+    enable_idle_reminder: bool
 
 
 def _get(name: str, default: Optional[str] = None, *, required: bool = False) -> Optional[str]:
@@ -122,10 +124,11 @@ def load_config(env_file: str | None = None) -> Config:
     return Config(
         bot_token=_get("BOT_TOKEN", required=True),
         sheet_csv_url=_get("SHEET_CSV_URL", DEFAULT_SHEET_URL) or DEFAULT_SHEET_URL,
-        landing_url=_get("LANDING_URL", "https://example.com/booking") or "https://example.com/booking",
+        landing_url=_get("LANDING_URL", "https://loov.ru/") or "https://loov.ru/",
         promo_code=promo_code,
         daily_try_limit=_as_int(_get("DAILY_TRY_LIMIT", "7"), 7),
         reminder_hours=_as_int(_get("REMINDER_HOURS", "24"), 24),
+        idle_reminder_minutes=_as_int(_get("IDLE_REMINDER_MINUTES", "5"), 5),
         csv_fetch_ttl_sec=_as_int(_get("CSV_FETCH_TTL_SEC", "60"), 60),
         csv_fetch_retries=_as_int(_get("CSV_FETCH_RETRIES", "3"), 3),
         mock_tryon=_as_bool(_get("MOCK_TRYON", "1"), True),
@@ -145,6 +148,7 @@ def load_config(env_file: str | None = None) -> Config:
         promo_contact_code=promo_contact_code,
         leads_sheet_name=leads_sheet_name,
         enable_leads_export=enable_leads_export,
+        enable_idle_reminder=_as_bool(_get("ENABLE_IDLE_REMINDER", "1"), True),
     )
 
 

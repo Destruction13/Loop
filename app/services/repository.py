@@ -34,7 +34,12 @@ class Repository:
     async def ensure_user(self, user_id: int) -> UserProfile:
         profile = await self.get_user(user_id)
         if profile is None:
-            profile = UserProfile(user_id=user_id, last_reset_at=datetime.now(timezone.utc))
+            now = datetime.now(timezone.utc)
+            profile = UserProfile(
+                user_id=user_id,
+                last_reset_at=now,
+                last_activity_ts=int(time.time()),
+            )
             await asyncio.to_thread(self._upsert_user, profile)
         return profile
 
@@ -56,6 +61,17 @@ class Repository:
     async def remaining_tries(self, user_id: int) -> int:
         profile = await self.ensure_daily_reset(user_id)
         return profile.remaining(self._daily_limit)
+
+    async def touch_activity(self, user_id: int, *, timestamp: Optional[int] = None) -> None:
+        await self.ensure_user(user_id)
+        ts = int(timestamp or time.time())
+        await asyncio.to_thread(self._update_last_activity_sync, user_id, ts)
+
+    async def list_idle_reminder_candidates(self, threshold_ts: int) -> List[UserProfile]:
+        return await asyncio.to_thread(self._list_idle_reminder_candidates_sync, threshold_ts)
+
+    async def mark_idle_reminder_sent(self, user_id: int) -> None:
+        await asyncio.to_thread(self._mark_idle_reminder_sent_sync, user_id)
 
     async def inc_used_on_success(self, user_id: int) -> None:
         profile = await self.ensure_daily_reset(user_id)
@@ -178,7 +194,12 @@ class Repository:
                     last_reset_at TEXT,
                     seen_models TEXT,
                     remind_at TEXT,
-                    referrer_id INTEGER
+                    referrer_id INTEGER,
+                    gen_count INTEGER NOT NULL DEFAULT 0,
+                    contact_skip_once INTEGER NOT NULL DEFAULT 0,
+                    contact_never INTEGER NOT NULL DEFAULT 0,
+                    last_activity_ts INTEGER NOT NULL DEFAULT 0,
+                    idle_reminder_sent INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -195,13 +216,7 @@ class Repository:
             self._ensure_contact_table(conn)
             conn.commit()
 
-    def _get_user_sync(self, user_id: int) -> Optional[UserProfile]:
-        with self._connection() as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-            row = cur.fetchone()
-        if not row:
-            return None
+    def _row_to_profile(self, row: sqlite3.Row) -> UserProfile:
         last_reset_at = (
             datetime.fromisoformat(row["last_reset_at"]) if row["last_reset_at"] else None
         )
@@ -220,7 +235,18 @@ class Repository:
             gen_count=row["gen_count"] if row["gen_count"] is not None else 0,
             contact_skip_once=bool(row["contact_skip_once"] or 0),
             contact_never=bool(row["contact_never"] or 0),
+            last_activity_ts=row["last_activity_ts"] if row["last_activity_ts"] else 0,
+            idle_reminder_sent=bool(row["idle_reminder_sent"] or 0),
         )
+
+    def _get_user_sync(self, user_id: int) -> Optional[UserProfile]:
+        with self._connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+        if not row:
+            return None
+        return self._row_to_profile(row)
 
     def _update_filters_sync(self, user_id: int, gender: Optional[str]) -> None:
         profile = self._get_user_sync(user_id)
@@ -247,7 +273,9 @@ class Repository:
                     referrer_id,
                     gen_count,
                     contact_skip_once,
-                    contact_never
+                    contact_never,
+                    last_activity_ts,
+                    idle_reminder_sent
                 )
                 VALUES (
                     :user_id,
@@ -261,7 +289,9 @@ class Repository:
                     :referrer_id,
                     :gen_count,
                     :contact_skip_once,
-                    :contact_never
+                    :contact_never,
+                    :last_activity_ts,
+                    :idle_reminder_sent
                 )
                 ON CONFLICT(user_id) DO UPDATE SET
                     gender=excluded.gender,
@@ -274,7 +304,9 @@ class Repository:
                     referrer_id=excluded.referrer_id,
                     gen_count=excluded.gen_count,
                     contact_skip_once=excluded.contact_skip_once,
-                    contact_never=excluded.contact_never
+                    contact_never=excluded.contact_never,
+                    last_activity_ts=excluded.last_activity_ts,
+                    idle_reminder_sent=excluded.idle_reminder_sent
                 """,
                 {
                     "user_id": data["user_id"],
@@ -291,6 +323,8 @@ class Repository:
                     "gen_count": data["gen_count"],
                     "contact_skip_once": 1 if data["contact_skip_once"] else 0,
                     "contact_never": 1 if data["contact_never"] else 0,
+                    "last_activity_ts": data["last_activity_ts"],
+                    "idle_reminder_sent": 1 if data["idle_reminder_sent"] else 0,
                 },
             )
             conn.commit()
@@ -303,12 +337,38 @@ class Repository:
                 (now.isoformat(),),
             )
             rows = cur.fetchall()
-        result = []
-        for row in rows:
-            profile = self._get_user_sync(row["user_id"])
-            if profile:
-                result.append(profile)
-        return result
+        return [self._row_to_profile(row) for row in rows]
+
+    def _list_idle_reminder_candidates_sync(self, threshold_ts: int) -> List[UserProfile]:
+        with self._connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                """
+                SELECT * FROM users
+                WHERE last_activity_ts > 0
+                  AND last_activity_ts <= ?
+                  AND idle_reminder_sent = 0
+                """,
+                (threshold_ts,),
+            )
+            rows = cur.fetchall()
+        return [self._row_to_profile(row) for row in rows]
+
+    def _update_last_activity_sync(self, user_id: int, timestamp: int) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE users SET last_activity_ts = ?, idle_reminder_sent = 0 WHERE user_id = ?",
+                (timestamp, user_id),
+            )
+            conn.commit()
+
+    def _mark_idle_reminder_sent_sync(self, user_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE users SET idle_reminder_sent = 1 WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
 
     def _record_seen_models_sync(
         self, user_id: int, model_ids: list[str], timestamp: str, context: str
@@ -478,6 +538,14 @@ class Repository:
         if "contact_never" not in columns:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN contact_never INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_activity_ts" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN last_activity_ts INTEGER NOT NULL DEFAULT 0"
+            )
+        if "idle_reminder_sent" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN idle_reminder_sent INTEGER NOT NULL DEFAULT 0"
             )
 
     def _ensure_contact_table(self, conn: sqlite3.Connection) -> None:

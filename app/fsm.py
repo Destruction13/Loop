@@ -13,7 +13,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Awaitable, Callable, List, Optional, Sequence
 
-from aiogram import F, Router
+from aiogram import BaseMiddleware, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -139,6 +139,23 @@ def setup_router(
 ) -> Router:
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
+
+    class ActivityMiddleware(BaseMiddleware):
+        """Tracks user activity timestamps."""
+
+        def __init__(self, repository: Repository) -> None:
+            super().__init__()
+            self._repository = repository
+
+        async def __call__(self, handler, event, data):
+            user = data.get("event_from_user")
+            if user:
+                await self._repository.touch_activity(user.id)
+            return await handler(event, data)
+
+    activity_middleware = ActivityMiddleware(repository)
+    router.message.middleware(activity_middleware)
+    router.callback_query.middleware(activity_middleware)
 
     async def _ensure_filters(user_id: int, state: FSMContext) -> FilterOptions:
         data = await state.get_data()
@@ -904,7 +921,8 @@ def setup_router(
         user_id = callback.from_user.id
         message = callback.message
         if message:
-            updated_markup = _remove_more_button_from_markup(message.reply_markup)
+            current_markup = getattr(message, "reply_markup", None)
+            updated_markup = _remove_more_button_from_markup(current_markup)
             if updated_markup is not None:
                 try:
                     await message.edit_reply_markup(reply_markup=updated_markup)
