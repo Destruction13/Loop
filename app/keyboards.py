@@ -35,6 +35,19 @@ def start_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def main_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Persistent reply keyboard with quick actions."""
+
+    return ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        keyboard=[
+            [KeyboardButton(text=msg.MAIN_MENU_TRY_BUTTON)],
+            [KeyboardButton(text=msg.MAIN_MENU_POLICY_BUTTON)],
+        ],
+    )
+
+
 def gender_keyboard() -> InlineKeyboardMarkup:
     """Keyboard for selecting gender."""
 
