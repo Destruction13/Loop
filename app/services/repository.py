@@ -73,6 +73,12 @@ class Repository:
     async def mark_idle_reminder_sent(self, user_id: int) -> None:
         await asyncio.to_thread(self._mark_idle_reminder_sent_sync, user_id)
 
+    async def list_social_ad_candidates(self, threshold_ts: int) -> List[UserProfile]:
+        return await asyncio.to_thread(self._list_social_ad_candidates_sync, threshold_ts)
+
+    async def mark_social_ad_shown(self, user_id: int) -> None:
+        await asyncio.to_thread(self._mark_social_ad_shown_sync, user_id)
+
     async def inc_used_on_success(self, user_id: int) -> None:
         profile = await self.ensure_daily_reset(user_id)
         lock = self._ensure_lock()
@@ -199,7 +205,8 @@ class Repository:
                     contact_skip_once INTEGER NOT NULL DEFAULT 0,
                     contact_never INTEGER NOT NULL DEFAULT 0,
                     last_activity_ts INTEGER NOT NULL DEFAULT 0,
-                    idle_reminder_sent INTEGER NOT NULL DEFAULT 0
+                    idle_reminder_sent INTEGER NOT NULL DEFAULT 0,
+                    social_ad_shown INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -222,6 +229,16 @@ class Repository:
         )
         remind_at = datetime.fromisoformat(row["remind_at"]) if row["remind_at"] else None
         seen_models = json.loads(row["seen_models"]) if row["seen_models"] else []
+        social_ad_raw = 0
+        if isinstance(row, sqlite3.Row):
+            columns = row.keys()
+            if "social_ad_shown" in columns:
+                social_ad_raw = row["social_ad_shown"]
+        else:
+            try:
+                social_ad_raw = row["social_ad_shown"]
+            except Exception:  # pragma: no cover - defensive fallback
+                social_ad_raw = 0
         return UserProfile(
             user_id=row["user_id"],
             gender=row["gender"],
@@ -237,6 +254,7 @@ class Repository:
             contact_never=bool(row["contact_never"] or 0),
             last_activity_ts=row["last_activity_ts"] if row["last_activity_ts"] else 0,
             idle_reminder_sent=bool(row["idle_reminder_sent"] or 0),
+            social_ad_shown=bool(social_ad_raw or 0),
         )
 
     def _get_user_sync(self, user_id: int) -> Optional[UserProfile]:
@@ -275,7 +293,8 @@ class Repository:
                     contact_skip_once,
                     contact_never,
                     last_activity_ts,
-                    idle_reminder_sent
+                    idle_reminder_sent,
+                    social_ad_shown
                 )
                 VALUES (
                     :user_id,
@@ -291,7 +310,8 @@ class Repository:
                     :contact_skip_once,
                     :contact_never,
                     :last_activity_ts,
-                    :idle_reminder_sent
+                    :idle_reminder_sent,
+                    :social_ad_shown
                 )
                 ON CONFLICT(user_id) DO UPDATE SET
                     gender=excluded.gender,
@@ -306,7 +326,8 @@ class Repository:
                     contact_skip_once=excluded.contact_skip_once,
                     contact_never=excluded.contact_never,
                     last_activity_ts=excluded.last_activity_ts,
-                    idle_reminder_sent=excluded.idle_reminder_sent
+                    idle_reminder_sent=excluded.idle_reminder_sent,
+                    social_ad_shown=excluded.social_ad_shown
                 """,
                 {
                     "user_id": data["user_id"],
@@ -325,6 +346,7 @@ class Repository:
                     "contact_never": 1 if data["contact_never"] else 0,
                     "last_activity_ts": data["last_activity_ts"],
                     "idle_reminder_sent": 1 if data["idle_reminder_sent"] else 0,
+                    "social_ad_shown": 1 if data["social_ad_shown"] else 0,
                 },
             )
             conn.commit()
@@ -366,6 +388,29 @@ class Repository:
         with self._connection() as conn:
             conn.execute(
                 "UPDATE users SET idle_reminder_sent = 1 WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
+
+    def _list_social_ad_candidates_sync(self, threshold_ts: int) -> List[UserProfile]:
+        with self._connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                """
+                SELECT * FROM users
+                WHERE last_activity_ts > 0
+                  AND last_activity_ts <= ?
+                  AND social_ad_shown = 0
+                """,
+                (threshold_ts,),
+            )
+            rows = cur.fetchall()
+        return [self._row_to_profile(row) for row in rows]
+
+    def _mark_social_ad_shown_sync(self, user_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE users SET social_ad_shown = 1 WHERE user_id = ?",
                 (user_id,),
             )
             conn.commit()
@@ -546,6 +591,10 @@ class Repository:
         if "idle_reminder_sent" not in columns:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN idle_reminder_sent INTEGER NOT NULL DEFAULT 0"
+            )
+        if "social_ad_shown" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN social_ad_shown INTEGER NOT NULL DEFAULT 0"
             )
 
     def _ensure_contact_table(self, conn: sqlite3.Connection) -> None:

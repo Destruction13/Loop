@@ -17,6 +17,7 @@ from app.services.collage import build_three_tile_collage
 from app.services.leads_export import LeadsExporter
 from app.services.idle_reminder import IdleReminderService
 from app.services.repository import Repository
+from app.services.social_ad import SocialAdService
 from app.services.scheduler import ReminderScheduler
 from app.services.storage_local import LocalStorage
 from app.services.tryon_mock import MockTryOnService
@@ -105,6 +106,7 @@ async def main() -> None:
     scheduler.start()
 
     idle_reminder: IdleReminderService | None = None
+    social_ad: SocialAdService | None = None
     if config.enable_idle_reminder:
         idle_reminder = IdleReminderService(
             bot=bot,
@@ -115,6 +117,17 @@ async def main() -> None:
         )
         idle_reminder.start()
 
+    if config.enable_social_ad and config.social_ad_minutes > 0:
+        social_ad = SocialAdService(
+            bot=bot,
+            repository=repository,
+            instagram_url=str(config.social_instagram_url),
+            tiktok_url=str(config.social_tiktok_url),
+            timeout_minutes=config.social_ad_minutes,
+            interval_seconds=30,
+        )
+        social_ad.start()
+
     logger.info("%s Bot started", EVENT_ID["START"])
     try:
         await dp.start_polling(bot)
@@ -122,6 +135,8 @@ async def main() -> None:
         await scheduler.stop()
         if idle_reminder is not None:
             await idle_reminder.stop()
+        if social_ad is not None:
+            await social_ad.stop()
         await catalog_service.aclose()
         await bot.session.close()
 

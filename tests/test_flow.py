@@ -38,13 +38,15 @@ def test_photo_instruction_text() -> None:
 
 def test_generation_result_keyboard_layout() -> None:
     keyboard = generation_result_keyboard("https://site", remaining=3)
-    row = keyboard.inline_keyboard[0]
-    assert [button.text for button in row] == [
-        msg.DETAILS_BUTTON_TEXT,
-        f"{msg.MORE_VARIANTS_BUTTON_TEXT} (осталось 3)",
+    assert len(keyboard.inline_keyboard) == 2
+    first_row = keyboard.inline_keyboard[0]
+    second_row = keyboard.inline_keyboard[1]
+    assert [button.text for button in first_row] == [msg.DETAILS_BUTTON_TEXT]
+    assert [button.text for button in second_row] == [
+        f"{msg.MORE_VARIANTS_BUTTON_TEXT} (осталось 3)"
     ]
-    assert row[0].url == "https://site"
-    assert row[1].callback_data == "more|3"
+    assert first_row[0].url == "https://site"
+    assert second_row[0].callback_data == "more|3"
 
 
 def test_followup_resolution_variants() -> None:
