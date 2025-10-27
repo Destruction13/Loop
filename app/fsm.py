@@ -722,6 +722,16 @@ def setup_router(
             msg.START_WELCOME,
             reply_markup=start_keyboard(),
         )
+        promo_video_path = Path("video") / "promo_start.mp4"
+        if promo_video_path.exists():
+            try:
+                await message.answer_video(video=FSInputFile(promo_video_path))
+            except TelegramBadRequest as exc:
+                logger.error(
+                    "Failed to send promo video from %s: %s", promo_video_path, exc
+                )
+        else:
+            logger.warning("Promo video not found at %s", promo_video_path)
         await _send_delivery_message(
             message,
             state,
