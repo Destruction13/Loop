@@ -755,9 +755,14 @@ def setup_router(
     @router.callback_query(StateFilter(TryOnStates.START), F.data == "start_go")
     async def start_go(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(TryOnStates.FOR_WHO)
-        await callback.message.edit_text(
-            msg.START_GENDER_PROMPT, reply_markup=gender_keyboard()
-        )
+        if callback.message.text:
+            await callback.message.edit_text(
+                msg.START_GENDER_PROMPT, reply_markup=gender_keyboard()
+            )
+        else:
+            await callback.message.edit_caption(
+                msg.START_GENDER_PROMPT, reply_markup=gender_keyboard()
+            )
         await state.update_data(gender_prompt_message_id=callback.message.message_id)
         await callback.answer()
 
