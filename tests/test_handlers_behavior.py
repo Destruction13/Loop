@@ -366,7 +366,7 @@ def build_router(
 
     async def fake_generate_glasses(
         *, face_path: str, glasses_path: str
-    ) -> bytes:
+    ) -> nanobanana.GenerationSuccess:
         tryon.calls.append(
             {
                 "user_id": tryon.last_user_id,
@@ -374,7 +374,16 @@ def build_router(
                 "glasses_path": Path(glasses_path),
             }
         )
-        return result_path.read_bytes()
+        return nanobanana.GenerationSuccess(
+            image_bytes=result_path.read_bytes(),
+            response={"candidates": [{"finishReason": "SUCCESS"}]},
+            finish_reason="SUCCESS",
+            has_inline=True,
+            has_data_url=False,
+            has_file_uri=False,
+            attempt=1,
+            retried=False,
+        )
 
     image_io.save_user_photo = fake_save_user_photo  # type: ignore[assignment]
     image_io.redownload_user_photo = fake_redownload_user_photo  # type: ignore[assignment]
@@ -713,6 +722,131 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         assert upload_message.answers[-1][0].startswith(
             f"<b>{msg.ASK_PHONE_TITLE}"
         )
+
+    asyncio.run(scenario())
+
+
+def test_generation_unsuitable_photo_requests_new_upload(tmp_path: Path) -> None:
+    model = GlassModel(
+        unique_id="m1",
+        title="Model 1",
+        model_code="M1",
+        site_url="https://example.com/1",
+        img_user_url="https://example.com/1.jpg",
+        img_nano_url="https://example.com/1-nano.jpg",
+        gender="Мужской",
+    )
+
+    async def scenario() -> None:
+        from app import fsm as fsm_module
+        from app.services import nanobanana
+
+        router, _, _, _, _ = build_router(tmp_path, models=[model])
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=72, bot=bot)
+        message.photo = [PhotoStub("upload1")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler_photo(message, state)
+
+        failing_error = nanobanana.NanoBananaGenerationError(
+            "unsuitable",
+            reason_code="UNSUITABLE_PHOTO",
+            reason_detail="finish=SAFETY",
+            finish_reason="SAFETY",
+            has_inline=False,
+            has_data_url=False,
+            has_file_uri=False,
+        )
+
+        async def failing_generate_glasses(*, face_path: str, glasses_path: str):
+            raise failing_error
+
+        original_generate = nanobanana.generate_glasses
+        original_fsm_generate = fsm_module.generate_glasses
+        nanobanana.generate_glasses = failing_generate_glasses  # type: ignore[assignment]
+        fsm_module.generate_glasses = failing_generate_glasses  # type: ignore[assignment]
+        try:
+            callback = DummyCallback("pick:src=batch2:m1", message)
+            await handler_choose(callback, state)
+        finally:
+            nanobanana.generate_glasses = original_generate  # type: ignore[assignment]
+            fsm_module.generate_glasses = original_fsm_generate  # type: ignore[assignment]
+
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert state.data.get("selected_model") is None
+        assert state.data.get("upload") is None
+        assert state.data.get("upload_file_id") is None
+        assert state.data.get("current_models") == []
+        assert message.answers[-1][0] == msg.PHOTO_NOT_SUITABLE_MAIN
+        markup = message.answers[-1][1]
+        assert isinstance(markup, InlineKeyboardMarkup)
+        assert markup.inline_keyboard[0][0].text == msg.BTN_SEND_NEW_PHOTO
+
+    asyncio.run(scenario())
+
+
+def test_generation_transient_error_keeps_retry_flow(tmp_path: Path) -> None:
+    model = GlassModel(
+        unique_id="m1",
+        title="Model 1",
+        model_code="M1",
+        site_url="https://example.com/1",
+        img_user_url="https://example.com/1.jpg",
+        img_nano_url="https://example.com/1-nano.jpg",
+        gender="Мужской",
+    )
+
+    async def scenario() -> None:
+        from app import fsm as fsm_module
+        from app.services import nanobanana
+
+        router, _, _, _, _ = build_router(tmp_path, models=[model])
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=73, bot=bot)
+        message.photo = [PhotoStub("upload1")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler_photo(message, state)
+
+        transient_error = nanobanana.NanoBananaGenerationError(
+            "transient",
+            reason_code="TRANSIENT",
+            reason_detail="timeout",
+            finish_reason="OTHER",
+            has_inline=False,
+            has_data_url=False,
+            has_file_uri=False,
+        )
+
+        async def transient_generate_glasses(*, face_path: str, glasses_path: str):
+            raise transient_error
+
+        original_generate = nanobanana.generate_glasses
+        original_fsm_generate = fsm_module.generate_glasses
+        nanobanana.generate_glasses = transient_generate_glasses  # type: ignore[assignment]
+        fsm_module.generate_glasses = transient_generate_glasses  # type: ignore[assignment]
+        try:
+            callback = DummyCallback("pick:src=batch2:m1", message)
+            await handler_choose(callback, state)
+        finally:
+            nanobanana.generate_glasses = original_generate  # type: ignore[assignment]
+            fsm_module.generate_glasses = original_fsm_generate  # type: ignore[assignment]
+
+        assert state.state is TryOnStates.ERROR
+        assert state.data.get("selected_model") is not None
+        assert message.answers[-1][0] == msg.ERROR_GENERATION_FAILED
+        markup = message.answers[-1][1]
+        assert isinstance(markup, InlineKeyboardMarkup)
+        assert markup.inline_keyboard[0][0].text == msg.RETRY_GENERATION_BUTTON_TEXT
 
     asyncio.run(scenario())
 

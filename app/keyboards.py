@@ -169,6 +169,21 @@ def retry_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def send_new_photo_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard prompting the user to provide a different photo."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=msg.BTN_SEND_NEW_PHOTO,
+                    callback_data="send_new_photo",
+                )
+            ]
+        ]
+    )
+
+
 def reminder_keyboard() -> InlineKeyboardMarkup:
     """Keyboard attached to reminder messages."""
 

@@ -36,6 +36,7 @@ from app.keyboards import (
     main_reply_keyboard,
     promo_keyboard,
     retry_keyboard,
+    send_new_photo_keyboard,
     start_keyboard,
 )
 from app.logging_conf import EVENT_ID
@@ -57,7 +58,10 @@ from app.services.image_io import (
     resize_inplace,
     save_user_photo,
 )
-from app.services.nanobanana import generate_glasses
+from app.services.nanobanana import (
+    NanoBananaGenerationError,
+    generate_glasses,
+)
 from app.services.recommendation import RecommendationService
 from app.utils.phone import normalize_phone
 from app.texts import messages as msg
@@ -842,6 +846,16 @@ def setup_router(
         )
         logger.info("%s Photo received from %s", EVENT_ID["PHOTO_RECEIVED"], user_id)
 
+    @router.callback_query(StateFilter(TryOnStates.AWAITING_PHOTO), F.data == "send_new_photo")
+    async def request_new_photo(callback: CallbackQuery, state: FSMContext) -> None:
+        await _send_aux_message(
+            callback.message,
+            state,
+            callback.message.answer,
+            msg.PHOTO_INSTRUCTION,
+        )
+        await callback.answer()
+
     @router.callback_query(
         StateFilter(TryOnStates.SHOW_RECS, TryOnStates.RESULT),
         F.data.startswith("pick:"),
@@ -965,6 +979,7 @@ def setup_router(
         progress_message: Message | None = None
         user_photo_path: Path | None = None
         result_bytes: bytes | None = None
+        start_time = 0.0
 
         async def _edit_progress(text: str) -> None:
             nonlocal progress_message
@@ -1015,22 +1030,79 @@ def setup_router(
             await _edit_progress(msg.PROGRESS_WAIT_GENERATION)
 
             start_time = time.perf_counter()
-            result_bytes = await with_generation_slot(
+            generation_result = await with_generation_slot(
                 generate_glasses(
                     face_path=str(user_photo_path),
                     glasses_path=glasses_path,
                 )
             )
             latency_ms = int((time.perf_counter() - start_time) * 1000)
-            result_kb = len(result_bytes) / 1024
+            result_bytes = generation_result.image_bytes
+            result_kb = len(result_bytes) / 1024 if result_bytes else 0
             logger.info(
-                "NanoBanana generation: user_id=%s frame_id=%s latency_ms=%s result_kb=%.1f",
+                (
+                    "NanoBanana generation: user_id=%s frame_id=%s latency_ms=%s "
+                    "result_kb=%.1f finish_reason=%s attempt=%s retried=%s"
+                ),
                 user_id,
                 model.unique_id,
                 latency_ms,
                 result_kb,
+                generation_result.finish_reason,
+                generation_result.attempt,
+                generation_result.retried,
             )
 
+        except NanoBananaGenerationError as exc:
+            latency_ms = (
+                int((time.perf_counter() - start_time) * 1000)
+                if start_time
+                else 0
+            )
+            logger.warning(
+                (
+                    "NanoBanana failure: user_id=%s frame_id=%s finish_reason=%s "
+                    "reason_code=%s reason_detail=%s has_inline=%s has_data_url=%s "
+                    "has_file_uri=%s latency_ms=%s attempt=%s retried=%s"
+                ),
+                user_id,
+                model.unique_id,
+                exc.finish_reason,
+                exc.reason_code,
+                exc.reason_detail,
+                exc.has_inline,
+                exc.has_data_url,
+                exc.has_file_uri,
+                latency_ms,
+                exc.attempt,
+                exc.retried,
+            )
+            await _delete_state_message(message, state, "generation_progress_message_id")
+            if exc.reason_code == "UNSUITABLE_PHOTO":
+                await state.update_data(
+                    selected_model=None,
+                    current_models=[],
+                    upload=None,
+                    upload_file_id=None,
+                )
+                await state.set_state(TryOnStates.AWAITING_PHOTO)
+                await _send_aux_message(
+                    message,
+                    state,
+                    message.answer,
+                    msg.PHOTO_NOT_SUITABLE_MAIN,
+                    reply_markup=send_new_photo_keyboard(),
+                )
+            else:
+                await _send_aux_message(
+                    message,
+                    state,
+                    message.answer,
+                    msg.ERROR_GENERATION_FAILED,
+                    reply_markup=retry_keyboard(),
+                )
+                await state.set_state(TryOnStates.ERROR)
+            return
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "%s Generation failed: %s",

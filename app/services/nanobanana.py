@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -26,9 +27,71 @@ API_ENDPOINT = (
     f"{MODEL_NAME}:generateContent"
 )
 
+UNSUITABLE_CODE = "UNSUITABLE_PHOTO"
+TRANSIENT_CODE = "TRANSIENT"
+PARSER_MISS_CODE = "PARSER_MISS"
+
 _API_KEY: str | None = None
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=60)
 _RETRY_DELAYS = (1.0, 3.0)
+
+
+@dataclass(slots=True)
+class GenerationSuccess:
+    """Successful generation payload with metadata."""
+
+    image_bytes: bytes
+    response: dict[str, Any]
+    finish_reason: str | None
+    has_inline: bool
+    has_data_url: bool
+    has_file_uri: bool
+    attempt: int
+    retried: bool
+
+
+@dataclass(slots=True)
+class _ResponseScan:
+    inline_data: str | None
+    finish_reason: str | None
+    has_inline: bool
+    has_data_url: bool
+    has_file_uri: bool
+    has_safety: bool
+
+
+class NanoBananaGenerationError(RuntimeError):
+    """Error raised when Gemini fails to return a usable image."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        response: dict[str, Any] | None = None,
+        finish_reason: str | None = None,
+        reason_code: str = TRANSIENT_CODE,
+        reason_detail: str = "",
+        has_inline: bool = False,
+        has_data_url: bool = False,
+        has_file_uri: bool = False,
+        attempt: int = 1,
+        retried: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.response = response
+        self.finish_reason = finish_reason
+        self.reason_code = reason_code
+        self.reason_detail = reason_detail
+        self.has_inline = has_inline
+        self.has_data_url = has_data_url
+        self.has_file_uri = has_file_uri
+        self.attempt = attempt
+        self.retried = retried
+
+    def with_attempt(self, attempt: int, retried: bool) -> "NanoBananaGenerationError":
+        self.attempt = attempt
+        self.retried = retried
+        return self
 
 
 def configure(api_key: str) -> None:
@@ -41,8 +104,8 @@ def configure(api_key: str) -> None:
     _API_KEY = sanitized
 
 
-async def generate_glasses(face_path: str, glasses_path: str) -> bytes:
-    """Return generated PNG bytes from Gemini; raise RuntimeError on failure."""
+async def generate_glasses(face_path: str, glasses_path: str) -> GenerationSuccess:
+    """Return generated data with metadata from Gemini; raise on failure."""
 
     if not _API_KEY:
         raise RuntimeError("NanoBanana API key is not set")
@@ -58,45 +121,157 @@ async def generate_glasses(face_path: str, glasses_path: str) -> bytes:
         ],
     }
 
-    attempt = 0
-    last_error: Exception | None = None
     url = f"{API_ENDPOINT}?key={_API_KEY}"
-    while attempt < 1 + len(_RETRY_DELAYS):
+    attempt = 0
+    while True:
         attempt += 1
+        retried = attempt > 1
         try:
-            return await _request_generation(url, payload)
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if attempt > len(_RETRY_DELAYS):
-                break
+            data = await _request_generation(url, payload)
+        except NanoBananaGenerationError as exc:
+            exc = exc.with_attempt(attempt, retried)
+            if (
+                exc.reason_code == TRANSIENT_CODE
+                and attempt <= len(_RETRY_DELAYS)
+            ):
+                await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
+                continue
+            raise exc
+
+        scan = _scan_response(data)
+        if scan.inline_data:
+            try:
+                decoded = base64.b64decode(scan.inline_data, validate=True)
+            except (ValueError, TypeError) as exc:  # pragma: no cover - unexpected format
+                reason_code, reason_detail = classify_failure(
+                    data, exc, scan=scan
+                )
+                error = NanoBananaGenerationError(
+                    "Invalid base64 image in Gemini response",
+                    response=data,
+                    finish_reason=scan.finish_reason,
+                    reason_code=reason_code,
+                    reason_detail=reason_detail,
+                    has_inline=scan.has_inline,
+                    has_data_url=scan.has_data_url,
+                    has_file_uri=scan.has_file_uri,
+                ).with_attempt(attempt, retried)
+                if (
+                    error.reason_code == TRANSIENT_CODE
+                    and attempt <= len(_RETRY_DELAYS)
+                ):
+                    await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
+                    continue
+                raise error from exc
+            return GenerationSuccess(
+                image_bytes=decoded,
+                response=data,
+                finish_reason=scan.finish_reason,
+                has_inline=scan.has_inline,
+                has_data_url=scan.has_data_url,
+                has_file_uri=scan.has_file_uri,
+                attempt=attempt,
+                retried=retried,
+            )
+
+        reason_code, reason_detail = classify_failure(data, scan=scan)
+        error = NanoBananaGenerationError(
+            "Gemini response missing image data",
+            response=data,
+            finish_reason=scan.finish_reason,
+            reason_code=reason_code,
+            reason_detail=reason_detail,
+            has_inline=scan.has_inline,
+            has_data_url=scan.has_data_url,
+            has_file_uri=scan.has_file_uri,
+        ).with_attempt(attempt, retried)
+        if error.reason_code == TRANSIENT_CODE and attempt <= len(_RETRY_DELAYS):
             await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
-    message = "Gemini generation failed"
-    if last_error:
-        message = f"{message}: {last_error}"
-    raise RuntimeError(message)
+            continue
+        raise error
 
 
-async def _request_generation(url: str, payload: dict[str, Any]) -> bytes:
+def classify_failure(
+    response: dict[str, Any] | None,
+    error: Exception | None = None,
+    *,
+    status: int | None = None,
+    scan: _ResponseScan | None = None,
+) -> tuple[str, str]:
+    """Classify the reason for a failed generation attempt."""
+
+    if response is not None:
+        if scan is None:
+            scan = _scan_response(response)
+        finish_reason = scan.finish_reason or ""
+        if scan.has_safety or finish_reason in {"SAFETY", "BLOCKED"}:
+            detail = finish_reason or "safety_ratings"
+            return UNSUITABLE_CODE, detail
+        if not _has_candidates(response):
+            return TRANSIENT_CODE, "empty_candidates"
+        if finish_reason in {"OTHER", "ERROR"}:
+            return TRANSIENT_CODE, f"finish={finish_reason}"
+        return PARSER_MISS_CODE, "no_image_data"
+
+    if error is not None:
+        if isinstance(error, asyncio.TimeoutError):
+            return TRANSIENT_CODE, "timeout"
+        if isinstance(error, aiohttp.ClientResponseError):
+            status = error.status
+            if status >= 500 or status == 429:
+                return TRANSIENT_CODE, f"status={status}"
+            return PARSER_MISS_CODE, f"status={status}"
+        if isinstance(error, aiohttp.ClientError):
+            return TRANSIENT_CODE, error.__class__.__name__
+        if isinstance(error, json.JSONDecodeError):
+            return PARSER_MISS_CODE, "json_decode"
+        return TRANSIENT_CODE, error.__class__.__name__
+
+    if status is not None:
+        if status >= 500 or status == 429:
+            return TRANSIENT_CODE, f"status={status}"
+        return PARSER_MISS_CODE, f"status={status}"
+
+    return PARSER_MISS_CODE, "unknown"
+
+
+async def _request_generation(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     async with aiohttp.ClientSession(timeout=_REQUEST_TIMEOUT) as session:
         try:
             async with session.post(url, json=payload) as response:
+                text = await response.text()
                 if response.status != 200:
-                    text = await response.text()
-                    raise RuntimeError(
-                        f"Gemini API returned status {response.status}: {text[:200]}"
+                    reason_code, reason_detail = classify_failure(
+                        None, status=response.status
                     )
-                data = await response.json()
-        except aiohttp.ClientError as exc:  # pragma: no cover - network failures
-            raise RuntimeError(f"Gemini request error: {exc}") from exc
+                    raise NanoBananaGenerationError(
+                        f"Gemini API returned status {response.status}",
+                        reason_code=reason_code,
+                        reason_detail=f"{reason_detail}:{text[:120]}",
+                    )
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError as exc:
+                    reason_code, reason_detail = classify_failure(None, exc)
+                    raise NanoBananaGenerationError(
+                        "Failed to decode Gemini response as JSON",
+                        reason_code=reason_code,
+                        reason_detail=reason_detail,
+                    ) from exc
         except asyncio.TimeoutError as exc:  # pragma: no cover - network failures
-            raise RuntimeError("Gemini request timed out") from exc
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Failed to decode Gemini response as JSON") from exc
-    encoded = _extract_inline_data(data)
-    try:
-        return base64.b64decode(encoded, validate=True)
-    except (ValueError, TypeError) as exc:
-        raise RuntimeError("Invalid base64 image in Gemini response") from exc
+            reason_code, reason_detail = classify_failure(None, exc)
+            raise NanoBananaGenerationError(
+                "Gemini request timed out",
+                reason_code=reason_code,
+                reason_detail=reason_detail,
+            ) from exc
+        except aiohttp.ClientError as exc:  # pragma: no cover - network failures
+            reason_code, reason_detail = classify_failure(None, exc)
+            raise NanoBananaGenerationError(
+                "Gemini request error",
+                reason_code=reason_code,
+                reason_detail=reason_detail,
+            ) from exc
 
 
 def _encode_image(path: Path) -> dict[str, Any]:
@@ -119,22 +294,70 @@ def _guess_mime(path: Path) -> str:
     return "image/png"
 
 
-def _extract_inline_data(payload: Any) -> str:
+def _scan_response(payload: Any) -> _ResponseScan:
+    inline_data: str | None = None
+    finish_reason: str | None = None
+    has_inline = False
+    has_data_url = False
+    has_file_uri = False
+    has_safety = False
+
     queue: list[Any] = [payload]
     while queue:
         current = queue.pop()
         if isinstance(current, dict):
-            for key in ("inline_data", "inlineData"):
-                if key in current and isinstance(current[key], dict):
-                    data_value = current[key].get("data")
+            for key, value in current.items():
+                if key in {"inline_data", "inlineData"} and isinstance(value, dict):
+                    has_inline = True
+                    data_value = value.get("data")
                     if isinstance(data_value, str) and data_value.strip():
-                        return data_value
-            for value in current.values():
-                queue.append(value)
+                        inline_data = data_value
+                elif key in {"finishReason", "finish_reason"} and isinstance(value, str):
+                    if not finish_reason:
+                        finish_reason = value
+                elif key in {"fileUri", "file_uri"} and isinstance(value, str):
+                    has_file_uri = True
+                elif key == "safetyRatings" and isinstance(value, list) and value:
+                    has_safety = True
+                elif key.lower() in {"data", "uri", "url"} and isinstance(value, str):
+                    if value.startswith("data:"):
+                        has_data_url = True
+                    if key.lower() in {"uri", "url"} and (
+                        value.startswith("gs://")
+                        or "googleapis" in value
+                    ):
+                        has_file_uri = True
+                elif isinstance(value, str):
+                    if value.startswith("data:"):
+                        has_data_url = True
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
         elif isinstance(current, list):
             queue.extend(current)
-    raise RuntimeError("Gemini response does not contain inline image data")
+        elif isinstance(current, str):
+            if current.startswith("data:"):
+                has_data_url = True
+
+    return _ResponseScan(
+        inline_data=inline_data,
+        finish_reason=finish_reason,
+        has_inline=has_inline,
+        has_data_url=has_data_url,
+        has_file_uri=has_file_uri,
+        has_safety=has_safety,
+    )
 
 
-__all__ = ["configure", "generate_glasses"]
+def _has_candidates(response: dict[str, Any]) -> bool:
+    candidates = response.get("candidates") if isinstance(response, dict) else None
+    return bool(candidates)
+
+
+__all__ = [
+    "GenerationSuccess",
+    "NanoBananaGenerationError",
+    "classify_failure",
+    "configure",
+    "generate_glasses",
+]
 
