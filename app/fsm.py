@@ -35,7 +35,6 @@ from app.keyboards import (
     limit_reached_keyboard,
     main_reply_keyboard,
     promo_keyboard,
-    retry_keyboard,
     send_new_photo_keyboard,
     start_keyboard,
 )
@@ -75,7 +74,6 @@ class TryOnStates(StatesGroup):
     GENERATING = State()
     RESULT = State()
     DAILY_LIMIT_REACHED = State()
-    ERROR = State()
 
 
 class ContactRequest(StatesGroup):
@@ -1062,67 +1060,77 @@ def setup_router(
             logger.warning(
                 (
                     "NanoBanana failure: user_id=%s frame_id=%s finish_reason=%s "
-                    "reason_code=%s reason_detail=%s has_inline=%s has_data_url=%s "
-                    "has_file_uri=%s latency_ms=%s attempt=%s retried=%s "
-                    "safety_present=%s safety_categories=%s safety_levels=%s"
+                    "latency_ms=%s has_inline=%s has_data_url=%s has_file_uri=%s "
+                    "detail=%s"
                 ),
                 user_id,
                 model.unique_id,
                 exc.finish_reason,
-                exc.reason_code,
-                exc.reason_detail,
+                latency_ms,
                 exc.has_inline,
                 exc.has_data_url,
                 exc.has_file_uri,
-                latency_ms,
-                exc.attempt,
-                exc.retried,
-                exc.safety_present,
-                list(exc.safety_categories),
-                exc.safety_levels,
+                exc.reason_detail,
             )
             await _delete_state_message(message, state, "generation_progress_message_id")
-            if exc.reason_code == "UNSUITABLE_PHOTO":
-                await state.update_data(
-                    selected_model=None,
-                    current_models=[],
-                    upload=None,
-                    upload_file_id=None,
-                )
-                await state.set_state(TryOnStates.AWAITING_PHOTO)
-                await _send_aux_message(
-                    message,
-                    state,
-                    message.answer,
-                    msg.PHOTO_NOT_SUITABLE_MAIN,
-                    reply_markup=send_new_photo_keyboard(),
-                )
-            else:
-                await _send_aux_message(
-                    message,
-                    state,
-                    message.answer,
-                    msg.ERROR_GENERATION_FAILED,
-                    reply_markup=retry_keyboard(),
-                )
-                await state.set_state(TryOnStates.ERROR)
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "%s Generation failed: %s",
-                EVENT_ID["GENERATION_FAILED"],
-                exc,
-                exc_info=True,
+            await state.update_data(
+                selected_model=None,
+                current_models=[],
+                upload=None,
+                upload_file_id=None,
             )
-            await _delete_state_message(message, state, "generation_progress_message_id")
+            await state.set_state(TryOnStates.AWAITING_PHOTO)
             await _send_aux_message(
                 message,
                 state,
                 message.answer,
-                msg.ERROR_GENERATION_FAILED,
-                reply_markup=retry_keyboard(),
+                msg.PHOTO_NOT_SUITABLE_MAIN,
+                reply_markup=send_new_photo_keyboard(),
             )
-            await state.set_state(TryOnStates.ERROR)
+            return
+        except Exception as exc:  # noqa: BLE001
+            latency_ms = (
+                int((time.perf_counter() - start_time) * 1000)
+                if start_time
+                else 0
+            )
+            logger.error(
+                "%s Generation failed: %s (latency_ms=%s)",
+                EVENT_ID["GENERATION_FAILED"],
+                exc,
+                latency_ms,
+                exc_info=True,
+            )
+            logger.warning(
+                (
+                    "NanoBanana failure: user_id=%s frame_id=%s finish_reason=%s "
+                    "latency_ms=%s has_inline=%s has_data_url=%s has_file_uri=%s "
+                    "detail=%s"
+                ),
+                user_id,
+                model.unique_id,
+                None,
+                latency_ms,
+                False,
+                False,
+                False,
+                str(exc),
+            )
+            await _delete_state_message(message, state, "generation_progress_message_id")
+            await state.update_data(
+                selected_model=None,
+                current_models=[],
+                upload=None,
+                upload_file_id=None,
+            )
+            await state.set_state(TryOnStates.AWAITING_PHOTO)
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.PHOTO_NOT_SUITABLE_MAIN,
+                reply_markup=send_new_photo_keyboard(),
+            )
             return
         finally:
             if user_photo_path and user_photo_path.exists():
@@ -1131,18 +1139,6 @@ def setup_router(
                 except OSError:
                     logger.debug("Failed to remove temp file %s", user_photo_path)
             await state.update_data(upload=None)
-
-        if not result_bytes:
-            await _delete_state_message(message, state, "generation_progress_message_id")
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
-                msg.ERROR_GENERATION_FAILED,
-                reply_markup=retry_keyboard(),
-            )
-            await state.set_state(TryOnStates.ERROR)
-            return
 
         await repository.inc_used_on_success(user_id)
         remaining = await repository.remaining_tries(user_id)
@@ -1422,16 +1418,5 @@ def setup_router(
             msg.PHOTO_INSTRUCTION,
         )
         await callback.answer()
-
-    @router.callback_query(StateFilter(TryOnStates.ERROR), F.data == "retry")
-    async def retry(callback: CallbackQuery, state: FSMContext) -> None:
-        data = await state.get_data()
-        selected: Optional[GlassModel] = data.get("selected_model")
-        if not selected:
-            await callback.answer("Нет выбранной модели", show_alert=True)
-            return
-        await state.set_state(TryOnStates.GENERATING)
-        await callback.answer()
-        await _perform_generation(callback.message, state, selected)
 
     return router

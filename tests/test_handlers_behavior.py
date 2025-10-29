@@ -790,7 +790,7 @@ def test_generation_unsuitable_photo_requests_new_upload(tmp_path: Path) -> None
     asyncio.run(scenario())
 
 
-def test_generation_transient_error_keeps_retry_flow(tmp_path: Path) -> None:
+def test_generation_transient_error_requests_new_upload(tmp_path: Path) -> None:
     model = GlassModel(
         unique_id="m1",
         title="Model 1",
@@ -841,12 +841,15 @@ def test_generation_transient_error_keeps_retry_flow(tmp_path: Path) -> None:
             nanobanana.generate_glasses = original_generate  # type: ignore[assignment]
             fsm_module.generate_glasses = original_fsm_generate  # type: ignore[assignment]
 
-        assert state.state is TryOnStates.ERROR
-        assert state.data.get("selected_model") is not None
-        assert message.answers[-1][0] == msg.ERROR_GENERATION_FAILED
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert state.data.get("selected_model") is None
+        assert state.data.get("upload") is None
+        assert state.data.get("upload_file_id") is None
+        assert state.data.get("current_models") == []
+        assert message.answers[-1][0] == msg.PHOTO_NOT_SUITABLE_MAIN
         markup = message.answers[-1][1]
         assert isinstance(markup, InlineKeyboardMarkup)
-        assert markup.inline_keyboard[0][0].text == msg.RETRY_GENERATION_BUTTON_TEXT
+        assert markup.inline_keyboard[0][0].text == msg.BTN_SEND_NEW_PHOTO
 
     asyncio.run(scenario())
 

@@ -33,9 +33,6 @@ PARSER_MISS_CODE = "PARSER_MISS"
 
 _API_KEY: str | None = None
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=60)
-_RETRY_DELAYS = (1.0, 3.0)
-
-
 @dataclass(slots=True)
 class GenerationSuccess:
     """Successful generation payload with metadata."""
@@ -115,12 +112,6 @@ class NanoBananaGenerationError(RuntimeError):
         self.safety_categories = tuple(safety_categories or ())
         self.safety_levels = dict(safety_levels or {})
 
-    def with_attempt(self, attempt: int, retried: bool) -> "NanoBananaGenerationError":
-        self.attempt = attempt
-        self.retried = retried
-        return self
-
-
 def configure(api_key: str) -> None:
     """Configure the API key used for subsequent requests."""
 
@@ -149,79 +140,52 @@ async def generate_glasses(face_path: str, glasses_path: str) -> GenerationSucce
     }
 
     url = f"{API_ENDPOINT}?key={_API_KEY}"
-    attempt = 0
-    while True:
-        attempt += 1
-        retried = attempt > 1
-        try:
-            data = await _request_generation(url, payload)
-        except NanoBananaGenerationError as exc:
-            exc = exc.with_attempt(attempt, retried)
-            if (
-                exc.reason_code == TRANSIENT_CODE
-                and attempt <= len(_RETRY_DELAYS)
-            ):
-                await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
-                continue
-            raise exc
+    data = await _request_generation(url, payload)
 
-        scan = _scan_response(data)
-        if scan.inline_data:
-            try:
-                decoded = base64.b64decode(scan.inline_data, validate=True)
-            except (ValueError, TypeError) as exc:  # pragma: no cover - unexpected format
-                reason_code, reason_detail, safety = classify_failure(
-                    data, exc, scan=scan
-                )
-                error = NanoBananaGenerationError(
-                    "Invalid base64 image in Gemini response",
-                    response=data,
-                    finish_reason=scan.finish_reason,
-                    reason_code=reason_code,
-                    reason_detail=reason_detail,
-                    has_inline=scan.has_inline,
-                    has_data_url=scan.has_data_url,
-                    has_file_uri=scan.has_file_uri,
-                    safety_present=safety.present,
-                    safety_categories=safety.categories,
-                    safety_levels=safety.levels,
-                ).with_attempt(attempt, retried)
-                if (
-                    error.reason_code == TRANSIENT_CODE
-                    and attempt <= len(_RETRY_DELAYS)
-                ):
-                    await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
-                    continue
-                raise error from exc
-            return GenerationSuccess(
-                image_bytes=decoded,
+    scan = _scan_response(data)
+    if scan.inline_data:
+        try:
+            decoded = base64.b64decode(scan.inline_data, validate=True)
+        except (ValueError, TypeError) as exc:  # pragma: no cover - unexpected format
+            reason_code, reason_detail, safety = classify_failure(data, exc, scan=scan)
+            raise NanoBananaGenerationError(
+                "Invalid base64 image in Gemini response",
                 response=data,
                 finish_reason=scan.finish_reason,
+                reason_code=reason_code,
+                reason_detail=reason_detail,
                 has_inline=scan.has_inline,
                 has_data_url=scan.has_data_url,
                 has_file_uri=scan.has_file_uri,
-                attempt=attempt,
-                retried=retried,
-            )
-
-        reason_code, reason_detail, safety = classify_failure(data, scan=scan)
-        error = NanoBananaGenerationError(
-            "Gemini response missing image data",
+                safety_present=safety.present,
+                safety_categories=safety.categories,
+                safety_levels=safety.levels,
+            ) from exc
+        return GenerationSuccess(
+            image_bytes=decoded,
             response=data,
             finish_reason=scan.finish_reason,
-            reason_code=reason_code,
-            reason_detail=reason_detail,
             has_inline=scan.has_inline,
             has_data_url=scan.has_data_url,
             has_file_uri=scan.has_file_uri,
-            safety_present=safety.present,
-            safety_categories=safety.categories,
-            safety_levels=safety.levels,
-        ).with_attempt(attempt, retried)
-        if error.reason_code == TRANSIENT_CODE and attempt <= len(_RETRY_DELAYS):
-            await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
-            continue
-        raise error
+            attempt=1,
+            retried=False,
+        )
+
+    reason_code, reason_detail, safety = classify_failure(data, scan=scan)
+    raise NanoBananaGenerationError(
+        "Gemini response missing image data",
+        response=data,
+        finish_reason=scan.finish_reason,
+        reason_code=reason_code,
+        reason_detail=reason_detail,
+        has_inline=scan.has_inline,
+        has_data_url=scan.has_data_url,
+        has_file_uri=scan.has_file_uri,
+        safety_present=safety.present,
+        safety_categories=safety.categories,
+        safety_levels=safety.levels,
+    )
 
 
 def classify_failure(
@@ -246,53 +210,34 @@ def classify_failure(
 
         safety_summary = _analyse_safety_signals(response)
 
-        if not inline_present and not has_alternative_refs and safety_summary.triggered:
-            detail = safety_summary.detail or "safety=unknown"
-            return UNSUITABLE_CODE, detail, safety_summary
+        detail_parts: list[str] = []
+        safety_detail = safety_summary.detail
+        if safety_detail:
+            detail_parts.append(safety_detail)
+        elif safety_summary.present and safety_summary.triggered:
+            detail_parts.append("safety_present")
+        if not detail_parts and finish_reason:
+            detail_parts.append(f"finish={finish_reason}")
+        if not has_candidates and not safety_detail:
+            detail_parts.append("empty_candidates")
+        if not has_alternative_refs and not safety_detail:
+            detail_parts.append("no_parts")
+        if has_alternative_refs and not inline_present:
+            detail_parts.append("alt_refs")
 
         if not inline_present:
-            if finish_reason in {"SAFETY", "BLOCKED"}:
-                detail_parts: list[str] = []
-                if finish_reason:
-                    detail_parts.append(f"finish={finish_reason}")
-                if not has_candidates:
-                    detail_parts.append("empty_candidates")
-                if not detail_parts:
-                    detail_parts.append("finish=UNKNOWN")
-                return UNSUITABLE_CODE, ",".join(detail_parts), safety_summary
+            if not detail_parts:
+                detail_parts.append("no_image_data")
+            return UNSUITABLE_CODE, ",".join(detail_parts), safety_summary
 
-            if finish_reason in {"OTHER", "IMAGE_OTHER", "ERROR"} and not safety_summary.triggered:
-                detail_parts = []
-                if finish_reason:
-                    detail_parts.append(f"finish={finish_reason}")
-                if not has_candidates:
-                    detail_parts.append("empty_candidates")
-                if not has_alternative_refs:
-                    detail_parts.append("no_parts")
-                if not detail_parts:
-                    detail_parts.append("finish=UNKNOWN")
-                return TRANSIENT_CODE, ",".join(detail_parts), safety_summary
+        if error is not None:
+            if not detail_parts:
+                detail_parts.append("invalid_image_data")
+            return UNSUITABLE_CODE, ",".join(detail_parts), safety_summary
 
-            if has_alternative_refs:
-                detail_parts = []
-                if finish_reason:
-                    detail_parts.append(f"finish={finish_reason}")
-                detail_parts.append("alt_refs")
-                return PARSER_MISS_CODE, ",".join(detail_parts), safety_summary
-
-            if not has_candidates:
-                return TRANSIENT_CODE, "empty_candidates", safety_summary
-
-            return PARSER_MISS_CODE, "no_image_data", safety_summary
-
-        if finish_reason in {"SAFETY", "BLOCKED"}:
-            detail = f"finish={finish_reason}" if finish_reason else "finish=UNKNOWN"
-            return UNSUITABLE_CODE, detail, safety_summary
-
-        if not has_candidates:
-            return TRANSIENT_CODE, "empty_candidates", safety_summary
-
-        return PARSER_MISS_CODE, "no_image_data", safety_summary
+        if not detail_parts:
+            detail_parts.append("no_image_data")
+        return UNSUITABLE_CODE, ",".join(detail_parts), safety_summary
 
     if error is not None:
         if isinstance(error, asyncio.TimeoutError):

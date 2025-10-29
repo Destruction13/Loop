@@ -65,7 +65,7 @@ def test_classify_failure_marks_transient_for_other_finish_without_safety() -> N
     }
 
     code, detail, summary = classify_failure(response)
-    assert code == "TRANSIENT"
+    assert code == "UNSUITABLE_PHOTO"
     assert detail == "finish=IMAGE_OTHER,no_parts"
     assert summary.present is False
     assert summary.triggered is False
@@ -90,7 +90,7 @@ def test_classify_failure_marks_parser_miss_for_alt_refs() -> None:
     }
 
     code, detail, summary = classify_failure(response)
-    assert code == "PARSER_MISS"
+    assert code == "UNSUITABLE_PHOTO"
     assert detail == "finish=SUCCESS,alt_refs"
     assert summary.present is False
     assert summary.triggered is False
@@ -139,7 +139,7 @@ def test_classify_failure_marks_transient_for_low_safety() -> None:
     }
 
     code, detail, summary = classify_failure(response)
-    assert code == "TRANSIENT"
+    assert code == "UNSUITABLE_PHOTO"
     assert detail == "finish=IMAGE_OTHER,no_parts"
     assert summary.present is True
     assert summary.triggered is False
