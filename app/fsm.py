@@ -34,6 +34,7 @@ from app.keyboards import (
     contact_request_keyboard,
     limit_reached_keyboard,
     main_reply_keyboard,
+    idle_reminder_keyboard,
     privacy_policy_keyboard,
     promo_keyboard,
     send_new_photo_keyboard,
@@ -319,25 +320,13 @@ def setup_router(
             if isinstance(first_arg, (list, tuple)):
                 send_args = ("".join(first_arg),) + send_args[1:]
         if "reply_markup" not in kwargs or kwargs["reply_markup"] is None:
-            kwargs["reply_markup"] = main_reply_keyboard()
+            kwargs["reply_markup"] = main_reply_keyboard(policy_url)
         sent_message = await send_method(*send_args, **kwargs)
         if track:
             await state.update_data(last_aux_message_id=sent_message.message_id)
         elif delete_previous:
             await state.update_data(last_aux_message_id=None)
         return sent_message
-
-    async def _send_privacy_policy(
-        message: Message, state: FSMContext
-    ) -> None:
-        markup = privacy_policy_keyboard(policy_url)
-        await _send_aux_message(
-            message,
-            state,
-            message.answer,
-            msg.PRIVACY_POLICY_TEXT,
-            reply_markup=markup,
-        )
 
     async def _send_delivery_message(
         source_message: Message,
@@ -883,7 +872,7 @@ def setup_router(
             state,
             message.answer,
             msg.MAIN_MENU_HINT,
-            reply_markup=main_reply_keyboard(),
+            reply_markup=main_reply_keyboard(policy_url),
         )
         logger.info("%s User %s entered start", EVENT_ID["START"], message.from_user.id)
 
@@ -1450,13 +1439,24 @@ def setup_router(
         )
         await _prompt_for_next_photo(message, state, prompt_source)
 
-    @router.message(F.text == msg.MAIN_MENU_POLICY_BUTTON)
-    async def handle_main_menu_policy(message: Message, state: FSMContext) -> None:
-        await _send_privacy_policy(message, state)
-
     @router.message(Command("privacy"))
     async def command_privacy(message: Message, state: FSMContext) -> None:
-        await _send_privacy_policy(message, state)
+        if policy_url:
+            markup = privacy_policy_keyboard(policy_url)
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                policy_url,
+                reply_markup=markup,
+            )
+            return
+        await _send_aux_message(
+            message,
+            state,
+            message.answer,
+            msg.PRIVACY_POLICY_TEXT,
+        )
 
     @router.callback_query(StateFilter(TryOnStates.DAILY_LIMIT_REACHED), F.data == "limit_promo")
     async def limit_promo(callback: CallbackQuery, state: FSMContext) -> None:

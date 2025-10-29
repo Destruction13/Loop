@@ -10,6 +10,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
+from aiogram.types.web_app_info import WebAppInfo
 
 from app.texts import messages as msg
 
@@ -35,15 +36,24 @@ def start_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def main_reply_keyboard() -> ReplyKeyboardMarkup:
+def main_reply_keyboard(policy_url: str | None = None) -> ReplyKeyboardMarkup:
     """Persistent reply keyboard with quick actions."""
+
+    sanitized = (policy_url or "").strip()
+    if sanitized:
+        policy_button = KeyboardButton(
+            text=msg.MAIN_MENU_POLICY_BUTTON,
+            web_app=WebAppInfo(url=sanitized),
+        )
+    else:
+        policy_button = KeyboardButton(text=msg.MAIN_MENU_POLICY_BUTTON)
 
     return ReplyKeyboardMarkup(
         resize_keyboard=True,
         one_time_keyboard=False,
         keyboard=[
             [KeyboardButton(text=msg.MAIN_MENU_TRY_BUTTON)],
-            [KeyboardButton(text=msg.MAIN_MENU_POLICY_BUTTON)],
+            [policy_button],
         ],
     )
 

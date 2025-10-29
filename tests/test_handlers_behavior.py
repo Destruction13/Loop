@@ -22,6 +22,9 @@ from app.services.recommendation import RecommendationResult
 from app.texts import messages as msg
 
 
+TEST_PRIVACY_POLICY_URL = "https://example.com/privacy"
+
+
 @dataclass
 class PhotoStub:
     file_unique_id: str
@@ -446,7 +449,7 @@ def build_router(
         contact_exporter=contact_exporter,
         idle_nudge_seconds=0,
         enable_idle_nudge=False,
-        privacy_policy_url="https://example.com/privacy",
+        privacy_policy_url=TEST_PRIVACY_POLICY_URL,
     )
     return router, repository, tryon, builder, recommender
 
@@ -466,7 +469,7 @@ def get_message_handler(router: Any, name: str):
 
 
 def assert_main_menu_keyboard(markup: Any) -> None:
-    expected = main_reply_keyboard()
+    expected = main_reply_keyboard(TEST_PRIVACY_POLICY_URL)
     assert hasattr(markup, "keyboard")
     assert markup.keyboard == expected.keyboard
 
