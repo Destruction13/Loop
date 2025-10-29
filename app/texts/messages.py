@@ -50,11 +50,14 @@ CATALOG_TEMPORARILY_UNAVAILABLE = (
 # Прелоадер, пока ищем подходящие модели.
 SEARCHING_MODELS_PROMPT = "Ищу свежие модели..."
 
-# Прелоадер, пока идёт генерация примерки.
-GENERATING_PROMPT = "Генерация..."
+# Прогресс-статусы для генерации примерки.
+PROGRESS_DOWNLOADING_USER_PHOTO = "Скачиваю твоё фото…"
+PROGRESS_DOWNLOADING_GLASSES = "Тяну референс очков…"
+PROGRESS_SENDING_TO_GENERATION = "Готовлю запрос…"
+PROGRESS_WAIT_GENERATION = "Генерирую магию… ⏳"
 
 # Сообщение об ошибке генерации.
-GENERATION_FAILED = "Что-то пошло не так. Попробуйте позже."
+ERROR_GENERATION_FAILED = "Не вышло сгенерировать. Попробуем ещё раз?"
 
 # Подпись к первой удачной примерке за день.
 FIRST_RESULT_CAPTION = (

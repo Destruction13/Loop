@@ -42,12 +42,10 @@ class Config:
     idle_reminder_minutes: int
     csv_fetch_ttl_sec: int
     csv_fetch_retries: int
-    mock_tryon: bool
     uploads_root: Path
     results_root: Path
     button_title_max: int
-    nano_api_url: Optional[str]
-    nano_api_key: Optional[str]
+    nanobanana_api_key: str
     collage: CollageConfig
     batch_size: int
     batch_layout_cols: int
@@ -143,6 +141,10 @@ def load_config(env_file: str | None = None) -> Config:
         else None
     )
 
+    api_key = _get("NANOBANANA_API_KEY", required=True) or ""
+    if not api_key.strip():
+        raise RuntimeError("NANOBANANA_API_KEY is required")
+
     return Config(
         bot_token=_get("BOT_TOKEN", required=True),
         sheet_csv_url=_get("SHEET_CSV_URL", DEFAULT_SHEET_URL) or DEFAULT_SHEET_URL,
@@ -153,12 +155,10 @@ def load_config(env_file: str | None = None) -> Config:
         idle_reminder_minutes=_as_int(idle_timeout_raw, 5),
         csv_fetch_ttl_sec=_as_int(_get("CSV_FETCH_TTL_SEC", "60"), 60),
         csv_fetch_retries=_as_int(_get("CSV_FETCH_RETRIES", "3"), 3),
-        mock_tryon=_as_bool(_get("MOCK_TRYON", "1"), True),
         uploads_root=_as_path(_get("UPLOADS_ROOT", "./uploads"), "./uploads"),
         results_root=_as_path(_get("RESULTS_ROOT", "./results"), "./results"),
         button_title_max=_as_int(_get("BUTTON_TITLE_MAX", "28"), 28),
-        nano_api_url=_get("NANO_API_URL"),
-        nano_api_key=_get("NANO_API_KEY"),
+        nanobanana_api_key=api_key.strip(),
         collage=collage,
         batch_size=batch_size,
         batch_layout_cols=batch_columns,
