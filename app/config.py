@@ -14,6 +14,8 @@ DEFAULT_SHEET_URL = (
     "R7nEX7HcAqrBo_PzSKYrCln4HFeCUJTB2q_C7asfwO7AOLNiwh/pub?output=csv"
 )
 
+DEFAULT_PRIVACY_POLICY_URL = "https://telegra.ph/Politika-konfidencialnosti-LOOV-10-29"
+
 
 @dataclass(slots=True)
 class CollageConfig:
@@ -134,7 +136,10 @@ def load_config(env_file: str | None = None) -> Config:
     if idle_timeout_raw is None:
         idle_timeout_raw = _get("IDLE_REMINDER_MINUTES")
 
-    privacy_policy_url = _get("PRIVACY_POLICY_URL", "") or ""
+    privacy_policy_url = (
+        _get("PRIVACY_POLICY_URL", DEFAULT_PRIVACY_POLICY_URL)
+        or DEFAULT_PRIVACY_POLICY_URL
+    )
 
     contacts_sheet_url = _get("GOOGLE_SHEET_URL")
     google_credentials_raw = _get("GOOGLE_SERVICE_ACCOUNT_JSON")

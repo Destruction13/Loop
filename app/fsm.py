@@ -8,7 +8,6 @@ import io
 import logging
 import time
 import uuid
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -16,7 +15,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, List, Optional, Sequence
 
 from aiogram import BaseMiddleware, F, Router, Bot
-from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -159,13 +157,6 @@ def setup_router(
     idle_enabled = enable_idle_nudge and idle_delay > 0
     idle_tasks: dict[int, asyncio.Task] = {}
 
-    progress_sequence: tuple[str, ...] = (
-        msg.PROGRESS_FINDING_MODELS_STEP1,
-        msg.PROGRESS_FINDING_MODELS_STEP2,
-        msg.PROGRESS_FINDING_MODELS_STEP3,
-        msg.PROGRESS_FINDING_MODELS_STEP4,
-    )
-    progress_interval = 0.7
     policy_url = (privacy_policy_url or "").strip()
 
     def _cancel_idle_timer(user_id: int) -> None:
@@ -394,7 +385,7 @@ def setup_router(
             upload=None,
             current_models=[],
             last_batch=[],
-            model_progress_message_id=None,
+            preload_message_id=None,
             generation_progress_message_id=None,
         )
         await _send_aux_message(
@@ -484,46 +475,7 @@ def setup_router(
         if not skip_contact_prompt:
             if await _maybe_request_contact(message, state, user_id):
                 return False
-        progress_message: Message | None = None
-        progress_task: asyncio.Task | None = None
-        progress_stop: asyncio.Event | None = None
         try:
-            try:
-                progress_message = await message.answer(
-                    progress_sequence[0], reply_markup=main_reply_keyboard()
-                )
-            except TelegramBadRequest as exc:
-                logger.debug(
-                    "Failed to send progress message to %s: %s",
-                    message.chat.id,
-                    exc,
-                )
-            else:
-                progress_stop = asyncio.Event()
-
-                async def _animate_progress() -> None:
-                    index = 1
-                    while not progress_stop.is_set() and index < len(progress_sequence):
-                        await asyncio.sleep(progress_interval)
-                        if progress_stop.is_set():
-                            break
-                        try:
-                            await progress_message.edit_text(progress_sequence[index])
-                        except TelegramBadRequest as edit_exc:
-                            logger.debug(
-                                "Failed to edit progress message %s: %s",
-                                progress_message.message_id,
-                                edit_exc,
-                            )
-                            break
-                        index = min(index + 1, len(progress_sequence) - 1)
-
-                progress_task = asyncio.create_task(_animate_progress())
-                await state.update_data(
-                    model_progress_message_id=progress_message.message_id
-                )
-
-            await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
             result = await recommender.recommend_for_user(user_id, filters.gender)
         except CatalogError as exc:
             logger.error("%s Failed to fetch catalog: %s", EVENT_ID["MODELS_SENT"], exc)
@@ -534,51 +486,40 @@ def setup_router(
                 msg.CATALOG_TEMPORARILY_UNAVAILABLE,
             )
             await state.update_data(current_models=[])
+            await _delete_state_message(message, state, "preload_message_id")
             return False
-        else:
-            if not result.models:
-                try:
-                    marketing_message = msg.marketing_text(no_more_message_key)
-                except KeyError:
-                    marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
-                await _send_aux_message(
-                    message,
-                    state,
-                    message.answer,
-                    marketing_message,
-                    reply_markup=all_seen_keyboard(site_url),
-                )
-                await state.update_data(current_models=[], last_batch=[])
-                return False
-            batch = list(result.models)
-            await state.update_data(current_models=batch, last_batch=batch)
-            await _send_model_batches(message, state, batch)
-            if result.exhausted:
-                try:
-                    marketing_message = msg.marketing_text(no_more_message_key)
-                except KeyError:
-                    marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
-                await _send_aux_message(
-                    message,
-                    state,
-                    message.answer,
-                    marketing_message,
-                    reply_markup=all_seen_keyboard(site_url),
-                )
-            return True
-        finally:
-            if progress_stop:
-                progress_stop.set()
-            if progress_task:
-                progress_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await progress_task
-            if progress_message:
-                with suppress(TelegramBadRequest):
-                    await message.bot.delete_message(
-                        message.chat.id, progress_message.message_id
-                    )
-            await state.update_data(model_progress_message_id=None)
+        if not result.models:
+            try:
+                marketing_message = msg.marketing_text(no_more_message_key)
+            except KeyError:
+                marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                marketing_message,
+                reply_markup=all_seen_keyboard(site_url),
+            )
+            await state.update_data(current_models=[], last_batch=[])
+            await _delete_state_message(message, state, "preload_message_id")
+            return False
+        batch = list(result.models)
+        await state.update_data(current_models=batch, last_batch=batch)
+        await _send_model_batches(message, state, batch)
+        await _delete_state_message(message, state, "preload_message_id")
+        if result.exhausted:
+            try:
+                marketing_message = msg.marketing_text(no_more_message_key)
+            except KeyError:
+                marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                marketing_message,
+                reply_markup=all_seen_keyboard(site_url),
+            )
+        return True
 
     async def _send_model_batches(
         message: Message, state: FSMContext, batch: list[GlassModel]
@@ -758,7 +699,7 @@ def setup_router(
                     upload=None,
                     current_models=[],
                     last_batch=[],
-                    model_progress_message_id=None,
+                    preload_message_id=None,
                     generation_progress_message_id=None,
                 )
                 await _send_aux_message(
@@ -1016,6 +957,13 @@ def setup_router(
         if await _maybe_request_contact(message, state, user_id):
             logger.info("%s Contact request queued for %s", EVENT_ID["MODELS_SENT"], user_id)
             return
+        preload_message = await _send_aux_message(
+            message,
+            state,
+            message.answer,
+            msg.SEARCHING_MODELS_PROMPT,
+        )
+        await state.update_data(preload_message_id=preload_message.message_id)
         await _send_models(
             message,
             user_id,
