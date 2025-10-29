@@ -203,14 +203,62 @@ def classify_failure(
     if response is not None:
         if scan is None:
             scan = _scan_response(response)
-        finish_reason = scan.finish_reason or ""
-        if scan.has_safety or finish_reason in {"SAFETY", "BLOCKED"}:
-            detail = finish_reason or "safety_ratings"
+        finish_reason_raw = scan.finish_reason or ""
+        finish_reason = finish_reason_raw.upper()
+        has_candidates = _has_candidates(response)
+        inline_present = scan.inline_data is not None
+        has_alternative_refs = scan.has_data_url or scan.has_file_uri
+
+        safety_hit = False
+        safety_detail = ""
+        if not inline_present:
+            safety_hit, safety_detail = _detect_safety_signal(response)
+
+        if safety_hit:
+            return UNSUITABLE_CODE, safety_detail
+
+        if not inline_present:
+            if finish_reason in {"SAFETY", "BLOCKED"}:
+                detail_parts: list[str] = []
+                if finish_reason:
+                    detail_parts.append(f"finish={finish_reason}")
+                if not has_candidates:
+                    detail_parts.append("empty_candidates")
+                if not detail_parts:
+                    detail_parts.append("finish=UNKNOWN")
+                return UNSUITABLE_CODE, ",".join(detail_parts)
+
+            if finish_reason in {"OTHER", "IMAGE_OTHER", "ERROR"}:
+                detail_parts = []
+                if finish_reason:
+                    detail_parts.append(f"finish={finish_reason}")
+                if not has_candidates:
+                    detail_parts.append("empty_candidates")
+                if not has_alternative_refs:
+                    detail_parts.append("no_parts")
+                if not detail_parts:
+                    detail_parts.append("finish=UNKNOWN")
+                return TRANSIENT_CODE, ",".join(detail_parts)
+
+            if has_alternative_refs:
+                detail_parts = []
+                if finish_reason:
+                    detail_parts.append(f"finish={finish_reason}")
+                detail_parts.append("alt_refs")
+                return PARSER_MISS_CODE, ",".join(detail_parts)
+
+            if not has_candidates:
+                return TRANSIENT_CODE, "empty_candidates"
+
+            return PARSER_MISS_CODE, "no_image_data"
+
+        if finish_reason in {"SAFETY", "BLOCKED"}:
+            detail = f"finish={finish_reason}" if finish_reason else "finish=UNKNOWN"
             return UNSUITABLE_CODE, detail
-        if not _has_candidates(response):
+
+        if not has_candidates:
             return TRANSIENT_CODE, "empty_candidates"
-        if finish_reason in {"OTHER", "ERROR"}:
-            return TRANSIENT_CODE, f"finish={finish_reason}"
+
         return PARSER_MISS_CODE, "no_image_data"
 
     if error is not None:
@@ -233,6 +281,132 @@ def classify_failure(
         return PARSER_MISS_CODE, f"status={status}"
 
     return PARSER_MISS_CODE, "unknown"
+
+
+def _detect_safety_signal(response: dict[str, Any]) -> tuple[bool, str]:
+    """Inspect safety ratings and detect blocked or high-risk content."""
+
+    ratings = _collect_safety_ratings(response)
+    for rating in ratings:
+        if not isinstance(rating, dict):
+            continue
+        category_value = rating.get("category") or rating.get("name") or ""
+        matched, category_token = _match_safety_category(str(category_value))
+        if not matched:
+            continue
+        if _is_blocked_value(rating.get("blocked")):
+            return True, f"safety={category_token}/blocked"
+        level = _extract_level_token(rating)
+        if level:
+            return True, f"safety={category_token}/{level}"
+
+    return False, ""
+
+
+def _collect_safety_ratings(payload: Any) -> list[Any]:
+    """Collect safety rating dictionaries from a nested payload."""
+
+    results: list[Any] = []
+    queue: list[Any] = [payload]
+    while queue:
+        current = queue.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in {"safetyRatings", "safety_ratings"} and isinstance(value, list):
+                    results.extend(value)
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+        elif isinstance(current, list):
+            queue.extend(current)
+    return results
+
+
+_SAFETY_KEYWORDS = (
+    "image_violence",
+    "violence",
+    "harassment",
+    "hate",
+    "sexual",
+    "child_safety",
+    "dangerous",
+    "medical",
+)
+
+
+def _match_safety_category(category: str) -> tuple[bool, str]:
+    normalized = category.replace("-", "_").lower()
+    for keyword in _SAFETY_KEYWORDS:
+        if keyword in normalized:
+            return True, keyword
+    return False, normalized or "unknown"
+
+
+def _is_blocked_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        return lowered in {"true", "blocked", "1", "yes"}
+    return False
+
+
+def _extract_level_token(rating: dict[str, Any]) -> str:
+    """Extract a normalized severity level token from a safety rating."""
+
+    for key in ("probability", "probabilityScore", "probability_score", "likelihood", "severity"):
+        if key not in rating:
+            continue
+        level_raw = _normalize_level(rating[key])
+        if not level_raw:
+            continue
+        token = _level_token(level_raw)
+        if token:
+            return token
+    return ""
+
+
+def _normalize_level(value: Any) -> str:
+    if isinstance(value, str):
+        upper = value.strip().upper()
+        for prefix in (
+            "PROBABILITY_",
+            "LIKELIHOOD_",
+            "HARM_CATEGORY_",
+            "CATEGORY_",
+            "LEVEL_",
+            "SAFETY_",
+            "BLOCKED_",
+        ):
+            if upper.startswith(prefix):
+                upper = upper[len(prefix) :]
+        if upper.startswith("SCORE_"):
+            upper = upper[len("SCORE_") :]
+        if "AND_ABOVE" in upper:
+            upper = upper.replace("AND_ABOVE", "")
+        upper = upper.strip("_ ")
+        return upper
+    if isinstance(value, (int, float)):
+        if value >= 0.75:
+            return "HIGH"
+        if value >= 0.5:
+            return "MEDIUM"
+        return ""
+    if isinstance(value, dict):
+        for key in ("label", "value", "name"):
+            if key in value:
+                normalized = _normalize_level(value[key])
+                if normalized:
+                    return normalized
+    return ""
+
+
+def _level_token(level: str) -> str:
+    upper = level.upper()
+    if "HIGH" in upper:
+        return "high"
+    if "MEDIUM" in upper:
+        return "medium"
+    return ""
 
 
 async def _request_generation(url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -317,7 +491,7 @@ def _scan_response(payload: Any) -> _ResponseScan:
                         finish_reason = value
                 elif key in {"fileUri", "file_uri"} and isinstance(value, str):
                     has_file_uri = True
-                elif key == "safetyRatings" and isinstance(value, list) and value:
+                elif key in {"safetyRatings", "safety_ratings"} and isinstance(value, list) and value:
                     has_safety = True
                 elif key.lower() in {"data", "uri", "url"} and isinstance(value, str):
                     if value.startswith("data:"):
