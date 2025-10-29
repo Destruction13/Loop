@@ -56,8 +56,6 @@ from app.services.repository import Repository
 from app.infrastructure.concurrency import with_generation_slot
 from app.services.drive_fetch import fetch_drive_file
 from app.services.image_io import (
-    ensure_dimensions,
-    load_image_metadata,
     redownload_user_photo,
     resize_inplace,
     save_user_photo,
@@ -1160,8 +1158,6 @@ def setup_router(
         progress_message: Message | None = None
         user_photo_path: Path | None = None
         result_bytes: bytes | None = None
-        base_size: tuple[int, int] | None = None
-        base_exif: bytes | None = None
         start_time = 0.0
 
         async def _edit_progress(text: str) -> None:
@@ -1191,14 +1187,6 @@ def setup_router(
             else:
                 raise RuntimeError("User photo is not available")
 
-            try:
-                base_size, base_exif = await asyncio.to_thread(
-                    load_image_metadata, user_photo_path
-                )
-            except Exception as exc:  # pragma: no cover - best effort metadata
-                logger.debug("Failed to read image metadata for %s: %s", user_id, exc)
-                base_size = None
-                base_exif = None
             progress_message = await _send_aux_message(
                 message,
                 state,
@@ -1229,20 +1217,6 @@ def setup_router(
             )
             latency_ms = int((time.perf_counter() - start_time) * 1000)
             result_bytes = generation_result.image_bytes
-            if base_size:
-                try:
-                    result_bytes = await asyncio.to_thread(
-                        ensure_dimensions,
-                        result_bytes,
-                        base_size,
-                        exif=base_exif,
-                    )
-                except Exception as exc:  # pragma: no cover - best effort guard
-                    logger.debug(
-                        "Failed to enforce result dimensions for %s: %s",
-                        user_id,
-                        exc,
-                    )
             result_kb = len(result_bytes) / 1024 if result_bytes else 0
             logger.info(
                 (

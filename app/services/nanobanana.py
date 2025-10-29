@@ -18,11 +18,7 @@ SYSTEM_PROMPT = (
     "Make sure the glasses fit perfectly — keep correct proportions, perspective, and realistic positioning on the nose and ears (if visible).\n"
     "Do not distort or change the original face or its features, only add the glasses.\n"
     "Keep natural lighting, shadows, and reflections consistent with the base image.\n"
-    "The final result should look like a real photo where the glasses are actually worn.\n"
-    "DO NOT expand or alter the original canvas.\n"
-    "Output MUST keep the exact original resolution (width × height) of the base photo.\n"
-    "Only add the glasses onto the face; do not inpaint or modify background, skin, hair, or other features.\n"
-    "Keep lighting, shadows, and reflections consistent. Do not upscale or pad the image."
+    "The final result should look like a real photo where the glasses are actually worn."
 )
 
 MODEL_NAME = "gemini-2.5-flash-image"
