@@ -60,6 +60,27 @@ class _ResponseScan:
     has_safety: bool
 
 
+@dataclass(slots=True)
+class SafetySummary:
+    """Structured representation of detected safety signals."""
+
+    present: bool
+    triggered: bool
+    detail: str
+    categories: tuple[str, ...]
+    levels: dict[str, str]
+
+    @classmethod
+    def empty(cls) -> "SafetySummary":
+        return cls(
+            present=False,
+            triggered=False,
+            detail="",
+            categories=(),
+            levels={},
+        )
+
+
 class NanoBananaGenerationError(RuntimeError):
     """Error raised when Gemini fails to return a usable image."""
 
@@ -76,6 +97,9 @@ class NanoBananaGenerationError(RuntimeError):
         has_file_uri: bool = False,
         attempt: int = 1,
         retried: bool = False,
+        safety_present: bool = False,
+        safety_categories: tuple[str, ...] | list[str] | None = None,
+        safety_levels: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.response = response
@@ -87,6 +111,9 @@ class NanoBananaGenerationError(RuntimeError):
         self.has_file_uri = has_file_uri
         self.attempt = attempt
         self.retried = retried
+        self.safety_present = safety_present
+        self.safety_categories = tuple(safety_categories or ())
+        self.safety_levels = dict(safety_levels or {})
 
     def with_attempt(self, attempt: int, retried: bool) -> "NanoBananaGenerationError":
         self.attempt = attempt
@@ -143,7 +170,7 @@ async def generate_glasses(face_path: str, glasses_path: str) -> GenerationSucce
             try:
                 decoded = base64.b64decode(scan.inline_data, validate=True)
             except (ValueError, TypeError) as exc:  # pragma: no cover - unexpected format
-                reason_code, reason_detail = classify_failure(
+                reason_code, reason_detail, safety = classify_failure(
                     data, exc, scan=scan
                 )
                 error = NanoBananaGenerationError(
@@ -155,6 +182,9 @@ async def generate_glasses(face_path: str, glasses_path: str) -> GenerationSucce
                     has_inline=scan.has_inline,
                     has_data_url=scan.has_data_url,
                     has_file_uri=scan.has_file_uri,
+                    safety_present=safety.present,
+                    safety_categories=safety.categories,
+                    safety_levels=safety.levels,
                 ).with_attempt(attempt, retried)
                 if (
                     error.reason_code == TRANSIENT_CODE
@@ -174,7 +204,7 @@ async def generate_glasses(face_path: str, glasses_path: str) -> GenerationSucce
                 retried=retried,
             )
 
-        reason_code, reason_detail = classify_failure(data, scan=scan)
+        reason_code, reason_detail, safety = classify_failure(data, scan=scan)
         error = NanoBananaGenerationError(
             "Gemini response missing image data",
             response=data,
@@ -184,6 +214,9 @@ async def generate_glasses(face_path: str, glasses_path: str) -> GenerationSucce
             has_inline=scan.has_inline,
             has_data_url=scan.has_data_url,
             has_file_uri=scan.has_file_uri,
+            safety_present=safety.present,
+            safety_categories=safety.categories,
+            safety_levels=safety.levels,
         ).with_attempt(attempt, retried)
         if error.reason_code == TRANSIENT_CODE and attempt <= len(_RETRY_DELAYS):
             await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
@@ -197,8 +230,10 @@ def classify_failure(
     *,
     status: int | None = None,
     scan: _ResponseScan | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, SafetySummary]:
     """Classify the reason for a failed generation attempt."""
+
+    safety_summary = SafetySummary.empty()
 
     if response is not None:
         if scan is None:
@@ -209,13 +244,11 @@ def classify_failure(
         inline_present = scan.inline_data is not None
         has_alternative_refs = scan.has_data_url or scan.has_file_uri
 
-        safety_hit = False
-        safety_detail = ""
-        if not inline_present:
-            safety_hit, safety_detail = _detect_safety_signal(response)
+        safety_summary = _analyse_safety_signals(response)
 
-        if safety_hit:
-            return UNSUITABLE_CODE, safety_detail
+        if not inline_present and not has_alternative_refs and safety_summary.triggered:
+            detail = safety_summary.detail or "safety=unknown"
+            return UNSUITABLE_CODE, detail, safety_summary
 
         if not inline_present:
             if finish_reason in {"SAFETY", "BLOCKED"}:
@@ -226,9 +259,9 @@ def classify_failure(
                     detail_parts.append("empty_candidates")
                 if not detail_parts:
                     detail_parts.append("finish=UNKNOWN")
-                return UNSUITABLE_CODE, ",".join(detail_parts)
+                return UNSUITABLE_CODE, ",".join(detail_parts), safety_summary
 
-            if finish_reason in {"OTHER", "IMAGE_OTHER", "ERROR"}:
+            if finish_reason in {"OTHER", "IMAGE_OTHER", "ERROR"} and not safety_summary.triggered:
                 detail_parts = []
                 if finish_reason:
                     detail_parts.append(f"finish={finish_reason}")
@@ -238,55 +271,61 @@ def classify_failure(
                     detail_parts.append("no_parts")
                 if not detail_parts:
                     detail_parts.append("finish=UNKNOWN")
-                return TRANSIENT_CODE, ",".join(detail_parts)
+                return TRANSIENT_CODE, ",".join(detail_parts), safety_summary
 
             if has_alternative_refs:
                 detail_parts = []
                 if finish_reason:
                     detail_parts.append(f"finish={finish_reason}")
                 detail_parts.append("alt_refs")
-                return PARSER_MISS_CODE, ",".join(detail_parts)
+                return PARSER_MISS_CODE, ",".join(detail_parts), safety_summary
 
             if not has_candidates:
-                return TRANSIENT_CODE, "empty_candidates"
+                return TRANSIENT_CODE, "empty_candidates", safety_summary
 
-            return PARSER_MISS_CODE, "no_image_data"
+            return PARSER_MISS_CODE, "no_image_data", safety_summary
 
         if finish_reason in {"SAFETY", "BLOCKED"}:
             detail = f"finish={finish_reason}" if finish_reason else "finish=UNKNOWN"
-            return UNSUITABLE_CODE, detail
+            return UNSUITABLE_CODE, detail, safety_summary
 
         if not has_candidates:
-            return TRANSIENT_CODE, "empty_candidates"
+            return TRANSIENT_CODE, "empty_candidates", safety_summary
 
-        return PARSER_MISS_CODE, "no_image_data"
+        return PARSER_MISS_CODE, "no_image_data", safety_summary
 
     if error is not None:
         if isinstance(error, asyncio.TimeoutError):
-            return TRANSIENT_CODE, "timeout"
+            return TRANSIENT_CODE, "timeout", safety_summary
         if isinstance(error, aiohttp.ClientResponseError):
             status = error.status
             if status >= 500 or status == 429:
-                return TRANSIENT_CODE, f"status={status}"
-            return PARSER_MISS_CODE, f"status={status}"
+                return TRANSIENT_CODE, f"status={status}", safety_summary
+            return PARSER_MISS_CODE, f"status={status}", safety_summary
         if isinstance(error, aiohttp.ClientError):
-            return TRANSIENT_CODE, error.__class__.__name__
+            return TRANSIENT_CODE, error.__class__.__name__, safety_summary
         if isinstance(error, json.JSONDecodeError):
-            return PARSER_MISS_CODE, "json_decode"
-        return TRANSIENT_CODE, error.__class__.__name__
+            return PARSER_MISS_CODE, "json_decode", safety_summary
+        return TRANSIENT_CODE, error.__class__.__name__, safety_summary
 
     if status is not None:
         if status >= 500 or status == 429:
-            return TRANSIENT_CODE, f"status={status}"
-        return PARSER_MISS_CODE, f"status={status}"
+            return TRANSIENT_CODE, f"status={status}", safety_summary
+        return PARSER_MISS_CODE, f"status={status}", safety_summary
 
-    return PARSER_MISS_CODE, "unknown"
+    return PARSER_MISS_CODE, "unknown", safety_summary
 
 
-def _detect_safety_signal(response: dict[str, Any]) -> tuple[bool, str]:
-    """Inspect safety ratings and detect blocked or high-risk content."""
+def _analyse_safety_signals(response: dict[str, Any]) -> SafetySummary:
+    """Inspect safety ratings and aggregate their severities."""
 
     ratings = _collect_safety_ratings(response)
+    categories_in_order: list[str] = []
+    levels: dict[str, str] = {}
+    triggered = False
+    detail = ""
+    detail_priority = -1
+
     for rating in ratings:
         if not isinstance(rating, dict):
             continue
@@ -294,13 +333,41 @@ def _detect_safety_signal(response: dict[str, Any]) -> tuple[bool, str]:
         matched, category_token = _match_safety_category(str(category_value))
         if not matched:
             continue
-        if _is_blocked_value(rating.get("blocked")):
-            return True, f"safety={category_token}/blocked"
-        level = _extract_level_token(rating)
-        if level:
-            return True, f"safety={category_token}/{level}"
+        if category_token not in categories_in_order:
+            categories_in_order.append(category_token)
 
-    return False, ""
+        blocked = _is_blocked_value(rating.get("blocked"))
+        level_token = _extract_level_token(rating)
+        if blocked:
+            _merge_level(levels, category_token, "BLOCKED")
+        elif level_token:
+            _merge_level(levels, category_token, level_token.upper())
+
+        if blocked:
+            triggered = True
+            blocked_priority = _LEVEL_PRIORITY.get("BLOCKED", 4)
+            if detail_priority < blocked_priority:
+                detail = f"safety={category_token}/blocked"
+                detail_priority = blocked_priority
+            continue
+
+        if level_token:
+            severity_priority = _LEVEL_PRIORITY.get(level_token.upper(), 0)
+            if severity_priority >= _LEVEL_PRIORITY.get("MEDIUM", 2):
+                triggered = True
+                if severity_priority > detail_priority:
+                    detail = f"safety={category_token}/{level_token}"
+                    detail_priority = severity_priority
+
+    present = bool(categories_in_order)
+    ordered_levels = {cat: levels[cat] for cat in categories_in_order if cat in levels}
+    return SafetySummary(
+        present=present,
+        triggered=triggered,
+        detail=detail,
+        categories=tuple(categories_in_order),
+        levels=ordered_levels,
+    )
 
 
 def _collect_safety_ratings(payload: Any) -> list[Any]:
@@ -324,17 +391,30 @@ def _collect_safety_ratings(payload: Any) -> list[Any]:
 _SAFETY_KEYWORDS = (
     "image_violence",
     "violence",
+    "graphic",
+    "blood",
     "harassment",
+    "threat",
     "hate",
     "sexual",
     "child_safety",
+    "self_harm",
+    "suicide",
     "dangerous",
+    "weapons",
+    "firearm",
+    "terrorism",
+    "extremism",
     "medical",
+    "drugs",
 )
 
 
 def _match_safety_category(category: str) -> tuple[bool, str]:
-    normalized = category.replace("-", "_").lower()
+    normalized = category.replace("-", "_").lower().strip()
+    for prefix in ("harm_category_", "harm_", "category_"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
     for keyword in _SAFETY_KEYWORDS:
         if keyword in normalized:
             return True, keyword
@@ -353,7 +433,18 @@ def _is_blocked_value(value: Any) -> bool:
 def _extract_level_token(rating: dict[str, Any]) -> str:
     """Extract a normalized severity level token from a safety rating."""
 
-    for key in ("probability", "probabilityScore", "probability_score", "likelihood", "severity"):
+    for key in (
+        "probability",
+        "probabilityScore",
+        "probability_score",
+        "prob",
+        "probabilityLevel",
+        "likelihood",
+        "likelihoodLevel",
+        "severity",
+        "severityLevel",
+        "confidence",
+    ):
         if key not in rating:
             continue
         level_raw = _normalize_level(rating[key])
@@ -363,6 +454,22 @@ def _extract_level_token(rating: dict[str, Any]) -> str:
         if token:
             return token
     return ""
+
+
+_LEVEL_PRIORITY = {
+    "BLOCKED": 4,
+    "HIGH": 3,
+    "MEDIUM": 2,
+    "LOW": 1,
+    "VERY_LOW": 0,
+}
+
+
+def _merge_level(levels: dict[str, str], category: str, level: str) -> None:
+    current_priority = _LEVEL_PRIORITY.get(level.upper(), 0)
+    previous = levels.get(category)
+    if previous is None or current_priority > _LEVEL_PRIORITY.get(previous, 0):
+        levels[category] = level.upper()
 
 
 def _normalize_level(value: Any) -> str:
@@ -406,6 +513,10 @@ def _level_token(level: str) -> str:
         return "high"
     if "MEDIUM" in upper:
         return "medium"
+    if "LOW" in upper:
+        if "VERY" in upper:
+            return "very_low"
+        return "low"
     return ""
 
 
@@ -415,36 +526,48 @@ async def _request_generation(url: str, payload: dict[str, Any]) -> dict[str, An
             async with session.post(url, json=payload) as response:
                 text = await response.text()
                 if response.status != 200:
-                    reason_code, reason_detail = classify_failure(
+                    reason_code, reason_detail, safety = classify_failure(
                         None, status=response.status
                     )
                     raise NanoBananaGenerationError(
                         f"Gemini API returned status {response.status}",
                         reason_code=reason_code,
                         reason_detail=f"{reason_detail}:{text[:120]}",
+                        safety_present=safety.present,
+                        safety_categories=safety.categories,
+                        safety_levels=safety.levels,
                     )
                 try:
                     return json.loads(text)
                 except json.JSONDecodeError as exc:
-                    reason_code, reason_detail = classify_failure(None, exc)
+                    reason_code, reason_detail, safety = classify_failure(None, exc)
                     raise NanoBananaGenerationError(
                         "Failed to decode Gemini response as JSON",
                         reason_code=reason_code,
                         reason_detail=reason_detail,
+                        safety_present=safety.present,
+                        safety_categories=safety.categories,
+                        safety_levels=safety.levels,
                     ) from exc
         except asyncio.TimeoutError as exc:  # pragma: no cover - network failures
-            reason_code, reason_detail = classify_failure(None, exc)
+            reason_code, reason_detail, safety = classify_failure(None, exc)
             raise NanoBananaGenerationError(
                 "Gemini request timed out",
                 reason_code=reason_code,
                 reason_detail=reason_detail,
+                safety_present=safety.present,
+                safety_categories=safety.categories,
+                safety_levels=safety.levels,
             ) from exc
         except aiohttp.ClientError as exc:  # pragma: no cover - network failures
-            reason_code, reason_detail = classify_failure(None, exc)
+            reason_code, reason_detail, safety = classify_failure(None, exc)
             raise NanoBananaGenerationError(
                 "Gemini request error",
                 reason_code=reason_code,
                 reason_detail=reason_detail,
+                safety_present=safety.present,
+                safety_categories=safety.categories,
+                safety_levels=safety.levels,
             ) from exc
 
 
@@ -530,6 +653,7 @@ def _has_candidates(response: dict[str, Any]) -> bool:
 __all__ = [
     "GenerationSuccess",
     "NanoBananaGenerationError",
+    "SafetySummary",
     "classify_failure",
     "configure",
     "generate_glasses",

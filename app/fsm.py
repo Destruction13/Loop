@@ -1063,7 +1063,8 @@ def setup_router(
                 (
                     "NanoBanana failure: user_id=%s frame_id=%s finish_reason=%s "
                     "reason_code=%s reason_detail=%s has_inline=%s has_data_url=%s "
-                    "has_file_uri=%s latency_ms=%s attempt=%s retried=%s"
+                    "has_file_uri=%s latency_ms=%s attempt=%s retried=%s "
+                    "safety_present=%s safety_categories=%s safety_levels=%s"
                 ),
                 user_id,
                 model.unique_id,
@@ -1076,6 +1077,9 @@ def setup_router(
                 latency_ms,
                 exc.attempt,
                 exc.retried,
+                exc.safety_present,
+                list(exc.safety_categories),
+                exc.safety_levels,
             )
             await _delete_state_message(message, state, "generation_progress_message_id")
             if exc.reason_code == "UNSUITABLE_PHOTO":
