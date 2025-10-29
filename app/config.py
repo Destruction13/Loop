@@ -36,6 +36,7 @@ class Config:
     bot_token: str
     sheet_csv_url: str
     site_url: str
+    privacy_policy_url: str
     promo_code: str
     daily_try_limit: int
     reminder_hours: int
@@ -133,6 +134,8 @@ def load_config(env_file: str | None = None) -> Config:
     if idle_timeout_raw is None:
         idle_timeout_raw = _get("IDLE_REMINDER_MINUTES")
 
+    privacy_policy_url = _get("PRIVACY_POLICY_URL", "") or ""
+
     contacts_sheet_url = _get("GOOGLE_SHEET_URL")
     google_credentials_raw = _get("GOOGLE_SERVICE_ACCOUNT_JSON")
     google_credentials_path = (
@@ -149,6 +152,7 @@ def load_config(env_file: str | None = None) -> Config:
         bot_token=_get("BOT_TOKEN", required=True),
         sheet_csv_url=_get("SHEET_CSV_URL", DEFAULT_SHEET_URL) or DEFAULT_SHEET_URL,
         site_url=(site_url or "https://loov.ru/") if site_url is not None else "https://loov.ru/",
+        privacy_policy_url=privacy_policy_url,
         promo_code=promo_code,
         daily_try_limit=_as_int(_get("DAILY_TRY_LIMIT", "7"), 7),
         reminder_hours=_as_int(_get("REMINDER_HOURS", "24"), 24),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -59,5 +60,50 @@ def resize_inplace(path: str | Path, max_side: int = 2048) -> None:
         image.save(file_path, format=format_hint, **save_kwargs)
 
 
-__all__ = ["save_user_photo", "redownload_user_photo", "resize_inplace"]
+def load_image_metadata(path: str | Path) -> tuple[tuple[int, int], bytes | None]:
+    """Return (width, height) and optional EXIF blob for the provided image."""
+
+    file_path = Path(path)
+    with Image.open(file_path) as image:
+        image = ImageOps.exif_transpose(image)
+        size = image.size
+        exif_bytes = image.info.get("exif")
+    return size, exif_bytes
+
+
+def ensure_dimensions(
+    image_bytes: bytes,
+    size: tuple[int, int],
+    *,
+    exif: bytes | None = None,
+) -> bytes:
+    """Resize the in-memory image to the exact size, preserving format and optional EXIF."""
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image = ImageOps.exif_transpose(image)
+        target_size = tuple(size)
+        if image.size != target_size:
+            image = image.resize(target_size, Image.LANCZOS)
+        output = io.BytesIO()
+        format_hint = (image.format or "PNG").upper()
+        save_kwargs: dict[str, bytes | int] = {}
+        if format_hint == "JPEG" and image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+        if format_hint == "JPEG":
+            if exif:
+                save_kwargs["exif"] = exif
+            save_kwargs["quality"] = 95
+        elif format_hint in {"TIFF"} and exif:
+            save_kwargs["exif"] = exif
+        image.save(output, format=format_hint, **save_kwargs)
+        return output.getvalue()
+
+
+__all__ = [
+    "save_user_photo",
+    "redownload_user_photo",
+    "resize_inplace",
+    "load_image_metadata",
+    "ensure_dimensions",
+]
 

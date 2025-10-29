@@ -1,6 +1,7 @@
 import asyncio
 import io
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, Optional, Sequence
@@ -35,12 +36,16 @@ class DummyBot:
     def __init__(self) -> None:
         self.deleted: list[tuple[int, int]] = []
         self.downloads: list[tuple[Any, Path]] = []
+        self.chat_actions: list[tuple[int, Any]] = []
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
 
     async def download(self, photo: PhotoStub, destination: Path) -> None:
         self.downloads.append((photo, destination))
+
+    async def send_chat_action(self, chat_id: int, action: Any) -> None:
+        self.chat_actions.append((chat_id, action))
 
 
 class DummyMessage:
@@ -117,6 +122,7 @@ class DummyCallback:
         self.message = message
         self.from_user = SimpleNamespace(id=message.from_user.id)
         self._answers: list[tuple[Optional[str], bool]] = []
+        self.bot = message.bot
 
     async def answer(self, text: Optional[str] = None, show_alert: bool = False) -> None:
         self._answers.append((text, show_alert))
@@ -144,7 +150,7 @@ class StubRepository:
     def __init__(self) -> None:
         self.gender: Optional[str] = None
         self.daily_limit: int = 5
-        self.daily_used: int = 0
+        self.tries_used: int = 0
         self.seen_models: list[str] = []
         self.updated_filters: list[tuple[int, str]] = []
         self.reminder: Optional[Any] = None
@@ -154,11 +160,18 @@ class StubRepository:
         self.contact_never: dict[int, bool] = {}
         self.contacts: dict[int, Any] = {}
         self.activity: list[int] = []
+        self.locked_until: Optional[datetime] = None
+        self.cycle_index: int = 0
+        self.nudge_sent: bool = False
 
     async def ensure_user(self, user_id: int) -> Any:
         return SimpleNamespace(
             gender=self.gender,
-            daily_used=self.daily_used,
+            tries_used=self.tries_used,
+            daily_try_limit=self.daily_limit,
+            locked_until=self.locked_until,
+            nudge_sent_cycle=self.nudge_sent,
+            cycle_index=self.cycle_index,
             seen_models=list(self.seen_models),
             gen_count=self.gen_counts.get(user_id, 0),
             contact_skip_once=self.contact_skip.get(user_id, False),
@@ -169,11 +182,23 @@ class StubRepository:
         self.updated_filters.append((user_id, gender))
         self.gender = gender
 
-    async def ensure_daily_reset(self, user_id: int) -> Any:
-        return SimpleNamespace(daily_used=self.daily_used)
+    async def ensure_daily_reset(self, user_id: int, *, now: Optional[datetime] = None) -> Any:
+        if self.locked_until and now and now >= self.locked_until:
+            self.locked_until = None
+            self.tries_used = 0
+            self.cycle_index += 1
+            self.nudge_sent = False
+        return SimpleNamespace(
+            tries_used=self.tries_used,
+            daily_try_limit=self.daily_limit,
+            locked_until=self.locked_until,
+            nudge_sent_cycle=self.nudge_sent,
+        )
 
     async def remaining_tries(self, user_id: int) -> int:
-        return max(self.daily_limit - self.daily_used, 0)
+        if self.locked_until is not None:
+            return 0
+        return max(self.daily_limit - self.tries_used, 0)
 
     async def record_seen_models(
         self,
@@ -193,7 +218,11 @@ class StubRepository:
         return False, False
 
     async def inc_used_on_success(self, user_id: int) -> None:
-        self.daily_used += 1
+        if self.locked_until is not None:
+            return
+        self.tries_used += 1
+        if self.tries_used >= self.daily_limit:
+            self.locked_until = datetime.now(UTC) + timedelta(hours=24)
 
     async def touch_activity(self, user_id: int) -> None:
         self.activity.append(user_id)
@@ -203,6 +232,9 @@ class StubRepository:
 
     async def mark_idle_reminder_sent(self, user_id: int) -> None:
         return None
+
+    async def mark_cycle_nudge_sent(self, user_id: int) -> None:
+        self.nudge_sent = True
 
     async def get_generation_count(self, user_id: int) -> int:
         return self.gen_counts.get(user_id, 0)
@@ -412,6 +444,9 @@ def build_router(
         promo_contact_code="PROMO1000",
         leads_exporter=leads_exporter,
         contact_exporter=contact_exporter,
+        idle_nudge_seconds=0,
+        enable_idle_nudge=False,
+        privacy_policy_url="https://example.com/privacy",
     )
     return router, repository, tryon, builder, recommender
 
@@ -687,7 +722,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         assert upload_message.message_id in deleted_ids
         assert any(mid > upload_message.message_id for mid in deleted_ids)
         assert state.data.get("generation_progress_message_id") is None
-        assert repository.daily_used == 1
+        assert repository.tries_used == 1
         assert state.state is TryOnStates.RESULT
         assert len(upload_message.answer_photos) == initial_photo_count + 1
         assert upload_message.answer_photos[-1][1] == "".join(msg.FIRST_RESULT_CAPTION)
@@ -697,7 +732,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         handler_more = get_callback_handler(router, "result_more")
         await handler_more(callback_follow, state)
         assert state.state is TryOnStates.AWAITING_PHOTO
-        assert upload_message.answers[-1][0] == "".join(msg.NEXT_RESULT_CAPTION)
+        assert upload_message.answers[-1][0] == "".join(msg.PHOTO_INSTRUCTION)
         assert_main_menu_keyboard(upload_message.answers[-1][1])
         assert upload_message.edited_captions
         last_caption_edit = upload_message.edited_captions[-1]
@@ -880,7 +915,7 @@ def test_idle_reminder_message_removed_when_user_requests_more(tmp_path: Path) -
         callback = DummyCallback("more|idle", message)
         await handler_more(callback, state)
 
-        assert message.answers[-1][0] == msg.SEARCHING_MODELS_PROMPT
+        assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
         assert (555, message.message_id) in bot.deleted
 
     asyncio.run(scenario())
@@ -930,7 +965,7 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
         more_callback = DummyCallback("more|1", message)
         await handler_more(more_callback, state)
         assert state.state is TryOnStates.AWAITING_PHOTO
-        assert message.answers[-1][0] == "".join(msg.NEXT_RESULT_CAPTION)
+        assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
         assert_main_menu_keyboard(message.answers[-1][1])
 
         message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]

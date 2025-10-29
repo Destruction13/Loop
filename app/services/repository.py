@@ -37,30 +37,57 @@ class Repository:
             now = datetime.now(timezone.utc)
             profile = UserProfile(
                 user_id=user_id,
+                daily_used=0,
+                tries_used=0,
+                daily_try_limit=self._daily_limit,
+                cycle_index=0,
+                cycle_started_at=None,
+                locked_until=None,
+                nudge_sent_cycle=False,
                 last_reset_at=now,
                 last_activity_ts=int(time.time()),
             )
+            await asyncio.to_thread(self._upsert_user, profile)
+            return profile
+
+        changed = self._apply_profile_defaults(profile)
+        if changed:
             await asyncio.to_thread(self._upsert_user, profile)
         return profile
 
     async def update_filters(self, user_id: int, *, gender: Optional[str] = None) -> None:
         await asyncio.to_thread(self._update_filters_sync, user_id, gender)
 
-    async def ensure_daily_reset(self, user_id: int, *, now: Optional[datetime] = None) -> UserProfile:
-        now = now or datetime.now(timezone.utc)
-        lock = self._ensure_lock()
-        async with lock:
-            profile = await self.ensure_user(user_id)
-            if not profile.last_reset_at or now - profile.last_reset_at >= timedelta(hours=24):
-                profile.daily_used = 0
-                profile.seen_models = []
-                profile.last_reset_at = now
-                await asyncio.to_thread(self._upsert_user, profile)
-            return profile
+    async def ensure_daily_reset(
+        self,
+        user_id: int,
+        *,
+        now: Optional[datetime] = None,
+        lock: bool = True,
+    ) -> UserProfile:
+        moment = now or datetime.now(timezone.utc)
+        if lock:
+            lock_obj = self._ensure_lock()
+            async with lock_obj:
+                return await self._ensure_daily_reset_locked(user_id, moment)
+        return await self._ensure_daily_reset_locked(user_id, moment)
+
+    async def _ensure_daily_reset_locked(
+        self, user_id: int, moment: datetime
+    ) -> UserProfile:
+        profile = await self.ensure_user(user_id)
+        updated = self._apply_profile_defaults(profile)
+        if profile.locked_until and profile.locked_until <= moment:
+            self._start_new_cycle(profile, moment)
+            updated = True
+        if updated:
+            await asyncio.to_thread(self._upsert_user, profile)
+        return profile
 
     async def remaining_tries(self, user_id: int) -> int:
         profile = await self.ensure_daily_reset(user_id)
-        return profile.remaining(self._daily_limit)
+        effective_limit = profile.daily_try_limit or self._daily_limit
+        return profile.remaining(effective_limit)
 
     async def touch_activity(self, user_id: int, *, timestamp: Optional[int] = None) -> None:
         await self.ensure_user(user_id)
@@ -73,17 +100,33 @@ class Repository:
     async def mark_idle_reminder_sent(self, user_id: int) -> None:
         await asyncio.to_thread(self._mark_idle_reminder_sent_sync, user_id)
 
+    async def mark_cycle_nudge_sent(self, user_id: int) -> None:
+        await asyncio.to_thread(self._set_nudge_flag_sync, user_id, True)
+
     async def list_social_ad_candidates(self, threshold_ts: int) -> List[UserProfile]:
         return await asyncio.to_thread(self._list_social_ad_candidates_sync, threshold_ts)
 
     async def mark_social_ad_shown(self, user_id: int) -> None:
         await asyncio.to_thread(self._mark_social_ad_shown_sync, user_id)
 
-    async def inc_used_on_success(self, user_id: int) -> None:
-        profile = await self.ensure_daily_reset(user_id)
+    async def inc_used_on_success(
+        self, user_id: int, *, now: Optional[datetime] = None
+    ) -> None:
+        moment = now or datetime.now(timezone.utc)
         lock = self._ensure_lock()
         async with lock:
-            profile.daily_used += 1
+            profile = await self.ensure_daily_reset(user_id, now=moment, lock=False)
+            if profile.locked_until and profile.locked_until > moment:
+                return
+            limit = profile.daily_try_limit or self._daily_limit
+            if profile.cycle_started_at is None:
+                profile.cycle_started_at = moment
+            profile.tries_used = max(profile.tries_used, 0) + 1
+            if profile.tries_used == 1:
+                profile.cycle_started_at = moment
+            profile.daily_used = profile.tries_used
+            if limit > 0 and profile.tries_used >= limit:
+                profile.locked_until = moment + timedelta(hours=24)
             await asyncio.to_thread(self._upsert_user, profile)
 
     async def get_generation_count(self, user_id: int) -> int:
@@ -190,13 +233,19 @@ class Repository:
     def _create_schema(self) -> None:
         with self._connection() as conn:
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     gender TEXT,
                     age_bucket TEXT,
                     style TEXT,
-                    daily_used INTEGER DEFAULT 0,
+                    daily_used INTEGER NOT NULL DEFAULT 0,
+                    tries_used INTEGER NOT NULL DEFAULT 0,
+                    daily_try_limit INTEGER NOT NULL DEFAULT {int(self._daily_limit)},
+                    cycle_started_at TEXT,
+                    cycle_index INTEGER NOT NULL DEFAULT 0,
+                    locked_until TEXT,
+                    nudge_sent_cycle INTEGER NOT NULL DEFAULT 0,
                     last_reset_at TEXT,
                     seen_models TEXT,
                     remind_at TEXT,
@@ -230,6 +279,7 @@ class Repository:
         remind_at = datetime.fromisoformat(row["remind_at"]) if row["remind_at"] else None
         seen_models = json.loads(row["seen_models"]) if row["seen_models"] else []
         social_ad_raw = 0
+        columns: Iterable[str] = ()
         if isinstance(row, sqlite3.Row):
             columns = row.keys()
             if "social_ad_shown" in columns:
@@ -239,12 +289,39 @@ class Repository:
                 social_ad_raw = row["social_ad_shown"]
             except Exception:  # pragma: no cover - defensive fallback
                 social_ad_raw = 0
+
+        def _has(column: str) -> bool:
+            return column in columns if columns else False
+
+        tries_used = row["tries_used"] if _has("tries_used") else row["daily_used"] or 0
+        daily_limit = row["daily_try_limit"] if _has("daily_try_limit") else self._daily_limit
+        cycle_started_at = (
+            datetime.fromisoformat(row["cycle_started_at"])
+            if _has("cycle_started_at") and row["cycle_started_at"]
+            else None
+        )
+        locked_until = (
+            datetime.fromisoformat(row["locked_until"])
+            if _has("locked_until") and row["locked_until"]
+            else None
+        )
+        cycle_index = row["cycle_index"] if _has("cycle_index") else 0
+        nudge_sent = bool(row["nudge_sent_cycle"] or 0) if _has("nudge_sent_cycle") else False
+        daily_used = row["daily_used"] if row["daily_used"] is not None else tries_used
+        if daily_used != tries_used and tries_used >= 0:
+            daily_used = tries_used
         return UserProfile(
             user_id=row["user_id"],
             gender=row["gender"],
             age_bucket=row["age_bucket"],
             style=row["style"] or "normal",
-            daily_used=row["daily_used"],
+            daily_used=daily_used,
+            tries_used=max(int(tries_used), 0),
+            daily_try_limit=int(daily_limit) if daily_limit is not None else self._daily_limit,
+            cycle_started_at=cycle_started_at,
+            cycle_index=int(cycle_index) if cycle_index is not None else 0,
+            locked_until=locked_until,
+            nudge_sent_cycle=nudge_sent,
             last_reset_at=last_reset_at,
             seen_models=seen_models,
             remind_at=remind_at,
@@ -276,6 +353,15 @@ class Repository:
 
     def _upsert_user(self, profile: UserProfile) -> None:
         data = asdict(profile)
+        tries_used = max(int(data.get("tries_used", 0) or 0), 0)
+        data["tries_used"] = tries_used
+        data["daily_used"] = tries_used
+        limit_value = data.get("daily_try_limit")
+        data["daily_try_limit"] = (
+            int(limit_value)
+            if isinstance(limit_value, int) and limit_value > 0
+            else int(self._daily_limit)
+        )
         with self._connection() as conn:
             conn.execute(
                 """
@@ -285,6 +371,12 @@ class Repository:
                     age_bucket,
                     style,
                     daily_used,
+                    tries_used,
+                    daily_try_limit,
+                    cycle_started_at,
+                    cycle_index,
+                    locked_until,
+                    nudge_sent_cycle,
                     last_reset_at,
                     seen_models,
                     remind_at,
@@ -302,6 +394,12 @@ class Repository:
                     :age_bucket,
                     :style,
                     :daily_used,
+                    :tries_used,
+                    :daily_try_limit,
+                    :cycle_started_at,
+                    :cycle_index,
+                    :locked_until,
+                    :nudge_sent_cycle,
                     :last_reset_at,
                     :seen_models,
                     :remind_at,
@@ -318,6 +416,12 @@ class Repository:
                     age_bucket=excluded.age_bucket,
                     style=excluded.style,
                     daily_used=excluded.daily_used,
+                    tries_used=excluded.tries_used,
+                    daily_try_limit=excluded.daily_try_limit,
+                    cycle_started_at=excluded.cycle_started_at,
+                    cycle_index=excluded.cycle_index,
+                    locked_until=excluded.locked_until,
+                    nudge_sent_cycle=excluded.nudge_sent_cycle,
                     last_reset_at=excluded.last_reset_at,
                     seen_models=excluded.seen_models,
                     remind_at=excluded.remind_at,
@@ -335,6 +439,20 @@ class Repository:
                     "age_bucket": data["age_bucket"],
                     "style": data["style"],
                     "daily_used": data["daily_used"],
+                    "tries_used": data["tries_used"],
+                    "daily_try_limit": data["daily_try_limit"],
+                    "cycle_started_at": (
+                        data["cycle_started_at"].isoformat()
+                        if data["cycle_started_at"]
+                        else None
+                    ),
+                    "cycle_index": data["cycle_index"],
+                    "locked_until": (
+                        data["locked_until"].isoformat()
+                        if data["locked_until"]
+                        else None
+                    ),
+                    "nudge_sent_cycle": 1 if data["nudge_sent_cycle"] else 0,
                     "last_reset_at": data["last_reset_at"].isoformat()
                     if data["last_reset_at"]
                     else None,
@@ -389,6 +507,14 @@ class Repository:
             conn.execute(
                 "UPDATE users SET idle_reminder_sent = 1 WHERE user_id = ?",
                 (user_id,),
+            )
+            conn.commit()
+
+    def _set_nudge_flag_sync(self, user_id: int, value: bool) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE users SET nudge_sent_cycle = ? WHERE user_id = ?",
+                (1 if value else 0, user_id),
             )
             conn.commit()
 
@@ -596,6 +722,26 @@ class Repository:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN social_ad_shown INTEGER NOT NULL DEFAULT 0"
             )
+        if "tries_used" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN tries_used INTEGER NOT NULL DEFAULT 0"
+            )
+        if "daily_try_limit" not in columns:
+            conn.execute(
+                f"ALTER TABLE users ADD COLUMN daily_try_limit INTEGER NOT NULL DEFAULT {int(self._daily_limit)}"
+            )
+        if "cycle_started_at" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN cycle_started_at TEXT")
+        if "cycle_index" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN cycle_index INTEGER NOT NULL DEFAULT 0"
+            )
+        if "locked_until" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN locked_until TEXT")
+        if "nudge_sent_cycle" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN nudge_sent_cycle INTEGER NOT NULL DEFAULT 0"
+            )
 
     def _ensure_contact_table(self, conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -610,6 +756,31 @@ class Repository:
             )
             """
         )
+
+    def _start_new_cycle(self, profile: UserProfile, now: datetime) -> None:
+        profile.cycle_index = (profile.cycle_index or 0) + 1
+        profile.tries_used = 0
+        profile.daily_used = 0
+        profile.cycle_started_at = None
+        profile.locked_until = None
+        profile.nudge_sent_cycle = False
+        profile.last_reset_at = now
+
+    def _apply_profile_defaults(self, profile: UserProfile) -> bool:
+        changed = False
+        if profile.daily_try_limit <= 0:
+            profile.daily_try_limit = self._daily_limit
+            changed = True
+        if profile.tries_used < 0:
+            profile.tries_used = 0
+            changed = True
+        if profile.daily_used != profile.tries_used:
+            profile.daily_used = profile.tries_used
+            changed = True
+        if profile.nudge_sent_cycle not in {True, False}:
+            profile.nudge_sent_cycle = False
+            changed = True
+        return changed
 
     def _ensure_lock(self) -> asyncio.Lock:
         if self._lock is None:

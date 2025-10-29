@@ -11,6 +11,7 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 "BOT_TOKEN=token123",
                 "SHEET_CSV_URL=https://example.com/catalog.csv",
                 "SITE_URL=https://landing.example.com",
+                "PRIVACY_POLICY_URL=https://telegra.ph/loov-policy",
                 'PROMO_CODE="SPECIAL"',
                 "DAILY_TRY_LIMIT=9",
                 "REMINDER_HOURS=12",
@@ -45,6 +46,7 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.bot_token == "token123"
     assert config.sheet_csv_url == "https://example.com/catalog.csv"
     assert config.site_url == "https://landing.example.com"
+    assert config.privacy_policy_url == "https://telegra.ph/loov-policy"
     assert config.promo_code == "SPECIAL"
     assert config.daily_try_limit == 9
     assert config.reminder_hours == 12

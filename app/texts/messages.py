@@ -50,6 +50,12 @@ CATALOG_TEMPORARILY_UNAVAILABLE = (
 # Прелоадер, пока ищем подходящие модели.
 SEARCHING_MODELS_PROMPT = "Ищу свежие модели..."
 
+# Прогресс-индикаторы подбора моделей.
+PROGRESS_FINDING_MODELS_STEP1 = "Ищу свежие модели… ▱▱▱"
+PROGRESS_FINDING_MODELS_STEP2 = "Ищу свежие модели… ▰▱▱"
+PROGRESS_FINDING_MODELS_STEP3 = "Ищу свежие модели… ▰▰▱"
+PROGRESS_FINDING_MODELS_STEP4 = "Ищу свежие модели… ▰▰▰"
+
 # Прогресс-статусы для генерации примерки.
 PROGRESS_DOWNLOADING_USER_PHOTO = "Скачиваю твоё фото…"
 PROGRESS_DOWNLOADING_GLASSES = "Тяну референс очков…"

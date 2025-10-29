@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -36,6 +36,12 @@ class UserProfile:
     age_bucket: Optional[str] = None
     style: str = "normal"
     daily_used: int = 0
+    tries_used: int = 0
+    daily_try_limit: int = 0
+    cycle_started_at: Optional[datetime] = None
+    cycle_index: int = 0
+    locked_until: Optional[datetime] = None
+    nudge_sent_cycle: bool = False
     last_reset_at: Optional[datetime] = None
     seen_models: list[str] = field(default_factory=list)
     remind_at: Optional[datetime] = None
@@ -47,10 +53,16 @@ class UserProfile:
     idle_reminder_sent: bool = False
     social_ad_shown: bool = False
 
-    def remaining(self, limit: int) -> int:
-        """Return remaining tries for the day."""
+    def remaining(self, limit: int | None = None) -> int:
+        """Return remaining tries respecting the current cycle state."""
 
-        return max(limit - self.daily_used, 0)
+        effective_limit = limit if limit and limit > 0 else self.daily_try_limit
+        if effective_limit <= 0:
+            return 0
+        if self.locked_until and self.locked_until > datetime.now(timezone.utc):
+            return 0
+        used = self.tries_used if self.tries_used >= 0 else 0
+        return max(effective_limit - used, 0)
 
 
 @dataclass(slots=True)

@@ -48,6 +48,19 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def privacy_policy_keyboard(url: str) -> InlineKeyboardMarkup | None:
+    """Inline keyboard linking to the privacy policy URL."""
+
+    sanitized = (url or "").strip()
+    if not sanitized:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=msg.MAIN_MENU_POLICY_BUTTON, url=sanitized)]
+        ]
+    )
+
+
 def gender_keyboard() -> InlineKeyboardMarkup:
     """Keyboard for selecting gender."""
 

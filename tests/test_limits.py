@@ -23,12 +23,17 @@ def test_daily_limit_decrements_and_resets(tmp_path: Path) -> None:
         remaining_after = await repo.remaining_tries(1)
         assert remaining_after == 1
 
-        profile = await repo.get_user(1)
-        assert profile is not None
-        future = (profile.last_reset_at or datetime.now(UTC)) + timedelta(hours=25)
+        await repo.inc_used_on_success(1)
+        locked_profile = await repo.get_user(1)
+        assert locked_profile is not None
+        assert locked_profile.tries_used == 2
+        assert locked_profile.locked_until is not None
+        assert await repo.remaining_tries(1) == 0
+
+        future = locked_profile.locked_until + timedelta(minutes=1)
         updated = await repo.ensure_daily_reset(1, now=future)
-        assert updated.daily_used == 0
-        assert updated.seen_models == []
+        assert updated.tries_used == 0
+        assert updated.locked_until is None
         assert await repo.remaining_tries(1) == 2
 
     asyncio.run(_run())
