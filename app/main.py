@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
@@ -12,6 +13,7 @@ from app.config import load_config
 from app.fsm import setup_router
 from app.keyboards import reminder_keyboard, start_keyboard
 from app.logging_conf import EVENT_ID, setup_logging
+from app.services import nanobanana
 from app.services.catalog_google import GoogleCatalogConfig, GoogleSheetCatalog
 from app.services.collage import build_three_tile_collage
 from app.services.contact_export import ContactSheetExporter
@@ -20,9 +22,6 @@ from app.services.idle_reminder import IdleReminderService
 from app.services.repository import Repository
 from app.services.social_ad import SocialAdService
 from app.services.scheduler import ReminderScheduler
-from app.services.storage_local import LocalStorage
-from app.services.tryon_mock import MockTryOnService
-from app.services.tryon_nanobanana import NanoBananaTryOnService
 from app.texts import messages as msg
 from app.utils.paths import ensure_dir
 from app.services.recommendation import (
@@ -38,6 +37,26 @@ async def main() -> None:
 
     ensure_dir(config.uploads_root)
     ensure_dir(config.results_root)
+    tmp_dir = ensure_dir(Path("tmp"))
+    ensure_dir(Path(".cache") / "frames")
+
+    async def _cleanup_tmp() -> None:
+        def _clean() -> None:
+            cutoff = time.time() - 3600
+            if not tmp_dir.exists():
+                return
+            for entry in tmp_dir.iterdir():
+                try:
+                    if entry.is_file() and entry.stat().st_mtime < cutoff:
+                        entry.unlink(missing_ok=True)
+                except OSError:
+                    continue
+
+        await asyncio.to_thread(_clean)
+
+    asyncio.create_task(_cleanup_tmp())
+
+    nanobanana.configure(config.nanobanana_api_key)
 
     bot = Bot(token=config.bot_token, parse_mode=ParseMode.HTML)
     dp = Dispatcher()
@@ -45,7 +64,6 @@ async def main() -> None:
     repository = Repository(Path("loop.db"), config.daily_try_limit)
     await repository.init()
 
-    storage = LocalStorage(config.uploads_root, config.results_root)
     catalog_config = GoogleCatalogConfig(
         csv_url=str(config.sheet_csv_url),
         cache_ttl_seconds=config.csv_fetch_ttl_sec,
@@ -76,19 +94,9 @@ async def main() -> None:
         credentials_path=config.google_service_account_json,
     )
 
-    if config.mock_tryon:
-        tryon_service = MockTryOnService(storage)
-    else:
-        tryon_service = NanoBananaTryOnService(
-            api_url=config.nano_api_url or "",
-            api_key=config.nano_api_key or "",
-        )
-
     router = setup_router(
         repository=repository,
         recommender=recommender,
-        tryon=tryon_service,
-        storage=storage,
         collage_config=config.collage,
         collage_builder=build_three_tile_collage,
         batch_size=config.batch_size,

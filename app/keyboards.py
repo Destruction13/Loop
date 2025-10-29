@@ -154,15 +154,15 @@ def promo_keyboard(site_url: str) -> InlineKeyboardMarkup:
     )
 
 
-def retry_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard for retrying failed generation."""
+def send_new_photo_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard prompting the user to provide a different photo."""
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=msg.RETRY_GENERATION_BUTTON_TEXT,
-                    callback_data="retry",
+                    text=msg.BTN_SEND_NEW_PHOTO,
+                    callback_data="send_new_photo",
                 )
             ]
         ]

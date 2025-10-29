@@ -24,6 +24,11 @@ from app.texts import messages as msg
 @dataclass
 class PhotoStub:
     file_unique_id: str
+    file_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.file_id is None:
+            self.file_id = f"{self.file_unique_id}_id"
 
 
 class DummyBot:
@@ -98,6 +103,12 @@ class DummySentMessage:
     message_id: int
     text: str
     reply_markup: Optional[Any]
+
+    async def edit_text(
+        self, text: str, reply_markup: Optional[Any] = None
+    ) -> None:
+        self.text = text
+        self.reply_markup = reply_markup
 
 
 class DummyCallback:
@@ -254,19 +265,11 @@ class StubTryOn:
     def __init__(self, result_path: Path) -> None:
         self.result_path = result_path
         self.calls: list[dict[str, Any]] = []
+        self.last_user_id: Optional[int] = None
 
     async def generate(self, **kwargs: Any) -> list[Path]:
         self.calls.append(kwargs)
         return [self.result_path]
-
-
-class StubStorage:
-    def __init__(self, uploads_dir: Path) -> None:
-        self.uploads_dir = uploads_dir
-        self.uploads_dir.mkdir(parents=True, exist_ok=True)
-
-    async def allocate_upload_path(self, user_id: int, filename: str) -> Path:
-        return self.uploads_dir / filename
 
 
 class StubLeadsExporter:
@@ -319,7 +322,6 @@ def build_router(
     result_path = tmp_path / "result.png"
     result_path.write_bytes(b"fake-image")
     tryon = StubTryOn(result_path=result_path)
-    storage = StubStorage(tmp_path / "uploads")
     builder = collage_builder or StubCollageBuilder()
     leads_exporter = StubLeadsExporter()
     contact_exporter = StubContactExporter()
@@ -334,11 +336,70 @@ def build_router(
         jpeg_quality=90,
     )
 
+    from app import fsm as fsm_module
+    from app.services import drive_fetch, image_io, nanobanana
+
+    async def fake_save_user_photo(message: DummyMessage, tmp_dir: str = "tmp") -> str:
+        destination = tmp_path / f"user_{message.from_user.id}.jpg"
+        destination.write_bytes(b"photo")
+        tryon.last_user_id = message.from_user.id
+        return str(destination)
+
+    async def fake_redownload_user_photo(
+        bot: Any, file_id: str, user_id: int, tmp_dir: str = "tmp"
+    ) -> str:
+        destination = tmp_path / f"user_{user_id}.jpg"
+        destination.write_bytes(b"photo")
+        tryon.last_user_id = user_id
+        return str(destination)
+
+    def fake_resize_inplace(path: str | Path, max_side: int = 2048) -> None:
+        target = Path(path)
+        if not target.exists():
+            target.write_bytes(b"photo")
+
+    glasses_path = tmp_path / "glasses.png"
+    glasses_path.write_bytes(b"glasses")
+
+    async def fake_fetch_drive_file(url: str, cache_dir: str = ".cache/frames") -> str:
+        return str(glasses_path)
+
+    async def fake_generate_glasses(
+        *, face_path: str, glasses_path: str
+    ) -> nanobanana.GenerationSuccess:
+        tryon.calls.append(
+            {
+                "user_id": tryon.last_user_id,
+                "input_photo": Path(face_path),
+                "glasses_path": Path(glasses_path),
+            }
+        )
+        return nanobanana.GenerationSuccess(
+            image_bytes=result_path.read_bytes(),
+            response={"candidates": [{"finishReason": "SUCCESS"}]},
+            finish_reason="SUCCESS",
+            has_inline=True,
+            has_data_url=False,
+            has_file_uri=False,
+            attempt=1,
+            retried=False,
+        )
+
+    image_io.save_user_photo = fake_save_user_photo  # type: ignore[assignment]
+    image_io.redownload_user_photo = fake_redownload_user_photo  # type: ignore[assignment]
+    image_io.resize_inplace = fake_resize_inplace  # type: ignore[assignment]
+    drive_fetch.fetch_drive_file = fake_fetch_drive_file  # type: ignore[assignment]
+    nanobanana.generate_glasses = fake_generate_glasses  # type: ignore[assignment]
+
+    fsm_module.save_user_photo = fake_save_user_photo  # type: ignore[assignment]
+    fsm_module.redownload_user_photo = fake_redownload_user_photo  # type: ignore[assignment]
+    fsm_module.resize_inplace = fake_resize_inplace  # type: ignore[assignment]
+    fsm_module.fetch_drive_file = fake_fetch_drive_file  # type: ignore[assignment]
+    fsm_module.generate_glasses = fake_generate_glasses  # type: ignore[assignment]
+
     router = setup_router(
         repository=repository,
         recommender=recommender,
-        tryon=tryon,
-        storage=storage,
         collage_config=collage_config,
         collage_builder=builder,
         batch_size=2,
@@ -625,7 +686,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         deleted_ids = [mid for _, mid in bot.deleted]
         assert upload_message.message_id in deleted_ids
         assert any(mid > upload_message.message_id for mid in deleted_ids)
-        assert state.data.get("generation_message_id") is None
+        assert state.data.get("generation_progress_message_id") is None
         assert repository.daily_used == 1
         assert state.state is TryOnStates.RESULT
         assert len(upload_message.answer_photos) == initial_photo_count + 1
@@ -661,6 +722,134 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         assert upload_message.answers[-1][0].startswith(
             f"<b>{msg.ASK_PHONE_TITLE}"
         )
+
+    asyncio.run(scenario())
+
+
+def test_generation_unsuitable_photo_requests_new_upload(tmp_path: Path) -> None:
+    model = GlassModel(
+        unique_id="m1",
+        title="Model 1",
+        model_code="M1",
+        site_url="https://example.com/1",
+        img_user_url="https://example.com/1.jpg",
+        img_nano_url="https://example.com/1-nano.jpg",
+        gender="Мужской",
+    )
+
+    async def scenario() -> None:
+        from app import fsm as fsm_module
+        from app.services import nanobanana
+
+        router, _, _, _, _ = build_router(tmp_path, models=[model])
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=72, bot=bot)
+        message.photo = [PhotoStub("upload1")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler_photo(message, state)
+
+        failing_error = nanobanana.NanoBananaGenerationError(
+            "unsuitable",
+            reason_code="UNSUITABLE_PHOTO",
+            reason_detail="finish=SAFETY",
+            finish_reason="SAFETY",
+            has_inline=False,
+            has_data_url=False,
+            has_file_uri=False,
+        )
+
+        async def failing_generate_glasses(*, face_path: str, glasses_path: str):
+            raise failing_error
+
+        original_generate = nanobanana.generate_glasses
+        original_fsm_generate = fsm_module.generate_glasses
+        nanobanana.generate_glasses = failing_generate_glasses  # type: ignore[assignment]
+        fsm_module.generate_glasses = failing_generate_glasses  # type: ignore[assignment]
+        try:
+            callback = DummyCallback("pick:src=batch2:m1", message)
+            await handler_choose(callback, state)
+        finally:
+            nanobanana.generate_glasses = original_generate  # type: ignore[assignment]
+            fsm_module.generate_glasses = original_fsm_generate  # type: ignore[assignment]
+
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert state.data.get("selected_model") is None
+        assert state.data.get("upload") is None
+        assert state.data.get("upload_file_id") is None
+        assert state.data.get("current_models") == []
+        assert message.answers[-1][0] == msg.PHOTO_NOT_SUITABLE_MAIN
+        markup = message.answers[-1][1]
+        assert isinstance(markup, InlineKeyboardMarkup)
+        assert markup.inline_keyboard[0][0].text == msg.BTN_SEND_NEW_PHOTO
+
+    asyncio.run(scenario())
+
+
+def test_generation_transient_error_requests_new_upload(tmp_path: Path) -> None:
+    model = GlassModel(
+        unique_id="m1",
+        title="Model 1",
+        model_code="M1",
+        site_url="https://example.com/1",
+        img_user_url="https://example.com/1.jpg",
+        img_nano_url="https://example.com/1-nano.jpg",
+        gender="Мужской",
+    )
+
+    async def scenario() -> None:
+        from app import fsm as fsm_module
+        from app.services import nanobanana
+
+        router, _, _, _, _ = build_router(tmp_path, models=[model])
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=73, bot=bot)
+        message.photo = [PhotoStub("upload1")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler_photo(message, state)
+
+        transient_error = nanobanana.NanoBananaGenerationError(
+            "transient",
+            reason_code="TRANSIENT",
+            reason_detail="timeout",
+            finish_reason="OTHER",
+            has_inline=False,
+            has_data_url=False,
+            has_file_uri=False,
+        )
+
+        async def transient_generate_glasses(*, face_path: str, glasses_path: str):
+            raise transient_error
+
+        original_generate = nanobanana.generate_glasses
+        original_fsm_generate = fsm_module.generate_glasses
+        nanobanana.generate_glasses = transient_generate_glasses  # type: ignore[assignment]
+        fsm_module.generate_glasses = transient_generate_glasses  # type: ignore[assignment]
+        try:
+            callback = DummyCallback("pick:src=batch2:m1", message)
+            await handler_choose(callback, state)
+        finally:
+            nanobanana.generate_glasses = original_generate  # type: ignore[assignment]
+            fsm_module.generate_glasses = original_fsm_generate  # type: ignore[assignment]
+
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert state.data.get("selected_model") is None
+        assert state.data.get("upload") is None
+        assert state.data.get("upload_file_id") is None
+        assert state.data.get("current_models") == []
+        assert message.answers[-1][0] == msg.PHOTO_NOT_SUITABLE_MAIN
+        markup = message.answers[-1][1]
+        assert isinstance(markup, InlineKeyboardMarkup)
+        assert markup.inline_keyboard[0][0].text == msg.BTN_SEND_NEW_PHOTO
 
     asyncio.run(scenario())
 

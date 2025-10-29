@@ -14,14 +14,12 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 'PROMO_CODE="SPECIAL"',
                 "DAILY_TRY_LIMIT=9",
                 "REMINDER_HOURS=12",
-                "MOCK_TRYON=0",
                 "CSV_FETCH_TTL_SEC=120",
                 "CSV_FETCH_RETRIES=4",
                 "UPLOADS_ROOT=./var/uploads",
                 "RESULTS_ROOT=./var/results",
                 "BUTTON_TITLE_MAX=42",
-                "NANO_API_URL=https://nano.example.com",
-                "NANO_API_KEY=secret",
+                "NANOBANANA_API_KEY=secret",
                 "BATCH_SIZE=5",
                 "BATCH_LAYOUT_COLS=3",
                 "PICK_SCHEME=GENDER_OR_GENDER_UNISEX",
@@ -50,14 +48,12 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.promo_code == "SPECIAL"
     assert config.daily_try_limit == 9
     assert config.reminder_hours == 12
-    assert config.mock_tryon is False
     assert config.csv_fetch_ttl_sec == 120
     assert config.csv_fetch_retries == 4
     assert config.uploads_root == Path("./var/uploads")
     assert config.results_root == Path("./var/results")
     assert config.button_title_max == 42
-    assert config.nano_api_url == "https://nano.example.com"
-    assert config.nano_api_key == "secret"
+    assert config.nanobanana_api_key == "secret"
     assert config.batch_size == 5
     assert config.batch_layout_cols == 3
     assert config.pick_scheme == "GENDER_OR_GENDER_UNISEX"

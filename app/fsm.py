@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import time
@@ -34,7 +35,7 @@ from app.keyboards import (
     limit_reached_keyboard,
     main_reply_keyboard,
     promo_keyboard,
-    retry_keyboard,
+    send_new_photo_keyboard,
     start_keyboard,
 )
 from app.logging_conf import EVENT_ID
@@ -49,8 +50,17 @@ from app.services.collage import (
 from app.services.contact_export import ContactRecord, ContactSheetExporter
 from app.services.leads_export import LeadPayload, LeadsExporter
 from app.services.repository import Repository
-from app.services.storage_base import StorageService
-from app.services.tryon_base import TryOnService
+from app.infrastructure.concurrency import with_generation_slot
+from app.services.drive_fetch import fetch_drive_file
+from app.services.image_io import (
+    redownload_user_photo,
+    resize_inplace,
+    save_user_photo,
+)
+from app.services.nanobanana import (
+    NanoBananaGenerationError,
+    generate_glasses,
+)
 from app.services.recommendation import RecommendationService
 from app.utils.phone import normalize_phone
 from app.texts import messages as msg
@@ -64,7 +74,6 @@ class TryOnStates(StatesGroup):
     GENERATING = State()
     RESULT = State()
     DAILY_LIMIT_REACHED = State()
-    ERROR = State()
 
 
 class ContactRequest(StatesGroup):
@@ -124,8 +133,6 @@ def setup_router(
     *,
     repository: Repository,
     recommender: RecommendationService,
-    tryon: TryOnService,
-    storage: StorageService,
     collage_config: CollageConfig,
     collage_builder: Callable[[Sequence[str | None], CollageConfig], Awaitable[io.BytesIO]] = build_three_tile_collage,
     batch_size: int,
@@ -251,7 +258,7 @@ def setup_router(
             current_models=[],
             last_batch=[],
             preload_message_id=None,
-            generation_message_id=None,
+            generation_progress_message_id=None,
         )
         await _send_aux_message(
             message,
@@ -565,7 +572,7 @@ def setup_router(
                     current_models=[],
                     last_batch=[],
                     preload_message_id=None,
-                    generation_message_id=None,
+                    generation_progress_message_id=None,
                 )
                 await _send_aux_message(
                     message,
@@ -799,10 +806,8 @@ def setup_router(
     async def accept_photo(message: Message, state: FSMContext) -> None:
         user_id = message.from_user.id
         photo = message.photo[-1]
-        filename = f"{photo.file_unique_id}.jpg"
-        path = await storage.allocate_upload_path(user_id, filename)
-        await message.bot.download(photo, destination=path)
-        await state.update_data(upload=str(path))
+        path = await save_user_photo(message)
+        await state.update_data(upload=path, upload_file_id=photo.file_id)
         profile = await repository.ensure_daily_reset(user_id)
         if profile.daily_used == 0:
             await state.update_data(first_generated_today=True)
@@ -838,6 +843,16 @@ def setup_router(
             skip_contact_prompt=True,
         )
         logger.info("%s Photo received from %s", EVENT_ID["PHOTO_RECEIVED"], user_id)
+
+    @router.callback_query(StateFilter(TryOnStates.AWAITING_PHOTO), F.data == "send_new_photo")
+    async def request_new_photo(callback: CallbackQuery, state: FSMContext) -> None:
+        await _send_aux_message(
+            callback.message,
+            state,
+            callback.message.answer,
+            msg.PHOTO_INSTRUCTION,
+        )
+        await callback.answer()
 
     @router.callback_query(
         StateFilter(TryOnStates.SHOW_RECS, TryOnStates.RESULT),
@@ -885,13 +900,6 @@ def setup_router(
             )
         await state.update_data(selected_model=selected)
         await state.set_state(TryOnStates.GENERATING)
-        generation_message = await _send_aux_message(
-            callback.message,
-            state,
-            callback.message.answer,
-            msg.GENERATING_PROMPT,
-        )
-        await state.update_data(generation_message_id=generation_message.message_id)
         await _perform_generation(callback.message, state, selected)
 
     @router.message(StateFilter(ContactRequest.waiting_for_phone), F.contact)
@@ -964,51 +972,174 @@ def setup_router(
         user_id = message.chat.id
         data = await state.get_data()
         upload_value = data.get("upload")
-        if not upload_value:
-            await _delete_state_message(message, state, "generation_message_id")
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
-                msg.GENERATION_FAILED,
-                reply_markup=retry_keyboard(),
-            )
-            await state.set_state(TryOnStates.ERROR)
-            return
-        upload_path = Path(upload_value)
+        upload_file_id = data.get("upload_file_id")
+
+        progress_message: Message | None = None
+        user_photo_path: Path | None = None
+        result_bytes: bytes | None = None
+        start_time = 0.0
+
+        async def _edit_progress(text: str) -> None:
+            nonlocal progress_message
+            if not progress_message:
+                return
+            try:
+                await progress_message.edit_text(text)
+            except TelegramBadRequest as exc:
+                logger.debug(
+                    "Failed to edit progress message %s for %s: %s",
+                    progress_message.message_id,
+                    user_id,
+                    exc,
+                )
+                progress_message = None
+
         try:
-            results = await tryon.generate(
-                user_id=user_id,
-                session_id=uuid.uuid4().hex,
-                input_photo=upload_path,
-                overlays=[],
+            if upload_value and Path(upload_value).exists():
+                user_photo_path = Path(upload_value)
+            elif upload_file_id:
+                downloaded = await redownload_user_photo(
+                    message.bot, upload_file_id, user_id
+                )
+                await state.update_data(upload=downloaded)
+                user_photo_path = Path(downloaded)
+            else:
+                raise RuntimeError("User photo is not available")
+
+            progress_message = await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.PROGRESS_DOWNLOADING_USER_PHOTO,
             )
+            await state.update_data(
+                generation_progress_message_id=progress_message.message_id
+            )
+
+            await asyncio.to_thread(resize_inplace, user_photo_path)
+            await _edit_progress(msg.PROGRESS_DOWNLOADING_GLASSES)
+
+            if not model.img_nano_url:
+                raise RuntimeError("Frame model does not have NanoBanana reference")
+            glasses_path = await fetch_drive_file(model.img_nano_url)
+            await asyncio.to_thread(resize_inplace, glasses_path)
+
+            await _edit_progress(msg.PROGRESS_SENDING_TO_GENERATION)
+            await _edit_progress(msg.PROGRESS_WAIT_GENERATION)
+
+            start_time = time.perf_counter()
+            generation_result = await with_generation_slot(
+                generate_glasses(
+                    face_path=str(user_photo_path),
+                    glasses_path=glasses_path,
+                )
+            )
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            result_bytes = generation_result.image_bytes
+            result_kb = len(result_bytes) / 1024 if result_bytes else 0
+            logger.info(
+                (
+                    "NanoBanana generation: user_id=%s frame_id=%s latency_ms=%s "
+                    "result_kb=%.1f finish_reason=%s attempt=%s retried=%s"
+                ),
+                user_id,
+                model.unique_id,
+                latency_ms,
+                result_kb,
+                generation_result.finish_reason,
+                generation_result.attempt,
+                generation_result.retried,
+            )
+
+        except NanoBananaGenerationError as exc:
+            latency_ms = (
+                int((time.perf_counter() - start_time) * 1000)
+                if start_time
+                else 0
+            )
+            logger.warning(
+                (
+                    "NanoBanana failure: user_id=%s frame_id=%s finish_reason=%s "
+                    "latency_ms=%s has_inline=%s has_data_url=%s has_file_uri=%s "
+                    "detail=%s"
+                ),
+                user_id,
+                model.unique_id,
+                exc.finish_reason,
+                latency_ms,
+                exc.has_inline,
+                exc.has_data_url,
+                exc.has_file_uri,
+                exc.reason_detail,
+            )
+            await _delete_state_message(message, state, "generation_progress_message_id")
+            await state.update_data(
+                selected_model=None,
+                current_models=[],
+                upload=None,
+                upload_file_id=None,
+            )
+            await state.set_state(TryOnStates.AWAITING_PHOTO)
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.PHOTO_NOT_SUITABLE_MAIN,
+                reply_markup=send_new_photo_keyboard(),
+            )
+            return
         except Exception as exc:  # noqa: BLE001
+            latency_ms = (
+                int((time.perf_counter() - start_time) * 1000)
+                if start_time
+                else 0
+            )
             logger.error(
-                "%s Generation failed: %s", EVENT_ID["GENERATION_FAILED"], exc
+                "%s Generation failed: %s (latency_ms=%s)",
+                EVENT_ID["GENERATION_FAILED"],
+                exc,
+                latency_ms,
+                exc_info=True,
             )
-            await _delete_state_message(message, state, "generation_message_id")
+            logger.warning(
+                (
+                    "NanoBanana failure: user_id=%s frame_id=%s finish_reason=%s "
+                    "latency_ms=%s has_inline=%s has_data_url=%s has_file_uri=%s "
+                    "detail=%s"
+                ),
+                user_id,
+                model.unique_id,
+                None,
+                latency_ms,
+                False,
+                False,
+                False,
+                str(exc),
+            )
+            await _delete_state_message(message, state, "generation_progress_message_id")
+            await state.update_data(
+                selected_model=None,
+                current_models=[],
+                upload=None,
+                upload_file_id=None,
+            )
+            await state.set_state(TryOnStates.AWAITING_PHOTO)
             await _send_aux_message(
                 message,
                 state,
                 message.answer,
-                msg.GENERATION_FAILED,
-                reply_markup=retry_keyboard(),
+                msg.PHOTO_NOT_SUITABLE_MAIN,
+                reply_markup=send_new_photo_keyboard(),
             )
-            await state.set_state(TryOnStates.ERROR)
             return
-        if not results:
-            await _delete_state_message(message, state, "generation_message_id")
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
-                msg.GENERATION_FAILED,
-                reply_markup=retry_keyboard(),
-            )
-            await state.set_state(TryOnStates.ERROR)
-            return
-        primary_result = results[0]
+        finally:
+            if user_photo_path and user_photo_path.exists():
+                try:
+                    user_photo_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.debug("Failed to remove temp file %s", user_photo_path)
+            await state.update_data(upload=None)
+
         await repository.inc_used_on_success(user_id)
         remaining = await repository.remaining_tries(user_id)
         plan = resolve_generation_followup(
@@ -1036,11 +1167,12 @@ def setup_router(
         result_markup = generation_result_keyboard(
             model.site_url, keyboard_remaining
         )
+        await _delete_state_message(message, state, "generation_progress_message_id")
         result_message = await _send_delivery_message(
             message,
             state,
             message.answer_photo,
-            FSInputFile(path=str(primary_result)),
+            BufferedInputFile(result_bytes, filename="result.png"),
             caption=caption_text,
             reply_markup=result_markup,
         )
@@ -1052,7 +1184,6 @@ def setup_router(
             source_message_id=message.message_id,
         )
         new_gen_count = await repository.increment_generation_count(user_id)
-        await _delete_state_message(message, state, "generation_message_id")
         new_flag = next_first_flag_value(
             data.get("first_generated_today", True), plan.outcome
         )
@@ -1287,23 +1418,5 @@ def setup_router(
             msg.PHOTO_INSTRUCTION,
         )
         await callback.answer()
-
-    @router.callback_query(StateFilter(TryOnStates.ERROR), F.data == "retry")
-    async def retry(callback: CallbackQuery, state: FSMContext) -> None:
-        data = await state.get_data()
-        selected: Optional[GlassModel] = data.get("selected_model")
-        if not selected:
-            await callback.answer("Нет выбранной модели", show_alert=True)
-            return
-        await state.set_state(TryOnStates.GENERATING)
-        generation_message = await _send_aux_message(
-            callback.message,
-            state,
-            callback.message.answer,
-            msg.GENERATING_PROMPT,
-        )
-        await state.update_data(generation_message_id=generation_message.message_id)
-        await callback.answer()
-        await _perform_generation(callback.message, state, selected)
 
     return router
