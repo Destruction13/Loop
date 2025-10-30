@@ -30,6 +30,18 @@ class CollageConfig:
     output_format: str
     jpeg_quality: int
 
+    @property
+    def width(self) -> int:
+        """Total collage width including padding and separator."""
+
+        return self.slot_width * 2 + self.separator_width + self.padding * 2
+
+    @property
+    def height(self) -> int:
+        """Total collage height including padding."""
+
+        return self.slot_height + self.padding * 2
+
 
 @dataclass(slots=True)
 class Config:
@@ -140,9 +152,9 @@ def load_config(env_file: str | None = None) -> Config:
         slot_width=max(_as_int(_get("COLLAGE_SLOT_WIDTH", "1080"), 1080), 1),
         slot_height=max(_as_int(_get("COLLAGE_SLOT_HEIGHT", "1440"), 1440), 1),
         separator_width=max(_as_int(_get("COLLAGE_SEPARATOR_WIDTH", "24"), 24), 0),
-        padding=max(_as_int(_get("COLLAGE_PADDING", "48"), 48), 0),
-        separator_color=_get("COLLAGE_SEPARATOR_COLOR", "#FFFFFF") or "#FFFFFF",
-        background=_get("COLLAGE_BACKGROUND", "#F7F7F7") or "#F7F7F7",
+        padding=max(_as_int(_get("COLLAGE_PADDING", "0"), 0), 0),
+        separator_color=_get("COLLAGE_SEPARATOR_COLOR", "#2A2A2A") or "#2A2A2A",
+        background=_get("COLLAGE_BACKGROUND", "#000000") or "#000000",
         output_format=(_get("COLLAGE_FORMAT", "PNG") or "PNG").upper(),
         jpeg_quality=_as_int(_get("COLLAGE_JPEG_QUALITY", "90"), 90),
     )

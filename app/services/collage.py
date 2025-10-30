@@ -52,21 +52,22 @@ async def build_three_tile_collage(
         timeout = httpx.Timeout(10.0, connect=10.0, read=10.0)
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
 
+    downloaded: list[_CollageSource] | None = None
     try:
         downloaded = await _download_sources(client, padded_sources)
+        if not any(source.data for source in downloaded):
+            raise CollageSourceUnavailable("Failed to download collage images")
+        return await asyncio.to_thread(_compose_collage, downloaded, cfg)
+    except CollageSourceUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception(
+            "Collage pipeline failed", extra={"collage_sources": padded_sources}
+        )
+        raise CollageProcessingError(str(exc)) from exc
     finally:
         if owns_client:
             await client.aclose()
-
-    if not any(source.data for source in downloaded):
-        raise CollageSourceUnavailable("Failed to download collage images")
-
-    try:
-        buffer = await asyncio.to_thread(_compose_collage, downloaded, cfg)
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Failed to compose collage: %s", exc)
-        raise CollageProcessingError(str(exc)) from exc
-    return buffer
 
 
 async def _download_sources(
@@ -112,11 +113,31 @@ def _compose_collage(sources: Iterable[_CollageSource], cfg: CollageConfig) -> i
     canvas_width = slot_width * 2 + separator_width + padding * 2
     canvas_height = slot_height + padding * 2
 
-    background_color = _parse_color(cfg.background, fallback=(247, 247, 247, 255))
-    separator_color = _parse_color(cfg.separator_color, fallback=(255, 255, 255, 255))
+    fmt = (cfg.output_format or "PNG").upper()
+    raw_background = (cfg.background or "").strip()
+    background_is_transparent = (
+        fmt == "PNG" and (not raw_background or raw_background.lower() == "transparent")
+    )
 
-    canvas = Image.new("RGBA", (canvas_width, canvas_height), color=background_color)
+    if background_is_transparent:
+        canvas_mode = "RGBA"
+        background_color = (0, 0, 0, 0)
+    else:
+        canvas_mode = "RGB"
+        background_color = _parse_color(
+            raw_background or None,
+            mode="RGB",
+            fallback=(255, 255, 255),
+        )
+
+    canvas = Image.new(canvas_mode, (canvas_width, canvas_height), color=background_color)
     draw = ImageDraw.Draw(canvas)
+
+    separator_color = _parse_color(
+        cfg.separator_color,
+        mode="RGBA" if canvas_mode == "RGBA" else "RGB",
+        fallback=(42, 42, 42, 255) if canvas_mode == "RGBA" else (42, 42, 42),
+    )
 
     tile_boxes = [
         (padding, padding, padding + slot_width, padding + slot_height),
@@ -152,6 +173,8 @@ def _compose_collage(sources: Iterable[_CollageSource], cfg: CollageConfig) -> i
                 method=Image.LANCZOS,
                 centering=(0.5, 0.5),
             )
+            if fitted.size != target_size:
+                fitted = fitted.resize(target_size, Image.LANCZOS)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Failed to fit collage image %s: %s", source.url, exc)
             image.close()
@@ -200,12 +223,21 @@ def _open_source_image(source: _CollageSource) -> Image.Image | None:
     return None
 
 
-def _parse_color(value: str | None, fallback: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+def _parse_color(
+    value: str | None,
+    *,
+    mode: str,
+    fallback: tuple[int, ...],
+) -> tuple[int, ...]:
     if value:
-        if value.strip().lower() == "transparent":
-            return (0, 0, 0, 0)
-        try:
-            return ImageColor.getcolor(value, "RGBA")
-        except ValueError:
-            LOGGER.warning("Unsupported color value %s, falling back to default", value)
+        normalized = value.strip()
+        if normalized:
+            if normalized.lower() == "transparent" and mode == "RGBA":
+                return (0, 0, 0, 0)
+            try:
+                return ImageColor.getcolor(normalized, mode)
+            except ValueError:
+                LOGGER.warning(
+                    "Unsupported color value %s, falling back to default", value
+                )
     return fallback

@@ -16,17 +16,17 @@ def _default_cfg() -> CollageConfig:
         slot_width=1080,
         slot_height=1440,
         separator_width=24,
-        padding=48,
-        separator_color="#FFFFFF",
-        background="#F7F7F7",
+        padding=0,
+        separator_color="#2A2A2A",
+        background="#000000",
         output_format="PNG",
         jpeg_quality=90,
     )
 
 
 def _geometry(cfg: CollageConfig) -> tuple[tuple[int, int], list[tuple[int, int, int, int]]]:
-    width = cfg.slot_width * 2 + cfg.separator_width + cfg.padding * 2
-    height = cfg.slot_height + cfg.padding * 2
+    width = cfg.width
+    height = cfg.height
     left_a = cfg.padding
     top = cfg.padding
     left_b = cfg.padding + cfg.slot_width + cfg.separator_width
@@ -55,6 +55,9 @@ async def _render_collage(
 
 def test_collage_dual_portrait_geometry() -> None:
     config = _default_cfg()
+    config.padding = 48
+    config.background = "#F7F7F7"
+    config.separator_color = "#FFFFFF"
     red = _make_image_bytes((400, 400), "red")
     green = _make_image_bytes((400, 400), "green")
 
@@ -118,11 +121,15 @@ def test_collage_draws_dividers() -> None:
         divider_left = boxes[0][2]
         sample_x = divider_left + config.separator_width // 2
         sample = collage.getpixel((sample_x, config.slot_height // 2 + config.padding))
+        if len(sample) == 3:
+            sample = (*sample, 255)
         assert all(abs(channel - ref) <= 5 for channel, ref in zip(sample, expected_color))
 
 
 def test_collage_handles_missing_sources() -> None:
     config = _default_cfg()
+    config.padding = 48
+    config.background = "#222222"
     red = _make_image_bytes((400, 400), "red")
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -139,7 +146,7 @@ def test_collage_handles_missing_sources() -> None:
 
     with Image.open(buffer) as collage:
         _, boxes = _geometry(config)
-        background_rgba = ImageColor.getcolor(config.background, "RGBA")
+        background_rgb = ImageColor.getcolor(config.background, "RGB")
         left_pixel = collage.getpixel(
             ((boxes[0][0] + boxes[0][2]) // 2, (boxes[0][1] + boxes[0][3]) // 2)
         )
@@ -147,12 +154,13 @@ def test_collage_handles_missing_sources() -> None:
             ((boxes[1][0] + boxes[1][2]) // 2, (boxes[1][1] + boxes[1][3]) // 2)
         )
         assert left_pixel[0] > 150
-        assert right_pixel == background_rgba
+        assert tuple(right_pixel[:3]) == background_rgb
 
 
-def test_collage_supports_transparent_background() -> None:
+@pytest.mark.parametrize("background_value", ["", "transparent"])
+def test_collage_supports_transparent_background(background_value: str) -> None:
     config = _default_cfg()
-    config.background = "transparent"
+    config.background = background_value
     red = _make_image_bytes((600, 900), "red")
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -173,8 +181,10 @@ def test_collage_supports_transparent_background() -> None:
 
     with Image.open(buffer) as collage:
         assert collage.mode == "RGBA"
-        top_left = collage.getpixel((0, 0))
-        assert top_left[3] == 0
+        bg_x = config.slot_width + config.separator_width + config.padding + 1
+        bg_y = config.padding + 1
+        top_right = collage.getpixel((bg_x, bg_y))
+        assert top_right[3] == 0
 
 
 def test_collage_can_export_jpeg() -> None:
@@ -220,3 +230,37 @@ def test_collage_raises_when_all_sources_missing() -> None:
                 config,
             )
         )
+
+
+def test_collage_config_width_height_properties() -> None:
+    cfg = _default_cfg()
+    cfg.padding = 12
+    cfg.separator_width = 8
+    assert cfg.width == cfg.slot_width * 2 + cfg.separator_width + cfg.padding * 2
+    assert cfg.height == cfg.slot_height + cfg.padding * 2
+
+
+def test_collage_invalid_background_falls_back_to_white() -> None:
+    config = _default_cfg()
+    config.background = "not-a-color"
+    config.separator_width = 0
+    red = _make_image_bytes((500, 500), "red")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=red,
+            headers={"content-type": "image/jpeg"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    buffer = asyncio.run(
+        _render_collage(
+            transport,
+            [None, "https://example.com/b.jpg"],
+            config,
+        )
+    )
+
+    with Image.open(buffer) as collage:
+        assert collage.getpixel((0, 0))[0:3] == (255, 255, 255)
