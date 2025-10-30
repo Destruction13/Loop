@@ -47,12 +47,11 @@ def test_drive_view_to_direct_invalid_url() -> None:
 
 def test_catalog_parses_and_filters_by_gender() -> None:
     csv_text = (
-        "Название,Модель,Ссылка на сайт,Пол,Ссылка на изображение для пользователя,"
-        "Ссылка на изображение для NanoBanana,Уникальный ID\n"
-        "Alpha,A1,https://example.com/a,Мужской,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
-        "Bravo,B1,https://example.com/b,Жен.,https://drive.google.com/file/d/BBB/view,,\n"
-        "Charlie,C1,https://example.com/c,уни,https://drive.google.com/file/d/CCC/view,https://nano/c,\n"
-        ",,https://example.com/d,Мужской,https://drive.google.com/file/d/DDD/view,,\n"
+        "Наименование,Модель,Ссылка,Sex,User Image,NanoBanana,Уникальный ID,Фото\n"
+        "Alpha,A1,https://example.com/a,Мужской,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha,https://example.com/a.jpg\n"
+        "Bravo,B1,https://example.com/b,Female,https://drive.google.com/file/d/BBB/view,https://nano/b,id-bravo,https://example.com/b.jpg\n"
+        "Charlie,C1,https://example.com/c,U,https://drive.google.com/file/d/CCC/view,https://nano/c,id-charlie,https://example.com/c.jpg\n"
+        ",,,male,https://drive.google.com/file/d/DDD/view,https://nano/d,id-missing,\n"
     )
 
     async def _run() -> None:
@@ -68,7 +67,7 @@ def test_catalog_parses_and_filters_by_gender() -> None:
             male_models = await catalog.list_by_gender("male")
             assert [model.title for model in male_models] == ["Alpha", "Charlie"]
             assert male_models[0].img_user_url.endswith("id=AAA")
-            assert male_models[1].gender == "Унисекс"
+            assert male_models[1].gender == "unisex"
             female_models = await catalog.list_by_gender("female")
             assert [model.title for model in female_models] == ["Bravo", "Charlie"]
             batch = await catalog.pick_batch(
@@ -85,8 +84,8 @@ def test_catalog_parses_and_filters_by_gender() -> None:
 
 def test_retry_policy_handles_redirect_and_server_errors() -> None:
     csv_text = (
-        "Название,Ссылка на сайт,Ссылка на изображение для пользователя\n"
-        "Alpha,https://example.com/a,https://drive.google.com/file/d/AAA/view\n"
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Alpha,A1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
     )
 
     async def _run() -> None:
@@ -124,8 +123,8 @@ def test_retry_policy_handles_redirect_and_server_errors() -> None:
 
 def test_catalog_cache_respects_ttl() -> None:
     csv_text = (
-        "Название,Ссылка на сайт,Ссылка на изображение для пользователя\n"
-        "Alpha,https://example.com/a,https://drive.google.com/file/d/AAA/view\n"
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Alpha,A1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
     )
 
     async def _run() -> None:
@@ -179,11 +178,11 @@ def test_html_response_raises_not_csv() -> None:
 
 def test_catalog_logs_summary(caplog: pytest.LogCaptureFixture) -> None:
     csv_text = (
-        "Название,Ссылка на сайт,Ссылка на изображение для пользователя\n"
-        "Valid,https://example.com/a,https://drive.google.com/file/d/AAA/view\n"
-        "Empty,https://example.com/b,   \n"
-        "Folder,https://example.com/c,https://drive.google.com/drive/folders/FFF?usp=sharing\n"
-        "Bad,https://example.com/d,https://example.com/not-drive\n"
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Valid,V1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,valid-1\n"
+        ",,,,,,\n"
+        "Folder,F1,https://example.com/c,female,https://drive.google.com/drive/folders/FFF?usp=sharing,https://nano/c,folder-1\n"
+        "Bad,B1,ftp://example.com/d,other,https://example.com/not-drive,https://nano/d,bad-1\n"
     )
 
     async def _run() -> None:
@@ -214,3 +213,114 @@ def test_catalog_logs_summary(caplog: pytest.LogCaptureFixture) -> None:
     assert "skipped_empty=1" in message
     assert "skipped_folder=1" in message
     assert "skipped_invalid=1" in message
+
+
+def test_catalog_respects_row_limit() -> None:
+    csv_text = (
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Alpha,A1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
+        "Bravo,B1,https://example.com/b,male,https://drive.google.com/file/d/BBB/view,https://nano/b,id-bravo\n"
+        "Charlie,C1,https://example.com/c,male,https://drive.google.com/file/d/CCC/view,https://nano/c,id-charlie\n"
+    )
+
+    async def _run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=csv_text)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            catalog = GoogleSheetCatalog(
+                GoogleCatalogConfig(
+                    csv_url="https://example.com/limit",
+                    cache_ttl_seconds=60,
+                    retries=3,
+                    parse_row_limit=1,
+                ),
+                client=client,
+            )
+            models = await catalog.list_by_gender("male")
+            assert [model.title for model in models] == ["Alpha"]
+            await catalog.aclose()
+
+    asyncio.run(_run())
+
+
+def test_direct_csv_url_used_without_fallback() -> None:
+    csv_text = (
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Alpha,A1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
+    )
+    direct_url = (
+        "https://docs.google.com/spreadsheets/d/e/ABC123/pub"
+        "?gid=0&single=true&output=csv"
+    )
+
+    async def _run() -> None:
+        requested: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append(str(request.url))
+            assert "output=csv" in str(request.url)
+            return httpx.Response(200, text=csv_text)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            catalog = GoogleSheetCatalog(
+                GoogleCatalogConfig(
+                    csv_url=direct_url,
+                    cache_ttl_seconds=60,
+                    retries=1,
+                ),
+                client=client,
+            )
+            models = await catalog.list_by_gender("male")
+            assert models
+            assert len(requested) == 1
+            assert direct_url in requested[0]
+            await catalog.aclose()
+
+    asyncio.run(_run())
+
+
+def test_sheet_id_fallback_respects_gid() -> None:
+    csv_text = (
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Alpha,A1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
+    )
+
+    requested: list[str] = []
+
+    async def _run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append(str(request.url))
+            if request.url.path.endswith("/gviz/tq"):
+                return httpx.Response(404, text="not found")
+            return httpx.Response(200, text=csv_text)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            catalog = GoogleSheetCatalog(
+                GoogleCatalogConfig(
+                    csv_url=None,
+                    sheet_id="SPREADSHEET123",
+                    sheet_gid="42",
+                    cache_ttl_seconds=60,
+                    retries=1,
+                ),
+                client=client,
+            )
+            models = await catalog.list_by_gender("male")
+            assert models
+            await catalog.aclose()
+
+        assert requested[0].startswith(
+            "https://docs.google.com/spreadsheets/d/SPREADSHEET123/gviz/tq"
+        )
+        assert "gid=42" in requested[0]
+        assert requested[1].startswith(
+            "https://docs.google.com/spreadsheets/d/SPREADSHEET123/export"
+        )
+        assert "format=csv" in requested[1]
+        assert "gid=42" in requested[1]
+
+    asyncio.run(_run())

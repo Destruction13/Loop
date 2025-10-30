@@ -505,7 +505,7 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
             site_url="https://example.com/1",
             img_user_url="https://example.com/1.jpg",
             img_nano_url="https://example.com/1-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
         GlassModel(
             unique_id="m2",
@@ -514,7 +514,7 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
             site_url="https://example.com/2",
             img_user_url="https://example.com/2.jpg",
             img_nano_url="https://example.com/2-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
         GlassModel(
             unique_id="m3",
@@ -523,7 +523,7 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
             site_url="https://example.com/3",
             img_user_url="https://example.com/3.jpg",
             img_nano_url="https://example.com/3-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
         GlassModel(
             unique_id="m4",
@@ -532,7 +532,7 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
             site_url="https://example.com/4",
             img_user_url="https://example.com/4.jpg",
             img_nano_url="https://example.com/4-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
     ]
     async def scenario() -> None:
@@ -598,7 +598,7 @@ def test_collage_source_unavailable_falls_back_to_text(tmp_path: Path) -> None:
             site_url="https://example.com/1",
             img_user_url="https://example.com/1.jpg",
             img_nano_url="https://example.com/1-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
         GlassModel(
             unique_id="m2",
@@ -607,7 +607,7 @@ def test_collage_source_unavailable_falls_back_to_text(tmp_path: Path) -> None:
             site_url="https://example.com/2",
             img_user_url="https://example.com/2.jpg",
             img_nano_url="https://example.com/2-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
     ]
 
@@ -647,7 +647,7 @@ def test_collage_processing_error_sends_individual_photos(tmp_path: Path) -> Non
             site_url="https://example.com/1",
             img_user_url="https://example.com/1.jpg",
             img_nano_url="https://example.com/1-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
         GlassModel(
             unique_id="m2",
@@ -656,7 +656,7 @@ def test_collage_processing_error_sends_individual_photos(tmp_path: Path) -> Non
             site_url="https://example.com/2",
             img_user_url="https://example.com/2.jpg",
             img_nano_url="https://example.com/2-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
     ]
 
@@ -699,7 +699,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         site_url="https://example.com/1",
         img_user_url="https://example.com/1.jpg",
         img_nano_url="https://example.com/1-nano.jpg",
-        gender="Мужской",
+        gender="male",
     )
     async def scenario() -> None:
         router, repository, tryon, _, _ = build_router(tmp_path, models=[model])
@@ -772,7 +772,7 @@ def test_generation_unsuitable_photo_requests_new_upload(tmp_path: Path) -> None
         site_url="https://example.com/1",
         img_user_url="https://example.com/1.jpg",
         img_nano_url="https://example.com/1-nano.jpg",
-        gender="Мужской",
+        gender="male",
     )
 
     async def scenario() -> None:
@@ -836,7 +836,7 @@ def test_generation_transient_error_requests_new_upload(tmp_path: Path) -> None:
         site_url="https://example.com/1",
         img_user_url="https://example.com/1.jpg",
         img_nano_url="https://example.com/1-nano.jpg",
-        gender="Мужской",
+        gender="male",
     )
 
     async def scenario() -> None:
@@ -901,7 +901,7 @@ def test_idle_reminder_message_removed_when_user_requests_more(tmp_path: Path) -
             site_url="https://example.com/1",
             img_user_url="https://example.com/1.jpg",
             img_nano_url="https://example.com/1-nano.jpg",
-            gender="Мужской",
+            gender="male",
         )
     ]
 
@@ -933,7 +933,7 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
             site_url="https://example.com/1",
             img_user_url="https://example.com/1.jpg",
             img_nano_url="https://example.com/1-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
         GlassModel(
             unique_id="m2",
@@ -942,7 +942,7 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
             site_url="https://example.com/2",
             img_user_url="https://example.com/2.jpg",
             img_nano_url="https://example.com/2-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
     ]
 
@@ -1004,7 +1004,7 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
             site_url="https://example.com/1",
             img_user_url="https://example.com/1.jpg",
             img_nano_url="https://example.com/1-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
         GlassModel(
             unique_id="m2",
@@ -1013,7 +1013,7 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
             site_url="https://example.com/2",
             img_user_url="https://example.com/2.jpg",
             img_nano_url="https://example.com/2-nano.jpg",
-            gender="Мужской",
+            gender="male",
         ),
     ]
 
@@ -1067,7 +1067,7 @@ def test_limit_result_sends_card_and_summary_message(tmp_path: Path) -> None:
         site_url="https://example.com/1",
         img_user_url="https://example.com/1.jpg",
         img_nano_url="https://example.com/1-nano.jpg",
-        gender="Мужской",
+        gender="male",
     )
 
     async def scenario() -> None:

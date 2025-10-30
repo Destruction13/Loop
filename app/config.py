@@ -45,6 +45,9 @@ class Config:
     idle_reminder_minutes: int
     csv_fetch_ttl_sec: int
     csv_fetch_retries: int
+    catalog_row_limit: int | None
+    catalog_sheet_id: Optional[str]
+    catalog_sheet_gid: Optional[str]
     uploads_root: Path
     results_root: Path
     button_title_max: int
@@ -107,6 +110,32 @@ def load_config(env_file: str | None = None) -> Config:
 
     batch_size = max(_as_int(_get("BATCH_SIZE", "2"), 2), 1)
     batch_columns = max(_as_int(_get("BATCH_LAYOUT_COLS", "2"), 2), 1)
+    google_sheet_url = _get("GOOGLE_SHEET_URL")
+    catalog_csv_url = (
+        _get("CATALOG_CSV_URL")
+        or _get("SHEET_CSV_URL")
+        or google_sheet_url
+    )
+    catalog_sheet_id = (
+        _get("CATALOG_SHEET_ID")
+        or _get("GOOGLE_SHEET_ID")
+        or _get("SHEET_ID")
+    )
+    catalog_sheet_gid = (
+        _get("CATALOG_SHEET_GID")
+        or _get("SHEET_GID")
+        or _get("GOOGLE_SHEET_GID")
+    )
+    row_limit_raw = _get("CATALOG_ROW_LIMIT")
+    row_limit: int | None = None
+    if row_limit_raw:
+        try:
+            parsed_limit = int(row_limit_raw)
+        except ValueError:
+            parsed_limit = 0
+        if parsed_limit > 0:
+            row_limit = parsed_limit
+
     collage = CollageConfig(
         width=_as_int(_get("CANVAS_WIDTH", "1600"), 1600),
         height=_as_int(_get("CANVAS_HEIGHT", "800"), 800),
@@ -141,7 +170,7 @@ def load_config(env_file: str | None = None) -> Config:
         or DEFAULT_PRIVACY_POLICY_URL
     )
 
-    contacts_sheet_url = _get("GOOGLE_SHEET_URL")
+    contacts_sheet_url = google_sheet_url
     google_credentials_raw = _get("GOOGLE_SERVICE_ACCOUNT_JSON")
     google_credentials_path = (
         Path(google_credentials_raw)
@@ -155,7 +184,13 @@ def load_config(env_file: str | None = None) -> Config:
 
     return Config(
         bot_token=_get("BOT_TOKEN", required=True),
-        sheet_csv_url=_get("SHEET_CSV_URL", DEFAULT_SHEET_URL) or DEFAULT_SHEET_URL,
+        sheet_csv_url=(
+            catalog_csv_url
+            or _get("SHEET_CSV_URL", DEFAULT_SHEET_URL)
+            or DEFAULT_SHEET_URL
+        ),
+        catalog_sheet_id=catalog_sheet_id,
+        catalog_sheet_gid=catalog_sheet_gid,
         site_url=(site_url or "https://loov.ru/") if site_url is not None else "https://loov.ru/",
         privacy_policy_url=privacy_policy_url,
         promo_code=promo_code,
@@ -164,6 +199,7 @@ def load_config(env_file: str | None = None) -> Config:
         idle_reminder_minutes=_as_int(idle_timeout_raw, 5),
         csv_fetch_ttl_sec=_as_int(_get("CSV_FETCH_TTL_SEC", "60"), 60),
         csv_fetch_retries=_as_int(_get("CSV_FETCH_RETRIES", "3"), 3),
+        catalog_row_limit=row_limit,
         uploads_root=_as_path(_get("UPLOADS_ROOT", "./uploads"), "./uploads"),
         results_root=_as_path(_get("RESULTS_ROOT", "./results"), "./results"),
         button_title_max=_as_int(_get("BUTTON_TITLE_MAX", "28"), 28),
