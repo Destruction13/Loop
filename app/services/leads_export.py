@@ -10,6 +10,24 @@ from datetime import datetime, timezone
 from typing import Optional
 
 
+import re
+from urllib.parse import urlparse, parse_qs
+
+def _extract_sheet_id(url_or_id: str | None) -> str | None:
+    if not url_or_id:
+        return None
+    s = url_or_id.strip().strip('"').strip("'")
+    # если уже чистый ID
+    if "/" not in s and "?" not in s:
+        return s
+    try:
+        u = urlparse(s)
+        m = re.search(r"/spreadsheets/d/([A-Za-z0-9-_]+)", u.path)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
 @dataclass(slots=True)
 class LeadPayload:
     """Payload describing a captured lead."""
@@ -24,7 +42,7 @@ class LeadPayload:
 
 class LeadsExporter:
     """Append captured leads to a Google Sheets worksheet."""
-
+    
     def __init__(
         self,
         *,
@@ -37,11 +55,15 @@ class LeadsExporter:
         self._enabled = enabled
         self._sheet_name = sheet_name
         self._promo_code = promo_code
-        self._spreadsheet_id = spreadsheet_id or os.getenv("LEADS_SPREADSHEET_ID")
-        creds_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or os.getenv(
-            "GOOGLE_APPLICATION_CREDENTIALS"
-        )
-        self._credentials_path = credentials_path or creds_env
+        raw_id = (
+        spreadsheet_id
+        or os.getenv("LEADS_SPREADSHEET_ID")         # старое имя
+        or os.getenv("GOOGLE_SHEET_ID")              # твое текущее в .env
+        or _extract_sheet_id(os.getenv("GOOGLE_SHEET_URL"))  # вытащим из URL
+    )
+        self._spreadsheet_id = (raw_id or "").strip().strip('"').strip("'")
+        creds_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        self._credentials_path = (credentials_path or creds_env or "").strip().strip('"').strip("'")
         self._logger = logging.getLogger("loop_bot.leads_export")
 
     async def export_lead_to_sheet(self, payload: LeadPayload) -> bool:
