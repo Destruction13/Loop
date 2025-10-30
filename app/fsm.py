@@ -14,9 +14,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, List, Optional, Sequence
 
-from aiogram import BaseMiddleware, F, Router
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart, StateFilter
+from aiogram import BaseMiddleware, F, Router, Bot
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -34,6 +34,8 @@ from app.keyboards import (
     contact_request_keyboard,
     limit_reached_keyboard,
     main_reply_keyboard,
+    idle_reminder_keyboard,
+    privacy_policy_keyboard,
     promo_keyboard,
     send_new_photo_keyboard,
     start_keyboard,
@@ -145,9 +147,115 @@ def setup_router(
     promo_contact_code: str,
     leads_exporter: LeadsExporter,
     contact_exporter: ContactSheetExporter,
+    idle_nudge_seconds: int,
+    enable_idle_nudge: bool,
+    privacy_policy_url: str,
 ) -> Router:
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
+
+    idle_delay = max(int(idle_nudge_seconds), 0)
+    idle_enabled = enable_idle_nudge and idle_delay > 0
+    idle_tasks: dict[int, asyncio.Task] = {}
+
+    policy_url = (privacy_policy_url or "").strip()
+
+    def _cancel_idle_timer(user_id: int) -> None:
+        task = idle_tasks.pop(user_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _should_schedule_idle(profile: UserProfile | None, now: datetime) -> bool:
+        if not idle_enabled or profile is None:
+            return False
+        if not profile.gender:
+            return False
+        if profile.locked_until and profile.locked_until > now:
+            return False
+        if profile.nudge_sent_cycle:
+            return False
+        limit = profile.daily_try_limit if profile.daily_try_limit > 0 else None
+        remaining = profile.remaining(limit)
+        return remaining > 0
+
+    def _extract_chat_id(event: Any) -> int | None:
+        if isinstance(event, Message):
+            return event.chat.id
+        if isinstance(event, CallbackQuery) and event.message:
+            return event.message.chat.id
+        return None
+
+    async def _delete_idle_nudge_message(
+        state: FSMContext, bot: Bot, chat_id: int
+    ) -> None:
+        data = await state.get_data()
+        message_id = data.get("idle_nudge_message_id")
+        if not message_id:
+            return
+        try:
+            await bot.delete_message(chat_id, message_id)
+        except TelegramBadRequest as exc:
+            logger.debug(
+                "Failed to delete idle nudge message %s: %s", message_id, exc
+            )
+        finally:
+            await state.update_data(idle_nudge_message_id=None)
+
+    async def _idle_timeout_worker(
+        user_id: int, chat_id: int, bot: Bot, state: FSMContext
+    ) -> None:
+        try:
+            await asyncio.sleep(idle_delay)
+            profile = await repository.ensure_daily_reset(user_id)
+            now = datetime.now(timezone.utc)
+            if not _should_schedule_idle(profile, now):
+                return
+            text = f"<b>{msg.IDLE_REMINDER_TITLE}</b>\n{msg.IDLE_REMINDER_BODY}"
+            keyboard = idle_reminder_keyboard(site_url)
+            try:
+                message = await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=keyboard,
+                )
+            except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                logger.debug(
+                    "Failed to deliver idle nudge to %s: %s", user_id, exc
+                )
+                return
+            await repository.mark_cycle_nudge_sent(user_id)
+            await state.update_data(idle_nudge_message_id=message.message_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Idle nudge task failed for %s", user_id)
+        finally:
+            idle_tasks.pop(user_id, None)
+
+    async def _handle_idle_timer(
+        user_id: int,
+        event: Any,
+        data: dict[str, Any],
+        profile: UserProfile | None,
+    ) -> None:
+        _cancel_idle_timer(user_id)
+        if not idle_enabled:
+            return
+        if profile is None:
+            return
+        now = datetime.now(timezone.utc)
+        if not _should_schedule_idle(profile, now):
+            return
+        chat_id = _extract_chat_id(event)
+        if chat_id is None:
+            return
+        bot: Bot | None = data.get("bot")
+        state: FSMContext | None = data.get("state")
+        if not bot or state is None:
+            return
+        idle_tasks[user_id] = asyncio.create_task(
+            _idle_timeout_worker(user_id, chat_id, bot, state)
+        )
 
     class ActivityMiddleware(BaseMiddleware):
         """Tracks user activity timestamps."""
@@ -158,9 +266,18 @@ def setup_router(
 
         async def __call__(self, handler, event, data):
             user = data.get("event_from_user")
-            if user:
-                await self._repository.touch_activity(user.id)
-            return await handler(event, data)
+            if not user:
+                return await handler(event, data)
+            user_id = user.id
+            _cancel_idle_timer(user_id)
+            await self._repository.ensure_daily_reset(user_id)
+            await self._repository.touch_activity(user_id)
+            try:
+                return await handler(event, data)
+            finally:
+                if idle_enabled:
+                    profile_after = await self._repository.ensure_daily_reset(user_id)
+                    await _handle_idle_timer(user_id, event, data, profile_after)
 
     activity_middleware = ActivityMiddleware(repository)
     router.message.middleware(activity_middleware)
@@ -203,7 +320,7 @@ def setup_router(
             if isinstance(first_arg, (list, tuple)):
                 send_args = ("".join(first_arg),) + send_args[1:]
         if "reply_markup" not in kwargs or kwargs["reply_markup"] is None:
-            kwargs["reply_markup"] = main_reply_keyboard()
+            kwargs["reply_markup"] = main_reply_keyboard(policy_url)
         sent_message = await send_method(*send_args, **kwargs)
         if track:
             await state.update_data(last_aux_message_id=sent_message.message_id)
@@ -755,7 +872,7 @@ def setup_router(
             state,
             message.answer,
             msg.MAIN_MENU_HINT,
-            reply_markup=main_reply_keyboard(),
+            reply_markup=main_reply_keyboard(policy_url),
         )
         logger.info("%s User %s entered start", EVENT_ID["START"], message.from_user.id)
 
@@ -809,7 +926,7 @@ def setup_router(
         path = await save_user_photo(message)
         await state.update_data(upload=path, upload_file_id=photo.file_id)
         profile = await repository.ensure_daily_reset(user_id)
-        if profile.daily_used == 0:
+        if profile.tries_used == 0:
             await state.update_data(first_generated_today=True)
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
@@ -823,6 +940,7 @@ def setup_router(
             )
             logger.info("%s Limit reached for user %s", EVENT_ID["LIMIT_REACHED"], user_id)
             return
+        await _delete_idle_nudge_message(state, message.bot, message.chat.id)
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
         if await _maybe_request_contact(message, state, user_id):
@@ -1269,21 +1387,8 @@ def setup_router(
                     entry["has_more"] = False
                     stored_results[str(message.message_id)] = entry
                     await state.update_data(result_messages=stored_results)
-        gen_count = await repository.get_generation_count(user_id)
-        if gen_count >= 1:
-            if remove_source_message and message:
-                try:
-                    await message.bot.delete_message(message.chat.id, message.message_id)
-                except TelegramBadRequest as exc:
-                    logger.debug(
-                        "Failed to delete reminder message %s: %s",
-                        message.message_id,
-                        exc,
-                    )
-            if message:
-                await _prompt_for_next_photo(message, state, msg.NEXT_RESULT_CAPTION)
-            await callback.answer()
-            return
+        chat_id = message.chat.id if message else user_id
+        await _delete_idle_nudge_message(state, callback.bot, chat_id)
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
@@ -1296,21 +1401,10 @@ def setup_router(
             )
             await callback.answer()
             return
-        filters = await _ensure_filters(user_id, state)
-        previous_state = await state.get_state()
-        if await _maybe_request_contact(
-            callback.message, state, user_id, origin_state=previous_state
-        ):
-            await callback.answer()
-            return
-        await state.set_state(TryOnStates.SHOW_RECS)
-        preload_message = await _send_aux_message(
-            callback.message,
-            state,
-            callback.message.answer,
-            msg.SEARCHING_MODELS_PROMPT,
-        )
-        await state.update_data(preload_message_id=preload_message.message_id)
+        if message:
+            await _prompt_for_next_photo(message, state, msg.PHOTO_INSTRUCTION)
+        else:
+            await state.set_state(TryOnStates.AWAITING_PHOTO)
         if remove_source_message and message:
             try:
                 await message.bot.delete_message(message.chat.id, message.message_id)
@@ -1320,13 +1414,6 @@ def setup_router(
                     message.message_id,
                     exc,
                 )
-        await _send_models(
-            callback.message,
-            user_id,
-            filters,
-            state,
-            skip_contact_prompt=True,
-        )
         await callback.answer()
 
     @router.message(F.text == msg.MAIN_MENU_TRY_BUTTON)
@@ -1352,10 +1439,17 @@ def setup_router(
         )
         await _prompt_for_next_photo(message, state, prompt_source)
 
-    @router.message(F.text == msg.MAIN_MENU_POLICY_BUTTON)
-    async def handle_main_menu_policy(message: Message, state: FSMContext) -> None:
-        current_state = await state.get_state()
-        if current_state == ContactRequest.waiting_for_phone.state:
+    @router.message(Command("privacy"))
+    async def command_privacy(message: Message, state: FSMContext) -> None:
+        if policy_url:
+            markup = privacy_policy_keyboard(policy_url)
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                policy_url,
+                reply_markup=markup,
+            )
             return
         await _send_aux_message(
             message,
@@ -1408,7 +1502,7 @@ def setup_router(
             )
             await callback.answer()
             return
-        first_flag = profile.daily_used == 0
+        first_flag = profile.tries_used == 0
         await state.update_data(gender=profile.gender, first_generated_today=first_flag)
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await _send_aux_message(

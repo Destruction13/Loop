@@ -19,14 +19,26 @@ def test_daily_reset(tmp_path: Path) -> None:
         await repo.inc_used_on_success(1)
         profile = await repo.get_user(1)
         assert profile is not None
-        assert profile.daily_used == 1
+        assert profile.tries_used == 1
+        assert profile.locked_until is None
 
-        future = (profile.last_reset_at or datetime.now(UTC)) + timedelta(hours=25)
+        await repo.inc_used_on_success(1)
+        profile = await repo.get_user(1)
+        assert profile is not None
+        assert profile.tries_used == 2
+        assert profile.locked_until is not None
+        assert await repo.remaining_tries(1) == 0
+
+        # attempt during lock should not change the counters
+        await repo.inc_used_on_success(1)
+        locked_until = profile.locked_until
+        assert locked_until is not None
+        future = locked_until + timedelta(minutes=1)
         updated = await repo.ensure_daily_reset(1, now=future)
-        assert updated.daily_used == 0
-        assert updated.seen_models == []
-        remaining = await repo.remaining_tries(1)
-        assert remaining == 2
+        assert updated.tries_used == 0
+        assert updated.cycle_index == 1
+        assert updated.locked_until is None
+        assert await repo.remaining_tries(1) == 2
 
     asyncio.run(scenario())
 

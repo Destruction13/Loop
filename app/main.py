@@ -18,7 +18,6 @@ from app.services.catalog_google import GoogleCatalogConfig, GoogleSheetCatalog
 from app.services.collage import build_three_tile_collage
 from app.services.contact_export import ContactSheetExporter
 from app.services.leads_export import LeadsExporter
-from app.services.idle_reminder import IdleReminderService
 from app.services.repository import Repository
 from app.services.social_ad import SocialAdService
 from app.services.scheduler import ReminderScheduler
@@ -109,6 +108,9 @@ async def main() -> None:
         promo_contact_code=config.promo_contact_code,
         leads_exporter=leads_exporter,
         contact_exporter=contact_exporter,
+        idle_nudge_seconds=max(config.idle_reminder_minutes, 0) * 60,
+        enable_idle_nudge=config.enable_idle_reminder,
+        privacy_policy_url=str(config.privacy_policy_url),
     )
     dp.include_router(router)
 
@@ -121,18 +123,7 @@ async def main() -> None:
     )
     scheduler.start()
 
-    idle_reminder: IdleReminderService | None = None
     social_ad: SocialAdService | None = None
-    if config.enable_idle_reminder:
-        idle_reminder = IdleReminderService(
-            bot=bot,
-            repository=repository,
-            site_url=str(config.site_url),
-            timeout_minutes=config.idle_reminder_minutes,
-            interval_seconds=30,
-        )
-        idle_reminder.start()
-
     if config.enable_social_ad and config.social_ad_minutes > 0:
         social_ad = SocialAdService(
             bot=bot,
@@ -149,8 +140,6 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         await scheduler.stop()
-        if idle_reminder is not None:
-            await idle_reminder.stop()
         if social_ad is not None:
             await social_ad.stop()
         await catalog_service.aclose()

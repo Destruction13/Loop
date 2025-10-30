@@ -4,6 +4,7 @@ from app.keyboards import (
     batch_selection_keyboard,
     generation_result_keyboard,
     main_reply_keyboard,
+    privacy_policy_keyboard,
 )
 from app.texts import messages as msg
 
@@ -98,7 +99,7 @@ def test_generation_result_keyboard_without_remaining_options() -> None:
     assert buttons[0].url == "https://example.com"
 
 
-def test_main_reply_keyboard_layout() -> None:
+def test_main_reply_keyboard_layout_without_url() -> None:
     keyboard = main_reply_keyboard()
 
     assert keyboard.resize_keyboard is True
@@ -107,3 +108,30 @@ def test_main_reply_keyboard_layout() -> None:
         [msg.MAIN_MENU_TRY_BUTTON],
         [msg.MAIN_MENU_POLICY_BUTTON],
     ]
+    assert keyboard.keyboard[1][0].web_app is None
+
+
+def test_main_reply_keyboard_layout_with_url() -> None:
+    keyboard = main_reply_keyboard("https://example.com/policy")
+
+    assert keyboard.resize_keyboard is True
+    assert keyboard.one_time_keyboard is False
+    assert keyboard.keyboard[1][0].text == msg.MAIN_MENU_POLICY_BUTTON
+    assert keyboard.keyboard[1][0].web_app is not None
+    assert keyboard.keyboard[1][0].web_app.url == "https://example.com/policy"
+
+
+def test_privacy_policy_keyboard_with_url() -> None:
+    keyboard = privacy_policy_keyboard(" https://example.com/policy ")
+
+    assert keyboard is not None
+    assert len(keyboard.inline_keyboard) == 1
+    button = keyboard.inline_keyboard[0][0]
+    assert button.text == msg.MAIN_MENU_POLICY_BUTTON
+    assert button.url == "https://example.com/policy"
+
+
+def test_privacy_policy_keyboard_without_url() -> None:
+    keyboard = privacy_policy_keyboard("")
+
+    assert keyboard is None
