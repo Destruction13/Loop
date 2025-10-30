@@ -146,6 +146,62 @@ def setup_router(
 
     batch_source = "src=batch2"
 
+    async def _delete_last_aux_message(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        message_id = data.get("last_aux_message_id")
+        if not message_id:
+            return
+        try:
+            await message.bot.delete_message(message.chat.id, message_id)
+        except TelegramBadRequest as exc:
+            logger.debug(
+                "Failed to delete last auxiliary message %s: %s", message_id, exc
+            )
+        finally:
+            await state.update_data(last_aux_message_id=None)
+
+    async def _send_aux_message(
+        source_message: Message,
+        state: FSMContext,
+        send_method: Callable[..., Awaitable[Message]],
+        *args,
+        **kwargs,
+    ) -> Message:
+        await _delete_last_aux_message(source_message, state)
+        sent_message = await send_method(*args, **kwargs)
+        await state.update_data(last_aux_message_id=sent_message.message_id)
+        return sent_message
+
+    async def _send_delivery_message(
+        source_message: Message,
+        state: FSMContext,
+        send_method: Callable[..., Awaitable[Message]],
+        *args,
+        **kwargs,
+    ) -> Message:
+        return await send_method(*args, **kwargs)
+
+    def _remove_more_button_from_markup(
+        markup: InlineKeyboardMarkup | None,
+    ) -> InlineKeyboardMarkup | None:
+        if not markup or not markup.inline_keyboard:
+            return None
+        new_rows = []
+        changed = False
+        for row in markup.inline_keyboard:
+            new_row = []
+            for button in row:
+                callback_data = getattr(button, "callback_data", None)
+                if callback_data and callback_data.startswith("more|"):
+                    changed = True
+                    continue
+                new_row.append(button)
+            if new_row:
+                new_rows.append(new_row)
+        if not changed:
+            return None
+        return InlineKeyboardMarkup(inline_keyboard=new_rows)
+
     async def _maybe_request_contact(
         message: Message,
         state: FSMContext,
@@ -186,7 +242,13 @@ def setup_router(
             update_payload["contact_pending_result_state"] = pending_state
         await state.update_data(**update_payload)
         await state.set_state(ContactRequest.waiting_for_phone)
-        await message.answer(prompt_text, reply_markup=contact_request_keyboard())
+        await _send_aux_message(
+            message,
+            state,
+            message.answer,
+            prompt_text,
+            reply_markup=contact_request_keyboard(),
+        )
         logger.info("%s Contact requested for %s", EVENT_ID["MODELS_SENT"], user_id)
         return True
 
@@ -205,7 +267,12 @@ def setup_router(
             result = await recommender.recommend_for_user(user_id, filters.gender)
         except CatalogError as exc:
             logger.error("%s Failed to fetch catalog: %s", EVENT_ID["MODELS_SENT"], exc)
-            await message.answer(msg.CATALOG_TEMPORARILY_UNAVAILABLE)
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.CATALOG_TEMPORARILY_UNAVAILABLE,
+            )
             await state.update_data(current_models=[])
             await _delete_state_message(message, state, "preload_message_id")
             return False
@@ -214,7 +281,10 @@ def setup_router(
                 marketing_message = msg.marketing_text(no_more_message_key)
             except KeyError:
                 marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
-            await message.answer(
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
                 marketing_message,
                 reply_markup=all_seen_keyboard(landing_url),
             )
@@ -223,24 +293,29 @@ def setup_router(
             return False
         batch = list(result.models)
         await state.update_data(current_models=batch, last_batch=batch)
-        await _send_model_batches(message, batch)
+        await _send_model_batches(message, state, batch)
         await _delete_state_message(message, state, "preload_message_id")
         if result.exhausted:
             try:
                 marketing_message = msg.marketing_text(no_more_message_key)
             except KeyError:
                 marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
-            await message.answer(
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
                 marketing_message,
                 reply_markup=all_seen_keyboard(landing_url),
             )
         return True
 
-    async def _send_model_batches(message: Message, batch: list[GlassModel]) -> None:
+    async def _send_model_batches(
+        message: Message, state: FSMContext, batch: list[GlassModel]
+    ) -> None:
         groups = chunk_models(batch, batch_size)
         for group in groups:
             try:
-                await _send_batch_message(message, group)
+                await _send_batch_message(message, state, group)
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "%s Failed to send model batch %s: %s",
@@ -342,7 +417,10 @@ def setup_router(
                 full_name=full_name,
             )
         if reward_needed:
-            await message.answer(
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
                 msg.ASK_PHONE_THANKS.format(
                     rub=contact_reward_rub, promo=promo_contact_code
                 ),
@@ -362,10 +440,18 @@ def setup_router(
                     followup_text = "".join(caption_source)
                 else:
                     followup_text = str(caption_source)
-                await message.answer(followup_text)
+                await _send_aux_message(
+                    message,
+                    state,
+                    message.answer,
+                    followup_text,
+                )
             return
         else:
-            await message.answer(
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
                 msg.ASK_PHONE_ALREADY_HAVE,
                 reply_markup=ReplyKeyboardRemove(),
             )
@@ -382,12 +468,17 @@ def setup_router(
         raw = (message.text or "").strip()
         normalized = normalize_phone(raw)
         if not normalized:
-            await message.answer(msg.ASK_PHONE_INVALID)
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.ASK_PHONE_INVALID,
+            )
             return
         await _store_contact(message, state, normalized, source=source)
 
     async def _send_batch_message(
-        message: Message, group: tuple[GlassModel, ...]
+        message: Message, state: FSMContext, group: tuple[GlassModel, ...]
     ) -> None:
         keyboard = batch_selection_keyboard(
             [(item.unique_id, item.title) for item in group],
@@ -398,7 +489,10 @@ def setup_router(
         try:
             buffer = await collage_builder(urls, collage_config)
         except CollageSourceUnavailable:
-            await message.answer(
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
                 msg.COLLAGE_IMAGES_UNAVAILABLE,
                 reply_markup=keyboard,
             )
@@ -410,7 +504,10 @@ def setup_router(
                 exc,
             )
             await _send_batch_as_photos(
-                message, group, reply_markup=keyboard
+                message,
+                state,
+                group,
+                reply_markup=keyboard,
             )
             return
         except Exception as exc:  # noqa: BLE001
@@ -420,14 +517,20 @@ def setup_router(
                 exc,
             )
             await _send_batch_as_photos(
-                message, group, reply_markup=keyboard
+                message,
+                state,
+                group,
+                reply_markup=keyboard,
             )
             return
 
         filename = f"collage-{uuid.uuid4().hex}.jpg"
         collage_bytes = buffer.getvalue()
         buffer.close()
-        await message.answer_photo(
+        await _send_delivery_message(
+            message,
+            state,
+            message.answer_photo,
             photo=BufferedInputFile(collage_bytes, filename=filename),
             caption=None,
             reply_markup=keyboard,
@@ -442,6 +545,7 @@ def setup_router(
 
     async def _send_batch_as_photos(
         message: Message,
+        state: FSMContext,
         group: tuple[GlassModel, ...],
         *,
         reply_markup: InlineKeyboardMarkup,
@@ -466,6 +570,8 @@ def setup_router(
         except TelegramBadRequest as exc:
             logger.warning("Failed to delete %s message %s: %s", key, message_id, exc)
         finally:
+            if data.get("last_aux_message_id") == message_id:
+                await state.update_data(last_aux_message_id=None)
             await state.update_data(**{key: None})
 
     @router.message(CommandStart())
@@ -483,7 +589,13 @@ def setup_router(
                     except ValueError:
                         pass
         await state.set_state(TryOnStates.START)
-        await message.answer(msg.START_WELCOME, reply_markup=start_keyboard())
+        await _send_aux_message(
+            message,
+            state,
+            message.answer,
+            msg.START_WELCOME,
+            reply_markup=start_keyboard(),
+        )
         logger.info("%s User %s entered start", EVENT_ID["START"], message.from_user.id)
 
     @router.callback_query(StateFilter(TryOnStates.START), F.data == "start_go")
@@ -506,7 +618,10 @@ def setup_router(
         await state.update_data(gender=gender, first_generated_today=True)
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await _delete_state_message(callback.message, state, "gender_prompt_message_id")
-        await callback.message.answer(
+        await _send_aux_message(
+            callback.message,
+            state,
+            callback.message.answer,
             msg.PHOTO_INSTRUCTION,
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -514,8 +629,13 @@ def setup_router(
         logger.info("%s Gender selected %s", EVENT_ID["FILTER_SELECTED"], gender)
 
     @router.message(StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT), ~F.photo)
-    async def reject_non_photo(message: Message) -> None:
-        await message.answer(msg.NOT_PHOTO_WARNING)
+    async def reject_non_photo(message: Message, state: FSMContext) -> None:
+        await _send_aux_message(
+            message,
+            state,
+            message.answer,
+            msg.NOT_PHOTO_WARNING,
+        )
 
     @router.message(StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT), F.photo)
     async def accept_photo(message: Message, state: FSMContext) -> None:
@@ -531,7 +651,10 @@ def setup_router(
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
-            await message.answer(
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
                 msg.DAILY_LIMIT_MESSAGE,
                 reply_markup=limit_reached_keyboard(landing_url),
             )
@@ -542,7 +665,10 @@ def setup_router(
         if await _maybe_request_contact(message, state, user_id):
             logger.info("%s Contact request queued for %s", EVENT_ID["MODELS_SENT"], user_id)
             return
-        preload_message = await message.answer(
+        preload_message = await _send_aux_message(
+            message,
+            state,
+            message.answer,
             msg.SEARCHING_MODELS_PROMPT,
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -582,7 +708,10 @@ def setup_router(
         remaining = await repository.remaining_tries(callback.from_user.id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
-            await callback.message.answer(
+            await _send_aux_message(
+                callback.message,
+                state,
+                callback.message.answer,
                 msg.DAILY_LIMIT_MESSAGE,
                 reply_markup=limit_reached_keyboard(landing_url),
             )
@@ -599,7 +728,12 @@ def setup_router(
             )
         await state.update_data(selected_model=selected)
         await state.set_state(TryOnStates.GENERATING)
-        generation_message = await callback.message.answer(msg.GENERATING_PROMPT)
+        generation_message = await _send_aux_message(
+            callback.message,
+            state,
+            callback.message.answer,
+            msg.GENERATING_PROMPT,
+        )
         await state.update_data(generation_message_id=generation_message.message_id)
         await _perform_generation(callback.message, state, selected)
 
@@ -607,11 +741,21 @@ def setup_router(
     async def contact_shared(message: Message, state: FSMContext) -> None:
         contact = message.contact
         if not contact or not contact.phone_number:
-            await message.answer(msg.ASK_PHONE_INVALID)
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.ASK_PHONE_INVALID,
+            )
             return
         normalized = normalize_phone(contact.phone_number)
         if not normalized:
-            await message.answer(msg.ASK_PHONE_INVALID)
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.ASK_PHONE_INVALID,
+            )
             return
         await _store_contact(message, state, normalized, source="share_button")
 
@@ -621,8 +765,12 @@ def setup_router(
         user_id = message.from_user.id
         if text == msg.ASK_PHONE_BUTTON_SKIP:
             await repository.set_contact_skip_once(user_id, True)
-            await message.answer(
-                msg.ASK_PHONE_SKIP_ACK, reply_markup=ReplyKeyboardRemove()
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.ASK_PHONE_SKIP_ACK,
+                reply_markup=ReplyKeyboardRemove(),
             )
             await _resume_after_contact(message, state, send_generation=True)
             logger.info("%s Contact skip once for %s", EVENT_ID["MODELS_SENT"], user_id)
@@ -630,8 +778,12 @@ def setup_router(
         if text == msg.ASK_PHONE_BUTTON_NEVER:
             await repository.set_contact_never(user_id, True)
             await repository.set_contact_skip_once(user_id, False)
-            await message.answer(
-                msg.ASK_PHONE_NEVER_ACK, reply_markup=ReplyKeyboardRemove()
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.ASK_PHONE_NEVER_ACK,
+                reply_markup=ReplyKeyboardRemove(),
             )
             await _resume_after_contact(message, state, send_generation=True)
             logger.info("%s Contact opt-out for %s", EVENT_ID["MODELS_SENT"], user_id)
@@ -639,8 +791,13 @@ def setup_router(
         await _handle_manual_phone(message, state, source="manual")
 
     @router.message(StateFilter(ContactRequest.waiting_for_phone))
-    async def contact_fallback(message: Message) -> None:
-        await message.answer(msg.ASK_PHONE_INVALID)
+    async def contact_fallback(message: Message, state: FSMContext) -> None:
+        await _send_aux_message(
+            message,
+            state,
+            message.answer,
+            msg.ASK_PHONE_INVALID,
+        )
 
     async def _perform_generation(message: Message, state: FSMContext, model: GlassModel) -> None:
         user_id = message.chat.id
@@ -648,7 +805,13 @@ def setup_router(
         upload_value = data.get("upload")
         if not upload_value:
             await _delete_state_message(message, state, "generation_message_id")
-            await message.answer(msg.GENERATION_FAILED, reply_markup=retry_keyboard())
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.GENERATION_FAILED,
+                reply_markup=retry_keyboard(),
+            )
             await state.set_state(TryOnStates.ERROR)
             return
         upload_path = Path(upload_value)
@@ -664,12 +827,24 @@ def setup_router(
                 "%s Generation failed: %s", EVENT_ID["GENERATION_FAILED"], exc
             )
             await _delete_state_message(message, state, "generation_message_id")
-            await message.answer(msg.GENERATION_FAILED, reply_markup=retry_keyboard())
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.GENERATION_FAILED,
+                reply_markup=retry_keyboard(),
+            )
             await state.set_state(TryOnStates.ERROR)
             return
         if not results:
             await _delete_state_message(message, state, "generation_message_id")
-            await message.answer(msg.GENERATION_FAILED, reply_markup=retry_keyboard())
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.GENERATION_FAILED,
+                reply_markup=retry_keyboard(),
+            )
             await state.set_state(TryOnStates.ERROR)
             return
         primary_result = results[0]
@@ -688,10 +863,19 @@ def setup_router(
             caption_text = "".join(caption_source)
         else:
             caption_text = str(caption_source)
-        await message.answer_photo(
+        result_markup = generation_result_keyboard(
+            model.site_url, plan.remaining
+        )
+        if plan.outcome is GenerationOutcome.LIMIT:
+            caption_text = f"{caption_text}\n\n{msg.DAILY_LIMIT_MESSAGE}"
+            result_markup = limit_reached_keyboard(landing_url)
+        await _send_delivery_message(
+            message,
+            state,
+            message.answer_photo,
             FSInputFile(path=str(primary_result)),
             caption=caption_text,
-            reply_markup=generation_result_keyboard(model.site_url, plan.remaining),
+            reply_markup=result_markup,
         )
         await repository.increment_generation_count(user_id)
         await _delete_state_message(message, state, "generation_message_id")
@@ -701,10 +885,6 @@ def setup_router(
         await state.update_data(first_generated_today=new_flag)
         contact_active = data.get("contact_request_active", False)
         if plan.outcome is GenerationOutcome.LIMIT:
-            await message.answer(
-                msg.DAILY_LIMIT_MESSAGE,
-                reply_markup=limit_reached_keyboard(landing_url),
-            )
             if contact_active:
                 await state.update_data(contact_pending_result_state="limit")
             else:
@@ -722,10 +902,25 @@ def setup_router(
     @router.callback_query(StateFilter(TryOnStates.RESULT), F.data.startswith("more|"))
     async def result_more(callback: CallbackQuery, state: FSMContext) -> None:
         user_id = callback.from_user.id
+        message = callback.message
+        if message:
+            updated_markup = _remove_more_button_from_markup(message.reply_markup)
+            if updated_markup is not None:
+                try:
+                    await message.edit_reply_markup(reply_markup=updated_markup)
+                except TelegramBadRequest as exc:
+                    logger.debug(
+                        "Failed to update keyboard for message %s: %s",
+                        message.message_id,
+                        exc,
+                    )
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
-            await callback.message.answer(
+            await _send_aux_message(
+                callback.message,
+                state,
+                callback.message.answer,
                 msg.DAILY_LIMIT_MESSAGE,
                 reply_markup=limit_reached_keyboard(landing_url),
             )
@@ -739,7 +934,12 @@ def setup_router(
             await callback.answer()
             return
         await state.set_state(TryOnStates.SHOW_RECS)
-        preload_message = await callback.message.answer(msg.SEARCHING_MODELS_PROMPT)
+        preload_message = await _send_aux_message(
+            callback.message,
+            state,
+            callback.message.answer,
+            msg.SEARCHING_MODELS_PROMPT,
+        )
         await state.update_data(preload_message_id=preload_message.message_id)
         await _send_models(
             callback.message,
@@ -751,20 +951,28 @@ def setup_router(
         await callback.answer()
 
     @router.callback_query(StateFilter(TryOnStates.DAILY_LIMIT_REACHED), F.data == "limit_promo")
-    async def limit_promo(callback: CallbackQuery) -> None:
+    async def limit_promo(callback: CallbackQuery, state: FSMContext) -> None:
         text = msg.PROMO_MESSAGE_TEMPLATE.format(promo_code=promo_code)
-        await callback.message.answer(
+        await _send_aux_message(
+            callback.message,
+            state,
+            callback.message.answer,
             text,
             reply_markup=promo_keyboard(landing_url),
         )
         await callback.answer()
 
     @router.callback_query(StateFilter(TryOnStates.DAILY_LIMIT_REACHED), F.data == "limit_remind")
-    async def limit_remind(callback: CallbackQuery) -> None:
+    async def limit_remind(callback: CallbackQuery, state: FSMContext) -> None:
         user_id = callback.from_user.id
         when = datetime.now(timezone.utc) + timedelta(hours=reminder_hours)
         await repository.set_reminder(user_id, when)
-        await callback.message.answer(msg.REMINDER_CONFIRMATION)
+        await _send_aux_message(
+            callback.message,
+            state,
+            callback.message.answer,
+            msg.REMINDER_CONFIRMATION,
+        )
         await callback.answer()
         logger.info(
             "%s Reminder scheduled for %s", EVENT_ID["REMINDER_SCHEDULED"], user_id
@@ -777,13 +985,22 @@ def setup_router(
         await repository.set_reminder(user_id, None)
         if not profile.gender:
             await state.set_state(TryOnStates.START)
-            await callback.message.answer(msg.START_WELCOME, reply_markup=start_keyboard())
+            await _send_aux_message(
+                callback.message,
+                state,
+                callback.message.answer,
+                msg.START_WELCOME,
+                reply_markup=start_keyboard(),
+            )
             await callback.answer()
             return
         first_flag = profile.daily_used == 0
         await state.update_data(gender=profile.gender, first_generated_today=first_flag)
         await state.set_state(TryOnStates.AWAITING_PHOTO)
-        await callback.message.answer(
+        await _send_aux_message(
+            callback.message,
+            state,
+            callback.message.answer,
             msg.PHOTO_INSTRUCTION,
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -797,7 +1014,12 @@ def setup_router(
             await callback.answer("Нет выбранной модели", show_alert=True)
             return
         await state.set_state(TryOnStates.GENERATING)
-        generation_message = await callback.message.answer(msg.GENERATING_PROMPT)
+        generation_message = await _send_aux_message(
+            callback.message,
+            state,
+            callback.message.answer,
+            msg.GENERATING_PROMPT,
+        )
         await state.update_data(generation_message_id=generation_message.message_id)
         await callback.answer()
         await _perform_generation(callback.message, state, selected)

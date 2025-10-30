@@ -23,6 +23,9 @@ def normalize_phone(raw: str, default_region: str = "RU") -> Optional[str]:
     candidate = raw.strip()
     if not candidate:
         return None
+    digits_only = "".join(ch for ch in candidate if ch.isdigit())
+    if candidate.startswith("8") and len(digits_only) == 11 and digits_only.startswith("8"):
+        candidate = "+7" + digits_only[1:]
     try:
         if candidate.startswith("+"):
             number = phonenumbers.parse(candidate, None)
