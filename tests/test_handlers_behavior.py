@@ -457,6 +457,10 @@ def build_router(
         idle_nudge_seconds=0,
         enable_idle_nudge=False,
         privacy_policy_url=TEST_PRIVACY_POLICY_URL,
+        promo_video_path=tmp_path / "promo.mp4",
+        promo_video_enabled=False,
+        promo_video_width=None,
+        promo_video_height=None,
     )
     return router, repository, tryon, builder, recommender
 

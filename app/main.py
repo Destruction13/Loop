@@ -114,6 +114,10 @@ async def main() -> None:
         idle_nudge_seconds=max(config.idle_reminder_minutes, 0) * 60,
         enable_idle_nudge=config.enable_idle_reminder,
         privacy_policy_url=str(config.privacy_policy_url),
+        promo_video_path=config.promo_video_path,
+        promo_video_enabled=config.promo_video_enabled,
+        promo_video_width=config.promo_video_width,
+        promo_video_height=config.promo_video_height,
     )
     dp.include_router(router)
 

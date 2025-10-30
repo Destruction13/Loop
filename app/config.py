@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/e/2PACX-1vRT2CXRcmWxmWHKADYfHTadlxBUZ-"
@@ -81,6 +84,10 @@ class Config:
     social_tiktok_url: str
     contacts_sheet_url: Optional[str]
     google_service_account_json: Optional[Path]
+    promo_video_path: Path
+    promo_video_enabled: bool
+    promo_video_width: int | None
+    promo_video_height: int | None
 
 
 def _get(name: str, default: Optional[str] = None, *, required: bool = False) -> Optional[str]:
@@ -106,6 +113,19 @@ def _as_int(value: Optional[str], fallback: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _as_positive_int_or_none(value: Optional[str]) -> int | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    try:
+        parsed = int(normalized)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _as_path(value: Optional[str], fallback: str) -> Path:
@@ -190,6 +210,26 @@ def load_config(env_file: str | None = None) -> Config:
         else None
     )
 
+    promo_video_path = _as_path(
+        _get("PROMO_VIDEO_PATH", "video/promo_start.mp4"), "video/promo_start.mp4"
+    )
+    promo_video_enabled = _as_bool(_get("PROMO_VIDEO_ENABLED", "1"), True)
+    promo_video_width_raw = _get("PROMO_VIDEO_WIDTH")
+    promo_video_height_raw = _get("PROMO_VIDEO_HEIGHT")
+    promo_video_width = _as_positive_int_or_none(promo_video_width_raw)
+    promo_video_height = _as_positive_int_or_none(promo_video_height_raw)
+    if promo_video_width_raw and promo_video_width is None:
+        logger.warning("Invalid PROMO_VIDEO_WIDTH value %r; ignoring", promo_video_width_raw)
+    if promo_video_height_raw and promo_video_height is None:
+        logger.warning("Invalid PROMO_VIDEO_HEIGHT value %r; ignoring", promo_video_height_raw)
+    logger.info(
+        "Promo video config: path=%s, enabled=%s, width=%s, height=%s",
+        promo_video_path,
+        promo_video_enabled,
+        promo_video_width,
+        promo_video_height,
+    )
+
     api_key = _get("NANOBANANA_API_KEY", required=True) or ""
     if not api_key.strip():
         raise RuntimeError("NANOBANANA_API_KEY is required")
@@ -236,7 +276,12 @@ def load_config(env_file: str | None = None) -> Config:
         or "https://tiktok.com/@loov",
         contacts_sheet_url=contacts_sheet_url,
         google_service_account_json=google_credentials_path,
+        promo_video_path=promo_video_path,
+        promo_video_enabled=promo_video_enabled,
+        promo_video_width=promo_video_width,
+        promo_video_height=promo_video_height,
     )
 
 
 __all__ = ["Config", "CollageConfig", "load_config"]
+

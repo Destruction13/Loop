@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import time
 import uuid
@@ -44,6 +45,7 @@ from app.logging_conf import EVENT_ID
 from app.models import FilterOptions, GlassModel, UserContact
 from app.services.catalog_base import CatalogError
 from app.config import CollageConfig
+from app.media import probe_video_size
 from app.services.collage import (
     CollageProcessingError,
     CollageSourceUnavailable,
@@ -150,6 +152,10 @@ def setup_router(
     idle_nudge_seconds: int,
     enable_idle_nudge: bool,
     privacy_policy_url: str,
+    promo_video_path: Path,
+    promo_video_enabled: bool,
+    promo_video_width: int | None,
+    promo_video_height: int | None,
 ) -> Router:
     router = Router()
     logger = logging.getLogger("loop_bot.handlers")
@@ -850,6 +856,8 @@ def setup_router(
                 await state.update_data(last_aux_message_id=None)
             await state.update_data(**{key: None})
 
+    promo_video_missing_warned = False
+
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
         await repository.ensure_user(message.from_user.id)
@@ -865,25 +873,72 @@ def setup_router(
                     except ValueError:
                         pass
         await state.set_state(TryOnStates.START)
-        promo_video_path = Path("video") / "promo_start.mp4"
+        promo_video_log = {
+            "path": str(promo_video_path),
+            "width": None,
+            "height": None,
+            "source": "none",
+        }
         start_message_sent = False
-        if promo_video_path.exists():
-            try:
-                await _send_aux_message(
-                    message,
-                    state,
-                    message.answer_video,
-                    video=FSInputFile(promo_video_path),
-                    caption=msg.START_WELCOME,
-                    reply_markup=start_keyboard(),
+        nonlocal promo_video_missing_warned
+        if promo_video_enabled:
+            if promo_video_path.exists():
+                width_override = None
+                height_override = None
+                source = "none"
+                if promo_video_width is not None and promo_video_height is not None:
+                    width_override = promo_video_width
+                    height_override = promo_video_height
+                    source = "env"
+                elif (promo_video_width is not None) != (promo_video_height is not None):
+                    logger.warning(
+                        "Both PROMO_VIDEO_WIDTH and PROMO_VIDEO_HEIGHT must be set; ignoring overrides"
+                    )
+                if width_override is None or height_override is None:
+                    probed_width, probed_height, probe_meta = probe_video_size(
+                        str(promo_video_path)
+                    )
+                    probe_source = probe_meta.get("source")
+                    if probed_width and probed_height:
+                        width_override = probed_width
+                        height_override = probed_height
+                    if probe_source == "cache":
+                        source = "cache"
+                    elif probe_source in {"ffprobe", "opencv"}:
+                        source = "probe"
+                    elif probe_source:
+                        source = "none"
+                promo_video_log.update(
+                    width=width_override,
+                    height=height_override,
+                    source=source,
                 )
-                start_message_sent = True
-            except TelegramBadRequest as exc:
-                logger.error(
-                    "Failed to send promo video from %s: %s", promo_video_path, exc
-                )
-        else:
-            logger.warning("Promo video not found at %s", promo_video_path)
+                send_kwargs: dict[str, Any] = {
+                    "video": FSInputFile(promo_video_path),
+                    "caption": msg.START_WELCOME,
+                    "reply_markup": start_keyboard(),
+                    "supports_streaming": True,
+                }
+                if width_override and height_override:
+                    send_kwargs["width"] = width_override
+                    send_kwargs["height"] = height_override
+                try:
+                    await _send_aux_message(
+                        message,
+                        state,
+                        message.answer_video,
+                        **send_kwargs,
+                    )
+                    start_message_sent = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to send promo video from %s: %s", promo_video_path, exc
+                    )
+            else:
+                if not promo_video_missing_warned:
+                    logger.warning("Promo video not found at %s", promo_video_path)
+                    promo_video_missing_warned = True
+        logger.info("promo_video=%s", json.dumps(promo_video_log, ensure_ascii=False))
 
         if not start_message_sent:
             await _send_aux_message(
