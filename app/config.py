@@ -29,6 +29,7 @@ class CollageConfig:
     divider_color: str
     background: str
     jpeg_quality: int
+    scale_mode: str
 
 
 @dataclass(slots=True)
@@ -140,11 +141,12 @@ def load_config(env_file: str | None = None) -> Config:
         width=_as_int(_get("CANVAS_WIDTH", "1600"), 1600),
         height=_as_int(_get("CANVAS_HEIGHT", "800"), 800),
         columns=batch_columns,
-        margin=_as_int(_get("TILE_MARGIN", "30"), 30),
+        margin=_as_int(_get("TILE_MARGIN", "32"), 32),
         divider_width=_as_int(_get("DIVIDER_WIDTH", "6"), 6),
-        divider_color=_get("DIVIDER_COLOR", "#E5E5E5") or "#E5E5E5",
-        background=_get("CANVAS_BG", "#FFFFFF") or "#FFFFFF",
+        divider_color=_get("DIVIDER_COLOR", "#505050") or "#505050",
+        background=_get("CANVAS_BG", "#181818") or "#181818",
         jpeg_quality=_as_int(_get("JPEG_QUALITY", "88"), 88),
+        scale_mode=(_get("COLLAGE_SCALE_MODE", "cover") or "cover").lower(),
     )
 
     promo_code = _get("PROMO_CODE", "DEMO 10") or "DEMO 10"

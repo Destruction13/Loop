@@ -16,11 +16,12 @@ def _default_cfg() -> CollageConfig:
         width=1600,
         height=800,
         columns=2,
-        margin=30,
+        margin=32,
         divider_width=6,
-        divider_color="#E5E5E5",
-        background="#FFFFFF",
+        divider_color="#505050",
+        background="#181818",
         jpeg_quality=88,
+        scale_mode="cover",
     )
 
 
@@ -96,7 +97,6 @@ def test_collage_1x2_geometry() -> None:
 def test_collage_draws_dividers() -> None:
     config = _default_cfg()
     config.divider_width = 8
-    config.divider_color = "#123456"
     image_bytes = _make_image_bytes((500, 500), "white")
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -115,13 +115,13 @@ def test_collage_draws_dividers() -> None:
         )
     )
 
-    divider_rgb = ImageColor.getrgb(config.divider_color)
+    expected_color = (80, 80, 80)
     with Image.open(buffer) as collage:
         boxes = _tile_boxes(config)
         divider_left = boxes[0][2]
         sample_x = divider_left + config.divider_width // 2
         sample = collage.getpixel((sample_x, config.height // 2))
-        assert all(abs(channel - ref) <= 5 for channel, ref in zip(sample, divider_rgb))
+        assert all(abs(channel - ref) <= 5 for channel, ref in zip(sample, expected_color))
 
 
 def test_collage_handles_missing_sources() -> None:
@@ -147,6 +147,37 @@ def test_collage_handles_missing_sources() -> None:
         right_pixel = collage.getpixel(((boxes[1][0] + boxes[1][2]) // 2, (boxes[1][1] + boxes[1][3]) // 2))
         assert left_pixel[0] > 150
         assert right_pixel == background_rgb
+
+
+def test_collage_contain_mode_draws_light_dividers() -> None:
+    config = _default_cfg()
+    config.scale_mode = "contain"
+    blue = _make_image_bytes((500, 300), "blue")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=blue,
+            headers={"content-type": "image/jpeg"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    buffer = asyncio.run(
+        _render_collage(
+            transport,
+            ["https://example.com/1.jpg", "https://example.com/2.jpg"],
+            config,
+        )
+    )
+
+    with Image.open(buffer) as collage:
+        boxes = _tile_boxes(config)
+        divider_left = boxes[0][2]
+        sample_x = divider_left + config.divider_width // 2
+        divider_sample = collage.getpixel((sample_x, config.height // 2))
+        assert all(abs(channel - ref) <= 5 for channel, ref in zip(divider_sample, (200, 200, 200)))
+        margin_sample = collage.getpixel((config.margin // 2, config.margin // 2))
+        assert margin_sample == (24, 24, 24)
 
 
 def test_collage_raises_when_all_sources_missing() -> None:

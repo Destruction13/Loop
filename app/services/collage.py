@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import httpx
-from PIL import Image, ImageColor, ImageDraw, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 from app.config import CollageConfig
 
@@ -104,8 +104,12 @@ async def _download_sources(
 
 
 def _compose_collage(sources: Iterable[_CollageSource], cfg: CollageConfig) -> io.BytesIO:
-    background = ImageColor.getrgb(cfg.background)
-    divider_color = ImageColor.getrgb(cfg.divider_color)
+    scale_mode = (cfg.scale_mode or "cover").lower()
+    if scale_mode not in {"cover", "contain"}:
+        scale_mode = "cover"
+
+    background = (24, 24, 24)
+    divider_color = (80, 80, 80) if scale_mode == "cover" else (200, 200, 200)
     width = max(cfg.width, 1)
     height = max(cfg.height, 1)
     margin = max(cfg.margin, 0)
@@ -132,19 +136,8 @@ def _compose_collage(sources: Iterable[_CollageSource], cfg: CollageConfig) -> i
         tile_boxes.append((left, margin, right, margin + tile_height))
         current_left = right + divider_width
 
-    for index, source in enumerate(sources):
-        if index >= len(tile_boxes):
-            break
-        image = _load_source_image(source, tile_boxes[index], background)
-        if image is None:
-            continue
-        tile_left, tile_top, tile_right, tile_bottom = tile_boxes[index]
-        cell_width = tile_right - tile_left
-        cell_height = tile_bottom - tile_top
-        pos_x = tile_left + max((cell_width - image.width) // 2, 0)
-        pos_y = tile_top + max((cell_height - image.height) // 2, 0)
-        canvas.paste(image, (pos_x, pos_y))
-        image.close()
+    renderer = render_collage(scale_mode)
+    renderer(canvas, tile_boxes, sources, background)
 
     if divider_width > 0:
         for index in range(1, columns):
@@ -166,26 +159,86 @@ def _compose_collage(sources: Iterable[_CollageSource], cfg: CollageConfig) -> i
     return buffer
 
 
-def _load_source_image(
-    source: _CollageSource,
-    cell_box: tuple[int, int, int, int],
+def render_collage(scale_mode: str):
+    if scale_mode == "contain":
+        return render_collage_contain
+    return render_collage_cover
+
+
+def render_collage_cover(
+    canvas: Image.Image,
+    tile_boxes: list[tuple[int, int, int, int]],
+    sources: Iterable[_CollageSource],
     background: tuple[int, int, int],
-) -> Image.Image | None:
+) -> None:
+    for index, source in enumerate(sources):
+        if index >= len(tile_boxes):
+            break
+        image = _open_source_image(source)
+        if image is None:
+            continue
+        tile_left, tile_top, tile_right, tile_bottom = tile_boxes[index]
+        cell_width = max(tile_right - tile_left, 1)
+        cell_height = max(tile_bottom - tile_top, 1)
+        try:
+            fitted = ImageOps.fit(
+                image,
+                (cell_width, cell_height),
+                method=Image.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to fit collage image %s: %s", source.url, exc)
+            image.close()
+            continue
+        try:
+            canvas.paste(fitted, (tile_left, tile_top))
+        finally:
+            if fitted is not image:
+                image.close()
+            fitted.close()
+
+
+def render_collage_contain(
+    canvas: Image.Image,
+    tile_boxes: list[tuple[int, int, int, int]],
+    sources: Iterable[_CollageSource],
+    background: tuple[int, int, int],
+) -> None:
+    for index, source in enumerate(sources):
+        if index >= len(tile_boxes):
+            break
+        image = _open_source_image(source)
+        if image is None:
+            continue
+        tile_left, tile_top, tile_right, tile_bottom = tile_boxes[index]
+        cell_width = max(tile_right - tile_left, 1)
+        cell_height = max(tile_bottom - tile_top, 1)
+        try:
+            fitted = ImageOps.contain(
+                image, (cell_width, cell_height), method=Image.LANCZOS
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to prepare collage image %s: %s", source.url, exc)
+            image.close()
+            continue
+        pos_x = tile_left + max((cell_width - fitted.width) // 2, 0)
+        pos_y = tile_top + max((cell_height - fitted.height) // 2, 0)
+        try:
+            canvas.paste(fitted, (pos_x, pos_y))
+        finally:
+            if fitted is not image:
+                image.close()
+            fitted.close()
+
+
+def _open_source_image(source: _CollageSource) -> Image.Image | None:
     if source.data is None:
         return None
 
-    cell_width = max(cell_box[2] - cell_box[0], 1)
-    cell_height = max(cell_box[3] - cell_box[1], 1)
-
     try:
         with Image.open(io.BytesIO(source.data)) as original:
-            converted = original.convert("RGB")
-            fitted = ImageOps.contain(
-                converted, (cell_width, cell_height), method=Image.LANCZOS
-            )
-            if fitted is not converted:
-                converted.close()
-            return fitted
+            return original.convert("RGB")
     except UnidentifiedImageError:
         LOGGER.warning("Collage image %s is not a valid image", source.url)
     except Exception as exc:  # noqa: BLE001

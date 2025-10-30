@@ -369,6 +369,7 @@ def build_router(
         divider_color="#E6E9EF",
         background="#FFFFFF",
         jpeg_quality=90,
+        scale_mode="cover",
     )
 
     from app import fsm as fsm_module

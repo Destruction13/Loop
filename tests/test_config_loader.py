@@ -32,6 +32,7 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 "DIVIDER_WIDTH=6",
                 "DIVIDER_COLOR=#123456",
                 "JPEG_QUALITY=82",
+                "COLLAGE_SCALE_MODE=contain",
                 "CONTACT_REWARD_RUB=1500",
                 "PROMO_CONTACT_CODE=EXTRA500",
                 "LEADS_SHEET_NAME=LeadsSheet",
@@ -71,6 +72,7 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.collage.divider_width == 6
     assert config.collage.divider_color == "#123456"
     assert config.collage.jpeg_quality == 82
+    assert config.collage.scale_mode == "contain"
     assert config.contact_reward_rub == 1500
     assert config.promo_contact_code == "EXTRA500"
     assert config.leads_sheet_name == "LeadsSheet"
