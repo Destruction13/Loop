@@ -339,9 +339,16 @@ class StubCollageBuilder:
             raise CollageSourceUnavailable("sources unavailable")
         if self.fail_processing:
             raise CollageProcessingError("processing error")
-        image = Image.new("RGB", (cfg.width, cfg.height), color="white")
+        width = cfg.slot_width * 2 + cfg.separator_width + cfg.padding * 2
+        height = cfg.slot_height + cfg.padding * 2
+        fmt = (cfg.output_format or "PNG").upper()
+        mode = "RGB" if fmt == "JPEG" else "RGBA"
+        image = Image.new(mode, (width, height), color=(255, 255, 255, 255))
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG")
+        save_kwargs: dict[str, object] = {"format": fmt}
+        if fmt == "JPEG":
+            save_kwargs["quality"] = cfg.jpeg_quality
+        image.save(buffer, **save_kwargs)
         buffer.seek(0)
         return buffer
 
@@ -361,15 +368,14 @@ def build_router(
     leads_exporter = StubLeadsExporter()
     contact_exporter = StubContactExporter()
     collage_config = CollageConfig(
-        width=1600,
-        height=800,
-        columns=2,
-        margin=30,
-        divider_width=6,
-        divider_color="#E6E9EF",
+        slot_width=1080,
+        slot_height=1440,
+        separator_width=24,
+        padding=48,
+        separator_color="#E6E9EF",
         background="#FFFFFF",
+        output_format="PNG",
         jpeg_quality=90,
-        scale_mode="cover",
     )
 
     from app import fsm as fsm_module
