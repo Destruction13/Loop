@@ -571,6 +571,36 @@ def test_searching_message_deleted_after_models_sent(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_small_catalog_keeps_showing_models(tmp_path: Path) -> None:
+    model = GlassModel(
+        unique_id="only-one",
+        title="Solo",
+        model_code="S1",
+        site_url="https://example.com/solo",
+        img_user_url="https://example.com/solo.jpg",
+        img_nano_url="https://example.com/solo-nano.jpg",
+        gender="male",
+    )
+
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path, models=[model])
+        handler = get_message_handler(router, "accept_photo")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=4242, bot=bot)
+        message.photo = [PhotoStub("photo")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler(message, state)
+
+        assert message.answer_photos, "Expected at least one recommendation photo"
+        texts = [text for text, _ in message.answers]
+        assert msg.marketing_text("all_seen") not in texts
+
+    asyncio.run(scenario())
+
+
 def test_exhausted_message_flow(tmp_path: Path) -> None:
     async def scenario() -> None:
         router, _, _, _, recommender = build_router(tmp_path)

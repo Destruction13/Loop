@@ -507,9 +507,7 @@ def _pick_unisex_batch(
     rng: random.Random, pool: list[GlassModel], batch_size: int
 ) -> tuple[list[GlassModel], bool]:
     selection = _sample(rng, pool, min(batch_size, len(pool)))
-    used_ids = {model.unique_id for model in selection}
-    remaining = [model for model in pool if model.unique_id not in used_ids]
-    exhausted = len(remaining) < batch_size
+    exhausted = len(selection) == 0
     return selection, exhausted
 
 
@@ -589,9 +587,7 @@ def _pick_gender_batch(
             picks.extend(gender_selection)
             used_ids.update(model.unique_id for model in gender_selection)
 
-    remaining_gender = [model for model in gender_pool if model.unique_id not in used_ids]
-    remaining_unisex = [model for model in unisex_pool if model.unique_id not in used_ids]
-    exhausted = (len(remaining_gender) + len(remaining_unisex)) < batch_size
+    exhausted = len(picks) == 0
     return picks, exhausted
 
 
