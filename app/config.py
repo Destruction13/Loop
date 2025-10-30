@@ -12,6 +12,36 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
+import re
+from urllib.parse import urlparse, parse_qs
+
+def _extract_sheet_id_and_gid(url_or_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Принимает либо чистый ID (1VlHdgf...FtY), либо любой Google Sheets URL.
+    Возвращает (sheet_id, gid) или (None, None), если ничего не нашли.
+    Поддерживает обычные edit-URL с /spreadsheets/d/<id>/ и вытаскивает ?gid=...
+    Для опубликованных CSV ссылок /e/2PACX... извлечь sheet_id нельзя — вернёт None.
+    """
+    if not url_or_id:
+        return None, None
+    s = url_or_id.strip().strip('"').strip("'")
+    # Если это уже похоже на голый ID (нет слешей и вопросиков) — вернём как есть
+    if "/" not in s and "?" not in s:
+        return s, None
+
+    try:
+        u = urlparse(s)
+        # /spreadsheets/d/<id>...
+        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", u.path)
+        sheet_id = m.group(1) if m else None
+        # ?gid=123456
+        q = parse_qs(u.query)
+        gid = (q.get("gid") or [None])[0]
+        return sheet_id, gid
+    except Exception:
+        return None, None
+
+
 DEFAULT_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/e/2PACX-1vRT2CXRcmWxmWHKADYfHTadlxBUZ-"
     "R7nEX7HcAqrBo_PzSKYrCln4HFeCUJTB2q_C7asfwO7AOLNiwh/pub?output=csv"
@@ -142,12 +172,13 @@ def load_config(env_file: str | None = None) -> Config:
 
     batch_size = max(_as_int(_get("BATCH_SIZE", "2"), 2), 1)
     batch_columns = max(_as_int(_get("BATCH_LAYOUT_COLS", "2"), 2), 1)
-    google_sheet_url = _get("GOOGLE_SHEET_URL")
     catalog_csv_url = (
         _get("CATALOG_CSV_URL")
         or _get("SHEET_CSV_URL")
-        or google_sheet_url
-    )
+        or google_sheet_url)
+
+    google_sheet_url = _get("GOOGLE_SHEET_URL")
+
     catalog_sheet_id = (
         _get("CATALOG_SHEET_ID")
         or _get("GOOGLE_SHEET_ID")
@@ -158,6 +189,16 @@ def load_config(env_file: str | None = None) -> Config:
         or _get("SHEET_GID")
         or _get("GOOGLE_SHEET_GID")
     )
+
+    # Если ID не задан, но есть ссылка — попробуем вытащить из URL
+    if not catalog_sheet_id and google_sheet_url:
+        sid_from_url, gid_from_url = _extract_sheet_id_and_gid(google_sheet_url)
+        if sid_from_url:
+            catalog_sheet_id = sid_from_url
+            logger.info("Derived GOOGLE_SHEET_ID from GOOGLE_SHEET_URL: %s", catalog_sheet_id)
+        if gid_from_url and not catalog_sheet_gid:
+            catalog_sheet_gid = gid_from_url
+
     row_limit_raw = _get("CATALOG_ROW_LIMIT")
     row_limit: int | None = None
     if row_limit_raw:
