@@ -64,7 +64,9 @@ async def main() -> None:
     await repository.init()
 
     catalog_config = GoogleCatalogConfig(
-        csv_url=str(config.sheet_csv_url),
+        csv_url=config.sheet_csv_url,
+        sheet_id=config.catalog_sheet_id,
+        sheet_gid=config.catalog_sheet_gid,
         cache_ttl_seconds=config.csv_fetch_ttl_sec,
         retries=config.csv_fetch_retries,
         parse_row_limit=config.catalog_row_limit,

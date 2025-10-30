@@ -10,7 +10,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import Iterable, List
+from typing import Iterable
 from urllib.parse import parse_qs, urlparse, urlsplit
 
 import httpx
@@ -80,7 +80,9 @@ REQUIRED_HEADERS = frozenset(
 class GoogleCatalogConfig:
     """Configuration for the Google Sheets catalog."""
 
-    csv_url: str
+    csv_url: str | None = None
+    sheet_id: str | None = None
+    sheet_gid: str | None = None
     cache_ttl_seconds: int = 60
     retries: int = 3
     backoff_base: float = 0.5
@@ -203,10 +205,15 @@ class GoogleSheetCatalog(CatalogService):
             return CatalogSnapshot(models=list(models), version_hash=version_hash)
 
     async def _fetch_csv(self) -> str:
-        urls: List[str] = [self._config.csv_url]
-        fallback_urls = _build_fallback_urls(self._config.csv_url)
-        if fallback_urls:
-            urls.extend(fallback_urls)
+        urls, source = _resolve_fetch_plan(self._config)
+        LOGGER.info("Catalog: source=%s", source)
+        if source == "direct-url":
+            LOGGER.info("Catalog: using direct csv url from env")
+        elif source == "doc-id":
+            LOGGER.info("Catalog: using doc-id derived csv urls")
+        else:
+            LOGGER.info("Catalog: using configured catalog url")
+        LOGGER.debug("Catalog: url candidates=%s", ", ".join(urls))
 
         last_error: Exception | None = None
         for index, url in enumerate(urls):
@@ -230,6 +237,12 @@ class GoogleSheetCatalog(CatalogService):
         last_error: Exception | None = None
         for attempt in range(1, self._config.retries + 1):
             try:
+                LOGGER.info(
+                    "Catalog fetch attempt %s/%s url=%s",
+                    attempt,
+                    self._config.retries,
+                    url,
+                )
                 response = await self._client.get(url)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = exc
@@ -246,6 +259,7 @@ class GoogleSheetCatalog(CatalogService):
                 break
 
             status = response.status_code
+            LOGGER.info("Catalog fetch status=%s url=%s", status, response.url)
             if 200 <= status < 300:
                 self._log_redirect_chain(url, response)
                 text = response.text
@@ -586,7 +600,7 @@ def _looks_like_html(payload: str) -> bool:
     return "<html" in sample or "<!doctype" in sample
 
 
-def _build_fallback_urls(original_url: str) -> list[str]:
+def _build_fallback_urls(original_url: str, *, default_gid: str | None = None) -> list[str]:
     parsed = urlparse(original_url)
     if parsed.netloc != "docs.google.com":
         return []
@@ -605,11 +619,43 @@ def _build_fallback_urls(original_url: str) -> list[str]:
     if not sheet_id:
         return []
     query = parse_qs(parsed.query)
-    gid = query.get("gid", ["0"])[0]
+    gid = query.get("gid", [default_gid or "0"])[0]
+    return _build_urls_from_sheet_id(sheet_id, gid)
+
+
+def _build_urls_from_sheet_id(sheet_id: str, gid: str) -> list[str]:
     base = "https://docs.google.com/spreadsheets/d"
     gviz = f"{base}/{sheet_id}/gviz/tq?tqx=out:csv&gid={gid}"
     export = f"{base}/{sheet_id}/export?format=csv&gid={gid}"
     return [gviz, export]
+
+
+def _resolve_fetch_plan(config: GoogleCatalogConfig) -> tuple[list[str], str]:
+    csv_url = (config.csv_url or "").strip()
+    sheet_id = (config.sheet_id or "").strip()
+    gid = (config.sheet_gid or "").strip() or "0"
+
+    if csv_url:
+        if _is_direct_csv_url(csv_url):
+            return [csv_url], "direct-url"
+        fallback_urls = _build_fallback_urls(csv_url, default_gid=gid)
+        if fallback_urls:
+            return fallback_urls, "doc-id"
+        return [csv_url], "configured-url"
+
+    if sheet_id:
+        return _build_urls_from_sheet_id(sheet_id, gid), "doc-id"
+
+    raise CatalogError("Catalog CSV source is not configured")
+
+
+def _is_direct_csv_url(url: str) -> bool:
+    lowered = url.lower()
+    return (
+        "output=csv" in lowered
+        or "tqx=out:csv" in lowered
+        or "format=csv" in lowered
+    )
 
 
 def _clean_drive_url(value: str | None) -> str:

@@ -243,3 +243,84 @@ def test_catalog_respects_row_limit() -> None:
             await catalog.aclose()
 
     asyncio.run(_run())
+
+
+def test_direct_csv_url_used_without_fallback() -> None:
+    csv_text = (
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Alpha,A1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
+    )
+    direct_url = (
+        "https://docs.google.com/spreadsheets/d/e/ABC123/pub"
+        "?gid=0&single=true&output=csv"
+    )
+
+    async def _run() -> None:
+        requested: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append(str(request.url))
+            assert "output=csv" in str(request.url)
+            return httpx.Response(200, text=csv_text)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            catalog = GoogleSheetCatalog(
+                GoogleCatalogConfig(
+                    csv_url=direct_url,
+                    cache_ttl_seconds=60,
+                    retries=1,
+                ),
+                client=client,
+            )
+            models = await catalog.list_by_gender("male")
+            assert models
+            assert len(requested) == 1
+            assert direct_url in requested[0]
+            await catalog.aclose()
+
+    asyncio.run(_run())
+
+
+def test_sheet_id_fallback_respects_gid() -> None:
+    csv_text = (
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Alpha,A1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
+    )
+
+    requested: list[str] = []
+
+    async def _run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append(str(request.url))
+            if request.url.path.endswith("/gviz/tq"):
+                return httpx.Response(404, text="not found")
+            return httpx.Response(200, text=csv_text)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            catalog = GoogleSheetCatalog(
+                GoogleCatalogConfig(
+                    csv_url=None,
+                    sheet_id="SPREADSHEET123",
+                    sheet_gid="42",
+                    cache_ttl_seconds=60,
+                    retries=1,
+                ),
+                client=client,
+            )
+            models = await catalog.list_by_gender("male")
+            assert models
+            await catalog.aclose()
+
+        assert requested[0].startswith(
+            "https://docs.google.com/spreadsheets/d/SPREADSHEET123/gviz/tq"
+        )
+        assert "gid=42" in requested[0]
+        assert requested[1].startswith(
+            "https://docs.google.com/spreadsheets/d/SPREADSHEET123/export"
+        )
+        assert "format=csv" in requested[1]
+        assert "gid=42" in requested[1]
+
+    asyncio.run(_run())

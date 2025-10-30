@@ -45,7 +45,9 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     config = load_config(str(env_file))
 
     assert config.bot_token == "token123"
-    assert config.sheet_csv_url == "https://example.com/sheets/edit"
+    assert config.sheet_csv_url == "https://example.com/catalog.csv"
+    assert config.catalog_sheet_id is None
+    assert config.catalog_sheet_gid is None
     assert config.site_url == "https://landing.example.com"
     assert config.privacy_policy_url == "https://telegra.ph/loov-policy"
     assert config.promo_code == "SPECIAL"
