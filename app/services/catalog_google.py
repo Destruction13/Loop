@@ -35,6 +35,7 @@ class GoogleCatalogConfig:
     cache_ttl_seconds: int = 60
     retries: int = 3
     backoff_base: float = 0.5
+    parse_row_limit: int | None = None
 
 
 class NotCSVError(CatalogError):
@@ -249,6 +250,7 @@ class GoogleSheetCatalog(CatalogService):
         skipped_empty = 0
         skipped_folder = 0
         skipped_invalid = 0
+        limit = self._config.parse_row_limit
         for row_index, row in enumerate(reader, start=2):
             total_rows += 1
             normalized_row = {_normalize_header(key): (value or "").strip() for key, value in row.items()}
@@ -291,6 +293,13 @@ class GoogleSheetCatalog(CatalogService):
                 gender=gender,
             )
             models.append(model)
+            if limit and len(models) >= limit:
+                LOGGER.info(
+                    "Catalog CSV row limit %s reached at data row %s, stopping parse",
+                    limit,
+                    row_index,
+                )
+                break
 
         LOGGER.info(
             "Catalog CSV parsed: total_rows=%s valid_rows=%s skipped_empty=%s skipped_folder=%s skipped_invalid=%s",

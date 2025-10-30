@@ -67,6 +67,7 @@ async def main() -> None:
         csv_url=str(config.sheet_csv_url),
         cache_ttl_seconds=config.csv_fetch_ttl_sec,
         retries=config.csv_fetch_retries,
+        parse_row_limit=config.catalog_row_limit,
     )
     catalog_service = GoogleSheetCatalog(catalog_config)
 

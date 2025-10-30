@@ -52,6 +52,7 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.reminder_hours == 12
     assert config.csv_fetch_ttl_sec == 120
     assert config.csv_fetch_retries == 4
+    assert config.catalog_row_limit is None
     assert config.uploads_root == Path("./var/uploads")
     assert config.results_root == Path("./var/results")
     assert config.button_title_max == 42

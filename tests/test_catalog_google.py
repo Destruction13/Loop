@@ -214,3 +214,33 @@ def test_catalog_logs_summary(caplog: pytest.LogCaptureFixture) -> None:
     assert "skipped_empty=1" in message
     assert "skipped_folder=1" in message
     assert "skipped_invalid=1" in message
+
+
+def test_catalog_respects_row_limit() -> None:
+    csv_text = (
+        "Название,Ссылка на сайт,Ссылка на изображение для пользователя\n"
+        "Alpha,https://example.com/a,https://drive.google.com/file/d/AAA/view\n"
+        "Bravo,https://example.com/b,https://drive.google.com/file/d/BBB/view\n"
+        "Charlie,https://example.com/c,https://drive.google.com/file/d/CCC/view\n"
+    )
+
+    async def _run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=csv_text)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            catalog = GoogleSheetCatalog(
+                GoogleCatalogConfig(
+                    csv_url="https://example.com/limit",
+                    cache_ttl_seconds=60,
+                    retries=3,
+                    parse_row_limit=1,
+                ),
+                client=client,
+            )
+            models = await catalog.list_by_gender("male")
+            assert [model.title for model in models] == ["Alpha"]
+            await catalog.aclose()
+
+    asyncio.run(_run())
