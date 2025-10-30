@@ -25,13 +25,14 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 "BATCH_SIZE=5",
                 "BATCH_LAYOUT_COLS=3",
                 "PICK_SCHEME=GENDER_OR_GENDER_UNISEX",
-                "CANVAS_WIDTH=1500",
-                "CANVAS_HEIGHT=500",
-                "CANVAS_BG=#EFEFEF",
-                "TILE_MARGIN=40",
-                "DIVIDER_WIDTH=6",
-                "DIVIDER_COLOR=#123456",
-                "JPEG_QUALITY=82",
+                "COLLAGE_SLOT_WIDTH=1100",
+                "COLLAGE_SLOT_HEIGHT=1500",
+                "COLLAGE_SEPARATOR_WIDTH=12",
+                "COLLAGE_PADDING=60",
+                "COLLAGE_BACKGROUND=#EFEFEF",
+                "COLLAGE_SEPARATOR_COLOR=#123456",
+                "COLLAGE_FORMAT=jpeg",
+                "COLLAGE_JPEG_QUALITY=82",
                 "CONTACT_REWARD_RUB=1500",
                 "PROMO_CONTACT_CODE=EXTRA500",
                 "LEADS_SHEET_NAME=LeadsSheet",
@@ -63,13 +64,13 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.batch_size == 5
     assert config.batch_layout_cols == 3
     assert config.pick_scheme == "GENDER_OR_GENDER_UNISEX"
-    assert config.collage.width == 1500
-    assert config.collage.height == 500
-    assert config.collage.columns == 3
-    assert config.collage.margin == 40
+    assert config.collage.slot_width == 1100
+    assert config.collage.slot_height == 1500
+    assert config.collage.separator_width == 12
+    assert config.collage.padding == 60
     assert config.collage.background == "#EFEFEF"
-    assert config.collage.divider_width == 6
-    assert config.collage.divider_color == "#123456"
+    assert config.collage.separator_color == "#123456"
+    assert config.collage.output_format == "JPEG"
     assert config.collage.jpeg_quality == 82
     assert config.contact_reward_rub == 1500
     assert config.promo_contact_code == "EXTRA500"

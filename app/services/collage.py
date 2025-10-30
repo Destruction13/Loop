@@ -38,9 +38,9 @@ async def build_three_tile_collage(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> io.BytesIO:
-    """Build a 1×N collage (default 1×3) with vertical dividers between tiles."""
+    """Build a dual-portrait collage with optional padding and separator."""
 
-    columns = max(cfg.columns, 1)
+    columns = 2
     padded_sources = list(image_urls[:columns])
     if len(padded_sources) < columns:
         padded_sources.extend([None] * (columns - len(padded_sources)))
@@ -52,21 +52,22 @@ async def build_three_tile_collage(
         timeout = httpx.Timeout(10.0, connect=10.0, read=10.0)
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
 
+    downloaded: list[_CollageSource] | None = None
     try:
         downloaded = await _download_sources(client, padded_sources)
+        if not any(source.data for source in downloaded):
+            raise CollageSourceUnavailable("Failed to download collage images")
+        return await asyncio.to_thread(_compose_collage, downloaded, cfg)
+    except CollageSourceUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception(
+            "Collage pipeline failed", extra={"collage_sources": padded_sources}
+        )
+        raise CollageProcessingError(str(exc)) from exc
     finally:
         if owns_client:
             await client.aclose()
-
-    if not any(source.data for source in downloaded):
-        raise CollageSourceUnavailable("Failed to download collage images")
-
-    try:
-        buffer = await asyncio.to_thread(_compose_collage, downloaded, cfg)
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Failed to compose collage: %s", exc)
-        raise CollageProcessingError(str(exc)) from exc
-    return buffer
 
 
 async def _download_sources(
@@ -104,90 +105,139 @@ async def _download_sources(
 
 
 def _compose_collage(sources: Iterable[_CollageSource], cfg: CollageConfig) -> io.BytesIO:
-    background = ImageColor.getrgb(cfg.background)
-    divider_color = ImageColor.getrgb(cfg.divider_color)
-    width = max(cfg.width, 1)
-    height = max(cfg.height, 1)
-    margin = max(cfg.margin, 0)
-    columns = max(cfg.columns, 1)
-    divider_width = max(cfg.divider_width, 0)
+    slot_width = max(cfg.slot_width, 1)
+    slot_height = max(cfg.slot_height, 1)
+    separator_width = max(cfg.separator_width, 0)
+    padding = max(cfg.padding, 0)
 
-    usable_width = max(width - 2 * margin - divider_width * (columns - 1), 1)
-    tile_height = max(height - 2 * margin, 1)
-    tile_width_float = usable_width / columns
+    canvas_width = slot_width * 2 + separator_width + padding * 2
+    canvas_height = slot_height + padding * 2
 
-    canvas = Image.new("RGB", (width, height), color=background)
+    fmt = (cfg.output_format or "PNG").upper()
+    raw_background = (cfg.background or "").strip()
+    background_is_transparent = (
+        fmt == "PNG" and (not raw_background or raw_background.lower() == "transparent")
+    )
+
+    if background_is_transparent:
+        canvas_mode = "RGBA"
+        background_color = (0, 0, 0, 0)
+    else:
+        canvas_mode = "RGB"
+        background_color = _parse_color(
+            raw_background or None,
+            mode="RGB",
+            fallback=(255, 255, 255),
+        )
+
+    canvas = Image.new(canvas_mode, (canvas_width, canvas_height), color=background_color)
     draw = ImageDraw.Draw(canvas)
 
-    tile_boxes: list[tuple[int, int, int, int]] = []
-    current_left = margin
-    for index in range(columns):
-        left = int(round(current_left))
-        if index == columns - 1:
-            right = width - margin
-        else:
-            right = int(round(current_left + tile_width_float))
-        if right <= left:
-            right = left + 1
-        tile_boxes.append((left, margin, right, margin + tile_height))
-        current_left = right + divider_width
+    separator_color = _parse_color(
+        cfg.separator_color,
+        mode="RGBA" if canvas_mode == "RGBA" else "RGB",
+        fallback=(42, 42, 42, 255) if canvas_mode == "RGBA" else (42, 42, 42),
+    )
 
+    tile_boxes = [
+        (padding, padding, padding + slot_width, padding + slot_height),
+        (
+            padding + slot_width + separator_width,
+            padding,
+            padding + slot_width * 2 + separator_width,
+            padding + slot_height,
+        ),
+    ]
+
+    if separator_width > 0:
+        separator_left = padding + slot_width
+        separator_box = (
+            separator_left,
+            padding,
+            separator_left + separator_width,
+            padding + slot_height,
+        )
+        draw.rectangle(separator_box, fill=separator_color)
+
+    target_size = (slot_width, slot_height)
     for index, source in enumerate(sources):
         if index >= len(tile_boxes):
             break
-        image = _load_source_image(source, tile_boxes[index], background)
+        image = _open_source_image(source)
         if image is None:
             continue
-        tile_left, tile_top, tile_right, tile_bottom = tile_boxes[index]
-        cell_width = tile_right - tile_left
-        cell_height = tile_bottom - tile_top
-        pos_x = tile_left + max((cell_width - image.width) // 2, 0)
-        pos_y = tile_top + max((cell_height - image.height) // 2, 0)
-        canvas.paste(image, (pos_x, pos_y))
-        image.close()
+        try:
+            fitted = ImageOps.fit(
+                image,
+                target_size,
+                method=Image.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            if fitted.size != target_size:
+                fitted = fitted.resize(target_size, Image.LANCZOS)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to fit collage image %s: %s", source.url, exc)
+            image.close()
+            continue
 
-    if divider_width > 0:
-        for index in range(1, columns):
-            divider_left = tile_boxes[index - 1][2]
-            divider_right = divider_left + divider_width
-            divider_box = (divider_left, margin, divider_right, margin + tile_height)
-            draw.rectangle(divider_box, fill=divider_color)
+        paste_left, paste_top, _, _ = tile_boxes[index]
+        paste_position = (paste_left, paste_top)
+        mask = fitted if fitted.mode in {"LA", "RGBA", "PA"} else None
+        try:
+            canvas.paste(fitted, paste_position, mask)
+        finally:
+            fitted.close()
+            image.close()
 
     buffer = io.BytesIO()
-    canvas.save(
-        buffer,
-        format="JPEG",
-        quality=max(min(cfg.jpeg_quality, 100), 1),
-        optimize=True,
-        progressive=True,
-    )
+    fmt = (cfg.output_format or "PNG").upper()
+    save_kwargs: dict[str, object] = {"format": fmt}
+    image_to_save = canvas
+    if fmt == "JPEG":
+        quality = max(min(cfg.jpeg_quality, 100), 1)
+        save_kwargs.update({"quality": quality, "optimize": True, "progressive": True})
+        image_to_save = canvas.convert("RGB")
+
+    try:
+        image_to_save.save(buffer, **save_kwargs)
+    finally:
+        if image_to_save is not canvas:
+            image_to_save.close()
+        canvas.close()
+
     buffer.seek(0)
-    canvas.close()
     return buffer
 
 
-def _load_source_image(
-    source: _CollageSource,
-    cell_box: tuple[int, int, int, int],
-    background: tuple[int, int, int],
-) -> Image.Image | None:
+def _open_source_image(source: _CollageSource) -> Image.Image | None:
     if source.data is None:
         return None
 
-    cell_width = max(cell_box[2] - cell_box[0], 1)
-    cell_height = max(cell_box[3] - cell_box[1], 1)
-
     try:
         with Image.open(io.BytesIO(source.data)) as original:
-            converted = original.convert("RGB")
-            fitted = ImageOps.contain(
-                converted, (cell_width, cell_height), method=Image.LANCZOS
-            )
-            if fitted is not converted:
-                converted.close()
-            return fitted
+            return original.convert("RGBA")
     except UnidentifiedImageError:
         LOGGER.warning("Collage image %s is not a valid image", source.url)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Failed to prepare collage image %s: %s", source.url, exc)
     return None
+
+
+def _parse_color(
+    value: str | None,
+    *,
+    mode: str,
+    fallback: tuple[int, ...],
+) -> tuple[int, ...]:
+    if value:
+        normalized = value.strip()
+        if normalized:
+            if normalized.lower() == "transparent" and mode == "RGBA":
+                return (0, 0, 0, 0)
+            try:
+                return ImageColor.getcolor(normalized, mode)
+            except ValueError:
+                LOGGER.warning(
+                    "Unsupported color value %s, falling back to default", value
+                )
+    return fallback

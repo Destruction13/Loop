@@ -19,16 +19,28 @@ DEFAULT_PRIVACY_POLICY_URL = "https://telegra.ph/Politika-konfidencialnosti-LOOV
 
 @dataclass(slots=True)
 class CollageConfig:
-    """Rendering options for horizontal collages."""
+    """Rendering options for dual-portrait collages."""
 
-    width: int
-    height: int
-    columns: int
-    margin: int
-    divider_width: int
-    divider_color: str
+    slot_width: int
+    slot_height: int
+    separator_width: int
+    padding: int
+    separator_color: str
     background: str
+    output_format: str
     jpeg_quality: int
+
+    @property
+    def width(self) -> int:
+        """Total collage width including padding and separator."""
+
+        return self.slot_width * 2 + self.separator_width + self.padding * 2
+
+    @property
+    def height(self) -> int:
+        """Total collage height including padding."""
+
+        return self.slot_height + self.padding * 2
 
 
 @dataclass(slots=True)
@@ -137,14 +149,14 @@ def load_config(env_file: str | None = None) -> Config:
             row_limit = parsed_limit
 
     collage = CollageConfig(
-        width=_as_int(_get("CANVAS_WIDTH", "1600"), 1600),
-        height=_as_int(_get("CANVAS_HEIGHT", "800"), 800),
-        columns=batch_columns,
-        margin=_as_int(_get("TILE_MARGIN", "30"), 30),
-        divider_width=_as_int(_get("DIVIDER_WIDTH", "6"), 6),
-        divider_color=_get("DIVIDER_COLOR", "#E5E5E5") or "#E5E5E5",
-        background=_get("CANVAS_BG", "#FFFFFF") or "#FFFFFF",
-        jpeg_quality=_as_int(_get("JPEG_QUALITY", "88"), 88),
+        slot_width=max(_as_int(_get("COLLAGE_SLOT_WIDTH", "1080"), 1080), 1),
+        slot_height=max(_as_int(_get("COLLAGE_SLOT_HEIGHT", "1440"), 1440), 1),
+        separator_width=max(_as_int(_get("COLLAGE_SEPARATOR_WIDTH", "24"), 24), 0),
+        padding=max(_as_int(_get("COLLAGE_PADDING", "0"), 0), 0),
+        separator_color=_get("COLLAGE_SEPARATOR_COLOR", "#2A2A2A") or "#2A2A2A",
+        background=_get("COLLAGE_BACKGROUND", "#000000") or "#000000",
+        output_format=(_get("COLLAGE_FORMAT", "PNG") or "PNG").upper(),
+        jpeg_quality=_as_int(_get("COLLAGE_JPEG_QUALITY", "90"), 90),
     )
 
     promo_code = _get("PROMO_CODE", "DEMO 10") or "DEMO 10"

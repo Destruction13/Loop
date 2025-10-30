@@ -752,6 +752,7 @@ def setup_router(
                 "Collage processing failed for models %s: %s",
                 [model.unique_id for model in group],
                 exc,
+                extra={"collage_fallback_used": True},
             )
             await _send_batch_as_photos(
                 message,
@@ -765,6 +766,8 @@ def setup_router(
                 "Unexpected collage error for models %s: %s",
                 [model.unique_id for model in group],
                 exc,
+                exc_info=True,
+                extra={"collage_fallback_used": True},
             )
             await _send_batch_as_photos(
                 message,
@@ -777,14 +780,29 @@ def setup_router(
         filename = f"collage-{uuid.uuid4().hex}.jpg"
         collage_bytes = buffer.getvalue()
         buffer.close()
-        await _send_delivery_message(
-            message,
-            state,
-            message.answer_photo,
-            photo=BufferedInputFile(collage_bytes, filename=filename),
-            caption=None,
-            reply_markup=keyboard,
-        )
+        try:
+            await _send_delivery_message(
+                message,
+                state,
+                message.answer_photo,
+                photo=BufferedInputFile(collage_bytes, filename=filename),
+                caption=None,
+                reply_markup=keyboard,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Failed to send collage message for models %s: %s",
+                [model.unique_id for model in group],
+                exc,
+                extra={"collage_fallback_used": True},
+            )
+            await _send_batch_as_photos(
+                message,
+                state,
+                group,
+                reply_markup=keyboard,
+            )
+            return
         logger.info(
             "%s Collage %sx%s sent for models %s",
             EVENT_ID["MODELS_SENT"],
@@ -804,11 +822,19 @@ def setup_router(
         for index, item in enumerate(group):
             caption = None
             markup = reply_markup if index == last_index else None
-            await message.answer_photo(
-                photo=URLInputFile(item.img_user_url),
-                caption=caption,
-                reply_markup=markup,
-            )
+            try:
+                await message.answer_photo(
+                    photo=URLInputFile(item.img_user_url),
+                    caption=caption,
+                    reply_markup=markup,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Failed to send fallback photo for model %s: %s",
+                    item.unique_id,
+                    exc,
+                    extra={"collage_fallback_used": True},
+                )
 
     async def _delete_state_message(message: Message, state: FSMContext, key: str) -> None:
         data = await state.get_data()
