@@ -229,14 +229,16 @@ def idle_reminder_keyboard(site_url: str) -> InlineKeyboardMarkup:
 
 
 def social_ad_keyboard(
-    instagram_url: str, tiktok_url: str
+    social_links: Sequence[tuple[str, str]]
 ) -> InlineKeyboardMarkup:
     """Keyboard shown in social media advertisement messages."""
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=msg.SOCIAL_AD_BTN_INST, url=instagram_url)],
-            [InlineKeyboardButton(text=msg.SOCIAL_AD_BTN_TIKTOK, url=tiktok_url)],
+            [InlineKeyboardButton(text=title, url=url)]
+            for title, url in social_links
+        ]
+        + [
             [
                 InlineKeyboardButton(
                     text=msg.SOCIAL_AD_BTN_TRY,

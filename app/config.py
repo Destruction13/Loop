@@ -65,8 +65,10 @@ class Config:
     enable_idle_reminder: bool
     social_ad_minutes: int
     enable_social_ad: bool
-    social_instagram_url: str
-    social_tiktok_url: str
+    social_instagram_main_url: str
+    social_instagram_raw_url: str
+    social_instagram_meta_url: str
+    social_instagram_core_url: str
     contacts_sheet_url: Optional[str]
     google_service_account_json: Optional[Path]
 
@@ -218,10 +220,30 @@ def load_config(env_file: str | None = None) -> Config:
         enable_idle_reminder=_as_bool(_get("ENABLE_IDLE_REMINDER", "1"), True),
         social_ad_minutes=_as_int(_get("SOCIAL_AD_MINUTES", "20"), 20),
         enable_social_ad=_as_bool(_get("ENABLE_SOCIAL_AD", "1"), True),
-        social_instagram_url=_get("SOCIAL_INSTAGRAM_URL", "https://instagram.com/loov")
-        or "https://instagram.com/loov",
-        social_tiktok_url=_get("SOCIAL_TIKTOK_URL", "https://tiktok.com/@loov")
-        or "https://tiktok.com/@loov",
+        social_instagram_main_url=
+        _get(
+            "SOCIAL_INSTAGRAM_MAIN_URL",
+            "https://www.instagram.com/loov.ru?igsh=bGZreDRlNXk1cHNn&utm_source=qr",
+        )
+        or "https://www.instagram.com/loov.ru?igsh=bGZreDRlNXk1cHNn&utm_source=qr",
+        social_instagram_raw_url=
+        _get(
+            "SOCIAL_INSTAGRAM_RAW_URL",
+            "https://www.instagram.com/loov.raw?igsh=bmtrYWl3OW5heWh2&utm_source=qr",
+        )
+        or "https://www.instagram.com/loov.raw?igsh=bmtrYWl3OW5heWh2&utm_source=qr",
+        social_instagram_meta_url=
+        _get(
+            "SOCIAL_INSTAGRAM_META_URL",
+            "https://www.instagram.com/loov.meta?igsh=cmZ0Z2M0dzB3cHUx&utm_source=qr",
+        )
+        or "https://www.instagram.com/loov.meta?igsh=cmZ0Z2M0dzB3cHUx&utm_source=qr",
+        social_instagram_core_url=
+        _get(
+            "SOCIAL_INSTAGRAM_CORE_URL",
+            "https://www.instagram.com/loov.core?igsh=MWRhMmppdjdzYnYxeg%3D%3D&utm_source=qr",
+        )
+        or "https://www.instagram.com/loov.core?igsh=MWRhMmppdjdzYnYxeg%3D%3D&utm_source=qr",
         contacts_sheet_url=contacts_sheet_url,
         google_service_account_json=google_credentials_path,
     )

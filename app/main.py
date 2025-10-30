@@ -131,8 +131,12 @@ async def main() -> None:
         social_ad = SocialAdService(
             bot=bot,
             repository=repository,
-            instagram_url=str(config.social_instagram_url),
-            tiktok_url=str(config.social_tiktok_url),
+            social_links=(
+                (msg.SOCIAL_AD_BTN_MAIN, str(config.social_instagram_main_url)),
+                (msg.SOCIAL_AD_BTN_RAW, str(config.social_instagram_raw_url)),
+                (msg.SOCIAL_AD_BTN_META, str(config.social_instagram_meta_url)),
+                (msg.SOCIAL_AD_BTN_CORE, str(config.social_instagram_core_url)),
+            ),
             timeout_minutes=config.social_ad_minutes,
             interval_seconds=30,
         )
