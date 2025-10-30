@@ -47,12 +47,11 @@ def test_drive_view_to_direct_invalid_url() -> None:
 
 def test_catalog_parses_and_filters_by_gender() -> None:
     csv_text = (
-        "Название,Модель,Ссылка на сайт,Пол,Ссылка на изображение для пользователя,"
-        "Ссылка на изображение для NanoBanana,Уникальный ID\n"
-        "Alpha,A1,https://example.com/a,Мужской,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
-        "Bravo,B1,https://example.com/b,Жен.,https://drive.google.com/file/d/BBB/view,,\n"
-        "Charlie,C1,https://example.com/c,уни,https://drive.google.com/file/d/CCC/view,https://nano/c,\n"
-        ",,https://example.com/d,Мужской,https://drive.google.com/file/d/DDD/view,,\n"
+        "Наименование,Модель,Ссылка,Sex,User Image,NanoBanana,Уникальный ID,Фото\n"
+        "Alpha,A1,https://example.com/a,Мужской,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha,https://example.com/a.jpg\n"
+        "Bravo,B1,https://example.com/b,Female,https://drive.google.com/file/d/BBB/view,https://nano/b,id-bravo,https://example.com/b.jpg\n"
+        "Charlie,C1,https://example.com/c,U,https://drive.google.com/file/d/CCC/view,https://nano/c,id-charlie,https://example.com/c.jpg\n"
+        ",,,male,https://drive.google.com/file/d/DDD/view,https://nano/d,id-missing,\n"
     )
 
     async def _run() -> None:
@@ -68,7 +67,7 @@ def test_catalog_parses_and_filters_by_gender() -> None:
             male_models = await catalog.list_by_gender("male")
             assert [model.title for model in male_models] == ["Alpha", "Charlie"]
             assert male_models[0].img_user_url.endswith("id=AAA")
-            assert male_models[1].gender == "Унисекс"
+            assert male_models[1].gender == "unisex"
             female_models = await catalog.list_by_gender("female")
             assert [model.title for model in female_models] == ["Bravo", "Charlie"]
             batch = await catalog.pick_batch(
@@ -85,8 +84,8 @@ def test_catalog_parses_and_filters_by_gender() -> None:
 
 def test_retry_policy_handles_redirect_and_server_errors() -> None:
     csv_text = (
-        "Название,Ссылка на сайт,Ссылка на изображение для пользователя\n"
-        "Alpha,https://example.com/a,https://drive.google.com/file/d/AAA/view\n"
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Alpha,A1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
     )
 
     async def _run() -> None:
@@ -124,8 +123,8 @@ def test_retry_policy_handles_redirect_and_server_errors() -> None:
 
 def test_catalog_cache_respects_ttl() -> None:
     csv_text = (
-        "Название,Ссылка на сайт,Ссылка на изображение для пользователя\n"
-        "Alpha,https://example.com/a,https://drive.google.com/file/d/AAA/view\n"
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Alpha,A1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
     )
 
     async def _run() -> None:
@@ -179,11 +178,11 @@ def test_html_response_raises_not_csv() -> None:
 
 def test_catalog_logs_summary(caplog: pytest.LogCaptureFixture) -> None:
     csv_text = (
-        "Название,Ссылка на сайт,Ссылка на изображение для пользователя\n"
-        "Valid,https://example.com/a,https://drive.google.com/file/d/AAA/view\n"
-        "Empty,https://example.com/b,   \n"
-        "Folder,https://example.com/c,https://drive.google.com/drive/folders/FFF?usp=sharing\n"
-        "Bad,https://example.com/d,https://example.com/not-drive\n"
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Valid,V1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,valid-1\n"
+        ",,,,,,\n"
+        "Folder,F1,https://example.com/c,female,https://drive.google.com/drive/folders/FFF?usp=sharing,https://nano/c,folder-1\n"
+        "Bad,B1,ftp://example.com/d,other,https://example.com/not-drive,https://nano/d,bad-1\n"
     )
 
     async def _run() -> None:
@@ -218,10 +217,10 @@ def test_catalog_logs_summary(caplog: pytest.LogCaptureFixture) -> None:
 
 def test_catalog_respects_row_limit() -> None:
     csv_text = (
-        "Название,Ссылка на сайт,Ссылка на изображение для пользователя\n"
-        "Alpha,https://example.com/a,https://drive.google.com/file/d/AAA/view\n"
-        "Bravo,https://example.com/b,https://drive.google.com/file/d/BBB/view\n"
-        "Charlie,https://example.com/c,https://drive.google.com/file/d/CCC/view\n"
+        "Title,Model,Site,Gender,User Image,NanoBanana,UID\n"
+        "Alpha,A1,https://example.com/a,male,https://drive.google.com/file/d/AAA/view,https://nano/a,id-alpha\n"
+        "Bravo,B1,https://example.com/b,male,https://drive.google.com/file/d/BBB/view,https://nano/b,id-bravo\n"
+        "Charlie,C1,https://example.com/c,male,https://drive.google.com/file/d/CCC/view,https://nano/c,id-charlie\n"
     )
 
     async def _run() -> None:

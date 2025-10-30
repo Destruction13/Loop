@@ -26,10 +26,12 @@ class DummyCatalog(CatalogService):
 
     async def list_by_gender(self, gender: str) -> List[GlassModel]:  # noqa: D401 - not used
         normalized = _normalize_gender(gender)
-        if normalized == "Унисекс":
-            allowed = {"Унисекс"}
+        if normalized == "unisex":
+            allowed = {"unisex"}
+        elif normalized in {"male", "female"}:
+            allowed = {normalized, "unisex"}
         else:
-            allowed = {normalized, "Унисекс"}
+            allowed = {normalized, "unisex"}
         return [model for model in self._snapshot.models if model.gender in allowed]
 
     async def pick_batch(
@@ -57,10 +59,10 @@ class DummyCatalog(CatalogService):
         unisex_pool = [
             model
             for model in models
-            if _normalize_gender(model.gender) == "Унисекс"
+            if _normalize_gender(model.gender) == "unisex"
         ]
 
-        if normalized_gender == "Унисекс":
+        if normalized_gender == "unisex":
             picks, exhausted = _pick_unisex_batch(rng, unisex_pool, batch_size)
         else:
             picks, exhausted = _pick_gender_batch(
@@ -84,12 +86,12 @@ def make_model(uid: str, gender: str) -> GlassModel:
 def _normalize_gender(value: str) -> str:
     prepared = (value or "").strip().lower()
     if prepared.startswith("муж") or prepared in {"m", "male"}:
-        return "Мужской"
+        return "male"
     if prepared.startswith("жен") or prepared in {"f", "female"}:
-        return "Женский"
+        return "female"
     if prepared.startswith("уни") or prepared.startswith("uni") or prepared in {"u", "unisex"}:
-        return "Унисекс"
-    return "Other"
+        return "unisex"
+    return "other"
 
 
 def _sample(rng: random.Random, items: Iterable[GlassModel], count: int) -> list[GlassModel]:
@@ -178,11 +180,11 @@ def test_pick_scheme_gender_or_unisex(tmp_path: Path) -> None:
         repo = Repository(tmp_path / "scheme.db", daily_limit=5)
         await repo.init()
         models = [
-            make_model("m1", "Мужской"),
-            make_model("m2", "Мужской"),
-            make_model("m3", "Мужской"),
-            make_model("u1", "Унисекс"),
-            make_model("u2", "Унисекс"),
+            make_model("m1", "male"),
+            make_model("m2", "male"),
+            make_model("m3", "male"),
+            make_model("u1", "unisex"),
+            make_model("u2", "unisex"),
         ]
         catalog = DummyCatalog(models)
 
@@ -208,25 +210,25 @@ def test_pick_scheme_gender_or_unisex(tmp_path: Path) -> None:
                 snapshot=await catalog.snapshot(),
             )
             genders = {model.gender for model in batch.items}
-            if genders == {"Мужской"}:
+            if genders == {"male"}:
                 counts["GG"] += 1
-            elif "Унисекс" in genders:
+            elif "unisex" in genders:
                 counts["GU"] += 1
         assert counts["GG"] > 0 and counts["GU"] > 0
         assert abs(counts["GG"] - counts["GU"]) < 60
 
         # Fallback when no unisex available
-        catalog.update([make_model("m4", "Мужской"), make_model("m5", "Мужской")], "v2")
+        catalog.update([make_model("m4", "male"), make_model("m5", "male")], "v2")
         batch = await catalog.pick_batch(
             gender="male",
             batch_size=2,
             scheme="GENDER_OR_GENDER_UNISEX",
             rng=random.Random(1),
         )
-        assert all(model.gender == "Мужской" for model in batch.items)
+        assert all(model.gender == "male" for model in batch.items)
 
         # Fallback when only unisex remains
-        catalog.update([make_model("u9", "Унисекс")], "v3")
+        catalog.update([make_model("u9", "unisex")], "v3")
         batch = await catalog.pick_batch(
             gender="male",
             batch_size=2,
@@ -235,7 +237,7 @@ def test_pick_scheme_gender_or_unisex(tmp_path: Path) -> None:
         )
         assert len(batch.items) == 1
         assert batch.exhausted is True
-        assert batch.items[0].gender == "Унисекс"
+        assert batch.items[0].gender == "unisex"
 
     asyncio.run(scenario())
 
@@ -244,7 +246,7 @@ def test_recommendation_allows_repeats(tmp_path: Path) -> None:
     async def scenario() -> None:
         repo = Repository(tmp_path / "repeats.db", daily_limit=5)
         await repo.init()
-        models = [make_model("m1", "Мужской")]
+        models = [make_model("m1", "male")]
         catalog = DummyCatalog(models)
         service = RecommendationService(
             catalog=catalog,
@@ -272,9 +274,9 @@ def test_catalog_version_change_clears_history(tmp_path: Path) -> None:
         repo = Repository(tmp_path / "version.db", daily_limit=5)
         await repo.init()
         models = [
-            make_model("m1", "Мужской"),
-            make_model("m2", "Мужской"),
-            make_model("u1", "Унисекс"),
+            make_model("m1", "male"),
+            make_model("m2", "male"),
+            make_model("u1", "unisex"),
         ]
         catalog = DummyCatalog(models, version_hash="v1")
         service = RecommendationService(
@@ -302,9 +304,9 @@ def test_recommendation_respects_unisex_selection(tmp_path: Path) -> None:
         repo = Repository(tmp_path / "unisex.db", daily_limit=5)
         await repo.init()
         models = [
-            make_model("u1", "Унисекс"),
-            make_model("u2", "Унисекс"),
-            make_model("u3", "Унисекс"),
+            make_model("u1", "unisex"),
+            make_model("u2", "unisex"),
+            make_model("u3", "unisex"),
         ]
         catalog = DummyCatalog(models)
         service = RecommendationService(
@@ -320,7 +322,7 @@ def test_recommendation_respects_unisex_selection(tmp_path: Path) -> None:
 
         result = await service.recommend_for_user(44, "unisex")
         assert len(result.models) == 2
-        assert all(model.gender == "Унисекс" for model in result.models)
+        assert all(model.gender == "unisex" for model in result.models)
 
     asyncio.run(scenario())
 

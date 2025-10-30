@@ -10,8 +10,8 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import List
-from urllib.parse import parse_qs, urlparse
+from typing import Iterable, List
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 import httpx
 
@@ -25,6 +25,55 @@ from app.services.catalog_base import (
 from app.utils.drive import DriveFolderUrlError, DriveUrlError, drive_view_to_direct
 
 LOGGER = logging.getLogger("loop_bot.catalog.google")
+
+
+def _normalize_header(value: str) -> str:
+    return value.strip().lower()
+
+
+HEADER_SYNONYMS: dict[str, frozenset[str]] = {
+    "unique_id": frozenset(
+        _normalize_header(token)
+        for token in ("уникальный id", "id", "uid", "unique id", "unique_id")
+    ),
+    "title": frozenset(
+        _normalize_header(token)
+        for token in ("название", "наименование", "title", "name")
+    ),
+    "model": frozenset(
+        _normalize_header(token) for token in ("модель", "model")
+    ),
+    "site": frozenset(
+        _normalize_header(token)
+        for token in ("ссылка на сайт", "url", "site", "ссылка")
+    ),
+    "img_nb": frozenset(
+        _normalize_header(token)
+        for token in (
+            "ссылка на изображение для nanobanana",
+            "nanobanana",
+            "nb image",
+            "image_nb",
+            "img_nb",
+        )
+    ),
+    "img_user": frozenset(
+        _normalize_header(token)
+        for token in (
+            "ссылка на изображение для пользователя",
+            "user image",
+            "image_user",
+            "img_user",
+        )
+    ),
+    "gender": frozenset(
+        _normalize_header(token) for token in ("пол", "gender", "sex")
+    ),
+}
+
+REQUIRED_HEADERS = frozenset(
+    ("unique_id", "title", "model", "site", "img_nb", "img_user", "gender")
+)
 
 
 @dataclass(slots=True)
@@ -73,10 +122,12 @@ class GoogleSheetCatalog(CatalogService):
         models = snapshot.models
         normalized = _normalize_gender(gender)
         allowed: set[str]
-        if normalized == "Унисекс":
-            allowed = {"Унисекс"}
+        if normalized == "unisex":
+            allowed = {"unisex"}
+        elif normalized in {"male", "female"}:
+            allowed = {normalized, "unisex"}
         else:
-            allowed = {normalized, "Унисекс"}
+            allowed = {normalized, "unisex"}
         return [model for model in models if model.gender in allowed]
 
     async def pick_batch(
@@ -104,10 +155,10 @@ class GoogleSheetCatalog(CatalogService):
             group = _normalize_gender(model.gender)
             if group == normalized_gender:
                 gender_pool.append(model)
-            elif group == "Унисекс":
+            elif group == "unisex":
                 unisex_pool.append(model)
 
-        if normalized_gender == "Унисекс":
+        if normalized_gender == "unisex":
             picks, exhausted = _pick_unisex_batch(rng, unisex_pool, batch_size)
         else:
             picks, exhausted = _pick_gender_batch(
@@ -245,54 +296,119 @@ class GoogleSheetCatalog(CatalogService):
         reader = csv.DictReader(stream)
         if not reader.fieldnames:
             raise CatalogError("Catalog CSV has no header row")
+
+        header_map = _resolve_header_map(reader.fieldnames)
+        missing_headers = REQUIRED_HEADERS - set(header_map)
+        if missing_headers:
+            missing = ", ".join(sorted(missing_headers))
+            raise CatalogError(f"Catalog CSV missing required columns: {missing}")
+
         models: list[GlassModel] = []
         total_rows = 0
         skipped_empty = 0
         skipped_folder = 0
         skipped_invalid = 0
-        limit = self._config.parse_row_limit
+        limit = self._config.parse_row_limit or 0
+
         for row_index, row in enumerate(reader, start=2):
             total_rows += 1
-            normalized_row = {_normalize_header(key): (value or "").strip() for key, value in row.items()}
-            title = normalized_row.get("название")
-            site_url = normalized_row.get("ссылка на сайт")
-            if not title or not site_url:
-                skipped_invalid += 1
-                LOGGER.warning("Skipping row %s due to missing title or site URL", row_index)
-                continue
-            model_code = normalized_row.get("модель", "")
-            gender_value = normalized_row.get("пол", "")
-            gender = _normalize_gender(gender_value)
-            img_user_original = _clean_drive_url(normalized_row.get("ссылка на изображение для пользователя", ""))
-            if not img_user_original:
+            if not any((value or "").strip() for value in row.values()):
                 skipped_empty += 1
-                LOGGER.debug("Skipping row %s due to empty user image URL", row_index)
+                LOGGER.debug("Skipping row %s because it is empty", row_index)
                 continue
+
+            normalized_row = {
+                key: (row.get(source) or "").strip()
+                for key, source in header_map.items()
+            }
+
+            unique_id = normalized_row["unique_id"]
+            title = normalized_row["title"]
+            model_code = normalized_row["model"]
+            site_url = normalized_row["site"]
+            img_nb_value = _clean_drive_url(normalized_row["img_nb"])
+            img_user_value = _clean_drive_url(normalized_row["img_user"])
+            gender_raw = normalized_row["gender"]
+
+            required_values = {
+                "unique_id": unique_id,
+                "title": title,
+                "model": model_code,
+                "site": site_url,
+                "img_nb": img_nb_value,
+                "img_user": img_user_value,
+                "gender": gender_raw,
+            }
+            if any(not value for value in required_values.values()):
+                missing = [name for name, value in required_values.items() if not value]
+                skipped_invalid += 1
+                LOGGER.warning(
+                    "Skipping row %s due to empty values in columns: %s",
+                    row_index,
+                    ", ".join(missing),
+                )
+                continue
+
+            if not _is_valid_http_url(site_url):
+                skipped_invalid += 1
+                LOGGER.warning("Skipping row %s due to invalid site URL: %s", row_index, site_url)
+                continue
+
+            if not _is_valid_http_url(img_nb_value):
+                skipped_invalid += 1
+                LOGGER.warning(
+                    "Skipping row %s due to invalid NanoBanana image URL: %s",
+                    row_index,
+                    img_nb_value,
+                )
+                continue
+
+            if _is_drive_folder_link(img_user_value) or _is_drive_folder_link(img_nb_value):
+                skipped_folder += 1
+                LOGGER.warning(
+                    "Skipping row %s because one of the image URLs points to a Drive folder",
+                    row_index,
+                )
+                continue
+
             try:
-                img_user_url = drive_view_to_direct(img_user_original, export="view")
+                img_user_url = drive_view_to_direct(img_user_value, export="view")
             except DriveFolderUrlError:
                 skipped_folder += 1
                 LOGGER.warning(
-                    "Skipping row %s due to folder Drive URL; expected file share like /file/d/.../view",
-                    row_index,
+                    "Skipping row %s due to Drive folder in user image URL", row_index
                 )
                 continue
             except DriveUrlError as exc:
                 skipped_invalid += 1
-                LOGGER.warning("Skipping row %s due to invalid Drive URL: %s", row_index, exc)
+                LOGGER.warning(
+                    "Skipping row %s due to invalid user image Drive URL: %s",
+                    row_index,
+                    exc,
+                )
                 continue
-            img_nano_url = normalized_row.get("ссылка на изображение для nanobanana", "")
-            unique_id = normalized_row.get("уникальный id") or _make_fallback_id(title, site_url)
+
+            gender = _normalize_gender(gender_raw)
+            if gender not in {"male", "female", "unisex"}:
+                skipped_invalid += 1
+                LOGGER.warning(
+                    "Skipping row %s due to unsupported gender value: %s",
+                    row_index,
+                    gender_raw,
+                )
+                continue
+
             model = GlassModel(
                 unique_id=unique_id,
                 title=title,
                 model_code=model_code,
                 site_url=site_url,
                 img_user_url=img_user_url,
-                img_nano_url=img_nano_url,
+                img_nano_url=img_nb_value,
                 gender=gender,
             )
             models.append(model)
+
             if limit and len(models) >= limit:
                 LOGGER.info(
                     "Catalog CSV row limit %s reached at data row %s, stopping parse",
@@ -312,26 +428,54 @@ class GoogleSheetCatalog(CatalogService):
         return models
 
 
-def _normalize_header(header: str) -> str:
-    return header.strip().lower()
+def _resolve_header_map(fieldnames: Iterable[str]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for name in fieldnames:
+        normalized = _normalize_header(name)
+        for canonical, synonyms in HEADER_SYNONYMS.items():
+            if normalized in synonyms and canonical not in mapping:
+                mapping[canonical] = name
+                break
+    return mapping
+
+
+def _is_valid_http_url(value: str) -> bool:
+    if not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _is_drive_folder_link(value: str | None) -> bool:
+    if not value:
+        return False
+    normalized = value.strip().lower()
+    return "drive.google.com/drive/folders" in normalized
 
 
 def _normalize_gender(value: str) -> str:
     prepared = (value or "").strip().lower()
-    male_tokens = {"муж", "мужской", "м", "male", "m"}
-    female_tokens = {"жен", "женский", "ж", "female", "f"}
-    unisex_tokens = {"унисекс", "uni", "unisex", "u"}
-    if prepared in male_tokens or prepared.startswith("муж"):
-        return "Мужской"
-    if prepared in female_tokens or prepared.startswith("жен"):
-        return "Женский"
-    if prepared in unisex_tokens or prepared.startswith("уни") or prepared.startswith("uni"):
-        return "Унисекс"
     if not prepared:
-        return "Унисекс"
-    if prepared:
-        LOGGER.warning("Unknown gender value '%s' in catalog, treating as Other", value)
-    return "Other"
+        return "other"
+
+    male_tokens = {"муж", "мужской", "мужчина", "м", "male", "m"}
+    female_tokens = {"жен", "женский", "женщина", "ж", "female", "f"}
+    unisex_tokens = {"унисекс", "uni", "unisex", "u"}
+
+    if prepared in male_tokens or prepared.startswith("муж"):
+        return "male"
+    if prepared in female_tokens or prepared.startswith("жен"):
+        return "female"
+    if prepared in unisex_tokens or prepared.startswith("уни") or prepared.startswith("uni"):
+        return "unisex"
+    if prepared in {"other", "другое"}:
+        return "other"
+
+    LOGGER.warning("Unknown gender value '%s' in catalog, treating as other", value)
+    return "other"
 
 
 def _sample(
@@ -435,11 +579,6 @@ def _pick_gender_batch(
     remaining_unisex = [model for model in unisex_pool if model.unique_id not in used_ids]
     exhausted = (len(remaining_gender) + len(remaining_unisex)) < batch_size
     return picks, exhausted
-
-
-def _make_fallback_id(title: str, site_url: str) -> str:
-    digest = hashlib.sha256(f"{title}|{site_url}".encode("utf-8")).hexdigest()
-    return digest[:16]
 
 
 def _looks_like_html(payload: str) -> bool:

@@ -114,11 +114,11 @@ class RecommendationService:
         female_tokens = {"жен", "женский", "ж", "female", "f"}
         unisex_tokens = {"унисекс", "uni", "unisex", "u"}
         if prepared in male_tokens or prepared.startswith("муж"):
-            return "мужской"
+            return "male"
         if prepared in female_tokens or prepared.startswith("жен"):
-            return "женский"
+            return "female"
         if prepared in unisex_tokens or prepared.startswith("уни") or prepared.startswith("uni"):
-            return "унисекс"
+            return "unisex"
         if prepared in {"other", "другое"}:
             return "other"
         if log_unknown and prepared:

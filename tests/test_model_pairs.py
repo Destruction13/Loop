@@ -12,7 +12,7 @@ def _model(uid: str, title: str) -> GlassModel:
         site_url="https://example.com",
         img_user_url=f"https://img/{uid}.jpg",
         img_nano_url=f"https://nano/{uid}.jpg",
-        gender="Унисекс",
+        gender="unisex",
     )
 
 

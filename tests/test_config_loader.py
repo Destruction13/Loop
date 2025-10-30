@@ -10,6 +10,7 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
             [
                 "BOT_TOKEN=token123",
                 "SHEET_CSV_URL=https://example.com/catalog.csv",
+                "GOOGLE_SHEET_URL=https://example.com/sheets/edit",
                 "SITE_URL=https://landing.example.com",
                 "PRIVACY_POLICY_URL=https://telegra.ph/loov-policy",
                 'PROMO_CODE="SPECIAL"',
@@ -44,7 +45,7 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     config = load_config(str(env_file))
 
     assert config.bot_token == "token123"
-    assert config.sheet_csv_url == "https://example.com/catalog.csv"
+    assert config.sheet_csv_url == "https://example.com/sheets/edit"
     assert config.site_url == "https://landing.example.com"
     assert config.privacy_policy_url == "https://telegra.ph/loov-policy"
     assert config.promo_code == "SPECIAL"
@@ -72,3 +73,4 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.promo_contact_code == "EXTRA500"
     assert config.leads_sheet_name == "LeadsSheet"
     assert config.enable_leads_export is False
+    assert config.contacts_sheet_url == "https://example.com/sheets/edit"
