@@ -156,10 +156,6 @@ SOCIAL_AD_BODY = (
     "Там живые примерки, реальные образы и вдохновение.\n"
     "Вернёшься — продолжим ✨"
 )
-SOCIAL_AD_BTN_INST = "Instagram"
-SOCIAL_AD_BTN_TIKTOK = "TikTok"
-SOCIAL_AD_BTN_TRY = "Вернуться к примерке"
-
 # Кнопки деталей и повтора генерации.
 DETAILS_BUTTON_TEXT = "Подробнее о модели"
 RETRY_GENERATION_BUTTON_TEXT = "Попробовать ещё раз"

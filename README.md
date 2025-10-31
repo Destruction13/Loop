@@ -19,12 +19,24 @@ pip install -r requirements.txt
 
 Скопируйте `.env.example` → `.env` и заполните значения. В шаблоне у каждой переменной есть комментарий:
 - токен бота, ссылка на Google Sheets CSV и URL лендинга;
+- Instagram-ссылки для блока соцсетей (`SOCIAL_LINKS_JSON` — JSON-массив title/url);
 - лимиты, TTL кэша, параметры напоминаний;
 - переключатель мок-генерации и креды NanoBanana;
 - пути к папкам `uploads/` и `results/`.
 
 Все переменные подхватываются через `load_config` (`app/config.py`) и превращаются в dataclass `Config`, так что
 никаких «спрятанных» параметров нет — правки делаются только в `.env`.
+
+Пример заполнения блока соцсетей:
+
+```
+SOCIAL_LINKS_JSON=[
+  {"title":"Основной loov.ru","url":"https://www.instagram.com/loov.ru?utm_source=qr"},
+  {"title":"Loov.raw","url":"https://www.instagram.com/loov.raw?utm_source=qr"}
+]
+```
+
+Количество кнопок в боте автоматически соответствует количеству элементов массива.
 
 ## Коллажи
 

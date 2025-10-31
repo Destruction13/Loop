@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Optional
+from typing import Optional, Sequence
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -23,15 +23,17 @@ class SocialAdService:
         *,
         bot: Bot,
         repository: Repository,
-        instagram_url: str,
-        tiktok_url: str,
+        social_links: Sequence[tuple[str, str]],
         timeout_minutes: int,
         interval_seconds: int = 30,
     ) -> None:
         self._bot = bot
         self._repository = repository
-        self._instagram_url = instagram_url
-        self._tiktok_url = tiktok_url
+        self._social_links: list[tuple[str, str]] = [
+            (title.strip(), url.strip())
+            for title, url in social_links
+            if title.strip() and url.strip()
+        ]
         self._timeout_seconds = max(timeout_minutes * 60, 0)
         self._interval = max(interval_seconds, 1)
         self._task: Optional[asyncio.Task] = None
@@ -83,7 +85,10 @@ class SocialAdService:
 
     async def _send_ad(self, user_id: int) -> None:
         await self._disable_previous_more_button(user_id)
-        keyboard = social_ad_keyboard(self._instagram_url, self._tiktok_url)
+        if not self._social_links:
+            self._logger.warning("No social links configured; skipping social ad")
+            return
+        keyboard = social_ad_keyboard(self._social_links)
         text = f"<b>{msg.SOCIAL_AD_TITLE}</b>\n{msg.SOCIAL_AD_BODY}"
         message = None
         try:
@@ -104,8 +109,10 @@ class SocialAdService:
                     message.message_id,
                     "social",
                     {
-                        "instagram_url": self._instagram_url,
-                        "tiktok_url": self._tiktok_url,
+                        "links": [
+                            {"title": title, "url": url}
+                            for title, url in self._social_links
+                        ]
                     },
                 )
 

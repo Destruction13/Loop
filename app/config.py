@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -76,6 +77,34 @@ class CollageConfig:
         return self.slot_height + self.padding * 2
 
 
+@dataclass(frozen=True, slots=True)
+class SocialLink:
+    """Represents a social media link displayed to the user."""
+
+    title: str
+    url: str
+
+
+DEFAULT_SOCIAL_LINKS: tuple[SocialLink, ...] = (
+    SocialLink(
+        title="Основной loov.ru",
+        url="https://www.instagram.com/loov.ru?igsh=bGZreDRlNXk1cHNn&utm_source=qr",
+    ),
+    SocialLink(
+        title="Loov.raw",
+        url="https://www.instagram.com/loov.raw?igsh=bmtrYWl3OW5heWh2&utm_source=qr",
+    ),
+    SocialLink(
+        title="Loov.meta",
+        url="https://www.instagram.com/loov.meta?igsh=cmZ0Z2M0dzB3cHUx&utm_source=qr",
+    ),
+    SocialLink(
+        title="Loov.core",
+        url="https://www.instagram.com/loov.core?igsh=MWRhMmppdjdzYnYxeg%3D%3D&utm_source=qr",
+    ),
+)
+
+
 @dataclass(slots=True)
 class Config:
     """Top-level application configuration."""
@@ -110,8 +139,7 @@ class Config:
     enable_idle_reminder: bool
     social_ad_minutes: int
     enable_social_ad: bool
-    social_instagram_url: str
-    social_tiktok_url: str
+    social_links: tuple[SocialLink, ...]
     contacts_sheet_url: Optional[str]
     google_service_account_json: Optional[Path]
     promo_video_path: Path
@@ -162,6 +190,34 @@ def _as_path(value: Optional[str], fallback: str) -> Path:
     return Path(value or fallback)
 
 
+def _parse_social_links(raw: Optional[str]) -> list[SocialLink]:
+    if raw is None:
+        return []
+    payload = raw.strip()
+    if not payload:
+        return []
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        logger.warning("Invalid SOCIAL_LINKS_JSON value; ignoring")
+        return []
+    if not isinstance(data, list):
+        logger.warning("SOCIAL_LINKS_JSON must be a JSON array")
+        return []
+    result: list[SocialLink] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title") or "").strip()
+        url = str(entry.get("url") or "").strip()
+        if not title or not url:
+            continue
+        result.append(SocialLink(title=title, url=url))
+    if not result:
+        logger.warning("SOCIAL_LINKS_JSON does not contain valid entries")
+    return result
+
+
 def load_config(env_file: str | None = None) -> Config:
     """Load configuration from the provided .env file (or default location)."""
 
@@ -172,12 +228,12 @@ def load_config(env_file: str | None = None) -> Config:
 
     batch_size = max(_as_int(_get("BATCH_SIZE", "2"), 2), 1)
     batch_columns = max(_as_int(_get("BATCH_LAYOUT_COLS", "2"), 2), 1)
+    google_sheet_url = _get("GOOGLE_SHEET_URL")
     catalog_csv_url = (
         _get("CATALOG_CSV_URL")
         or _get("SHEET_CSV_URL")
-        or google_sheet_url)
-
-    google_sheet_url = _get("GOOGLE_SHEET_URL")
+        or google_sheet_url
+    )
 
     catalog_sheet_id = (
         _get("CATALOG_SHEET_ID")
@@ -275,6 +331,13 @@ def load_config(env_file: str | None = None) -> Config:
     if not api_key.strip():
         raise RuntimeError("NANOBANANA_API_KEY is required")
 
+    social_links_raw = _get("SOCIAL_LINKS_JSON")
+    if social_links_raw is None:
+        social_links = list(DEFAULT_SOCIAL_LINKS)
+    else:
+        parsed_links = _parse_social_links(social_links_raw)
+        social_links = parsed_links if parsed_links else []
+
     return Config(
         bot_token=_get("BOT_TOKEN", required=True),
         sheet_csv_url=(
@@ -311,10 +374,7 @@ def load_config(env_file: str | None = None) -> Config:
         enable_idle_reminder=_as_bool(_get("ENABLE_IDLE_REMINDER", "1"), True),
         social_ad_minutes=_as_int(_get("SOCIAL_AD_MINUTES", "20"), 20),
         enable_social_ad=_as_bool(_get("ENABLE_SOCIAL_AD", "1"), True),
-        social_instagram_url=_get("SOCIAL_INSTAGRAM_URL", "https://instagram.com/loov")
-        or "https://instagram.com/loov",
-        social_tiktok_url=_get("SOCIAL_TIKTOK_URL", "https://tiktok.com/@loov")
-        or "https://tiktok.com/@loov",
+        social_links=tuple(social_links),
         contacts_sheet_url=contacts_sheet_url,
         google_service_account_json=google_credentials_path,
         promo_video_path=promo_video_path,
@@ -324,5 +384,5 @@ def load_config(env_file: str | None = None) -> Config:
     )
 
 
-__all__ = ["Config", "CollageConfig", "load_config"]
+__all__ = ["Config", "CollageConfig", "SocialLink", "load_config"]
 

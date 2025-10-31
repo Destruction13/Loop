@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app.config import load_config
+from app.config import SocialLink, load_config
 
 
 def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
@@ -37,6 +37,8 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 "PROMO_CONTACT_CODE=EXTRA500",
                 "LEADS_SHEET_NAME=LeadsSheet",
                 "ENABLE_LEADS_EXPORT=0",
+                'SOCIAL_LINKS_JSON=[{"title":"One","url":"https://example.com/one"},'
+                ' {"title":"Two","url":"https://example.com/two"}]',
             ]
         ),
         encoding="utf-8",
@@ -77,3 +79,7 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.leads_sheet_name == "LeadsSheet"
     assert config.enable_leads_export is False
     assert config.contacts_sheet_url == "https://example.com/sheets/edit"
+    assert config.social_links == (
+        SocialLink(title="One", url="https://example.com/one"),
+        SocialLink(title="Two", url="https://example.com/two"),
+    )
