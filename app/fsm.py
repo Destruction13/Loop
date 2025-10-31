@@ -318,6 +318,11 @@ def setup_router(
         finally:
             await state.update_data(last_aux_message_id=None)
 
+    async def _build_main_reply_keyboard(state: FSMContext):
+        data = await state.get_data()
+        show_try_button = bool(data.get("allow_try_button", False))
+        return main_reply_keyboard(policy_url, show_try_button=show_try_button)
+
     async def _send_aux_message(
         source_message: Message,
         state: FSMContext,
@@ -335,7 +340,7 @@ def setup_router(
             if isinstance(first_arg, (list, tuple)):
                 send_args = ("".join(first_arg),) + send_args[1:]
         if "reply_markup" not in kwargs or kwargs["reply_markup"] is None:
-            kwargs["reply_markup"] = main_reply_keyboard(policy_url)
+            kwargs["reply_markup"] = await _build_main_reply_keyboard(state)
         sent_message = await send_method(*send_args, **kwargs)
         if track:
             await state.update_data(last_aux_message_id=sent_message.message_id)
@@ -380,6 +385,39 @@ def setup_router(
         if isinstance(source, (list, tuple)):
             return "".join(source)
         return str(source)
+
+    FOLLOWUP_CAPTIONS: tuple[Sequence[str] | str, ...] = (
+        msg.SECOND_RESULT_CAPTION,
+        msg.THIRD_RESULT_CAPTION,
+        msg.FOURTH_RESULT_CAPTION_TEMPLATE,
+        msg.FIFTH_RESULT_CAPTION,
+        msg.SIXTH_RESULT_CAPTION,
+        msg.SEVENTH_RESULT_CAPTION,
+    )
+
+    def _resolve_ready_word(gender: str | None) -> str:
+        mapping = {
+            "male": "Готов",
+            "for_who_male": "Готов",
+            "female": "Готова",
+            "for_who_female": "Готова",
+        }
+        return mapping.get(gender, "Готов(а)")
+
+    def _resolve_followup_caption(index: int, gender: str | None) -> str:
+        if not FOLLOWUP_CAPTIONS:
+            return _render_text(msg.SECOND_RESULT_CAPTION)
+        normalized = index % len(FOLLOWUP_CAPTIONS)
+        if normalized == 2:
+            template_source = msg.FOURTH_RESULT_CAPTION_TEMPLATE
+            template_text = (
+                "".join(template_source)
+                if isinstance(template_source, (list, tuple))
+                else str(template_source)
+            )
+            return template_text.format(ready=_resolve_ready_word(gender))
+        source = FOLLOWUP_CAPTIONS[normalized]
+        return _render_text(source)
 
     async def _prompt_for_next_photo(
         message: Message,
@@ -698,11 +736,6 @@ def setup_router(
             await _resume_after_contact(message, state, send_generation=False)
             current_state = await state.get_state()
             if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
-                caption_source = msg.NEXT_RESULT_CAPTION
-                if isinstance(caption_source, (list, tuple)):
-                    followup_text = "".join(caption_source)
-                else:
-                    followup_text = str(caption_source)
                 await state.set_state(TryOnStates.AWAITING_PHOTO)
                 await state.update_data(
                     upload=None,
@@ -710,6 +743,14 @@ def setup_router(
                     last_batch=[],
                     preload_message_id=None,
                     generation_progress_message_id=None,
+                    allow_try_button=True,
+                )
+                gender = state_data.get("gender")
+                gen_count = await repository.get_generation_count(user_id)
+                followup_index = max(gen_count, 1) - 1
+                followup_text = _resolve_followup_caption(
+                    followup_index,
+                    gender,
                 )
                 await _send_aux_message(
                     message,
@@ -887,6 +928,9 @@ def setup_router(
                     except ValueError:
                         pass
         await state.set_state(TryOnStates.START)
+        await state.update_data(
+            allow_try_button=False,
+        )
         promo_video_log = {
             "path": str(promo_video_path),
             "width": None,
@@ -967,7 +1011,7 @@ def setup_router(
             state,
             message.answer,
             msg.MAIN_MENU_HINT,
-            reply_markup=main_reply_keyboard(policy_url),
+            reply_markup=main_reply_keyboard(policy_url, show_try_button=False),
         )
         logger.info("%s User %s entered start", EVENT_ID["START"], message.from_user.id)
 
@@ -993,7 +1037,11 @@ def setup_router(
     async def select_gender(callback: CallbackQuery, state: FSMContext) -> None:
         gender = callback.data.replace("gender_", "")
         await repository.update_filters(callback.from_user.id, gender=gender)
-        await state.update_data(gender=gender, first_generated_today=True)
+        await state.update_data(
+            gender=gender,
+            first_generated_today=True,
+            allow_try_button=False,
+        )
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await _delete_state_message(callback.message, state, "gender_prompt_message_id")
         await _send_aux_message(
@@ -1038,7 +1086,15 @@ def setup_router(
         await _delete_idle_nudge_message(state, message.bot, message.chat.id)
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
-        if await _maybe_request_contact(message, state, user_id):
+        contact_profile = await repository.ensure_user(user_id)
+        defer_contact_reminder = (
+            contact_profile.contact_skip_once
+            and contact_profile.gen_count >= CONTACT_REMINDER_TRIGGER
+        )
+        await state.update_data(contact_reminder_deferred=defer_contact_reminder)
+        if not defer_contact_reminder and await _maybe_request_contact(
+            message, state, user_id
+        ):
             logger.info("%s Contact request queued for %s", EVENT_ID["MODELS_SENT"], user_id)
             return
         preload_message = await _send_aux_message(
@@ -1149,31 +1205,19 @@ def setup_router(
         user_id = message.from_user.id
         if text == msg.ASK_PHONE_BUTTON_SKIP:
             await repository.set_contact_skip_once(user_id, True)
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
-                msg.ASK_PHONE_SKIP_ACK,
-            )
             await _resume_after_contact(message, state, send_generation=False)
             current_state = await state.get_state()
             if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
-                await _prompt_for_next_photo(message, state, msg.PHOTO_INSTRUCTION)
+                await _prompt_for_next_photo(message, state, msg.ASK_PHONE_SKIP_ACK)
             logger.info("%s Contact skip once for %s", EVENT_ID["MODELS_SENT"], user_id)
             return
         if text == msg.ASK_PHONE_BUTTON_NEVER:
             await repository.set_contact_never(user_id, True)
             await repository.set_contact_skip_once(user_id, False)
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
-                msg.ASK_PHONE_NEVER_ACK,
-            )
             await _resume_after_contact(message, state, send_generation=False)
             current_state = await state.get_state()
             if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
-                await _prompt_for_next_photo(message, state, msg.PHOTO_INSTRUCTION)
+                await _prompt_for_next_photo(message, state, msg.ASK_PHONE_NEVER_ACK)
             logger.info("%s Contact opt-out for %s", EVENT_ID["MODELS_SENT"], user_id)
             return
         await _handle_manual_phone(message, state, source="manual")
@@ -1192,6 +1236,7 @@ def setup_router(
         data = await state.get_data()
         upload_value = data.get("upload")
         upload_file_id = data.get("upload_file_id")
+        deferred_contact_request = bool(data.get("contact_reminder_deferred"))
 
         progress_message: Message | None = None
         user_photo_path: Path | None = None
@@ -1367,12 +1412,14 @@ def setup_router(
         )
         gen_count_before = await repository.get_generation_count(user_id)
         is_second_generation = gen_count_before == 1
-        caption_source = (
-            msg.FIRST_RESULT_CAPTION
-            if data.get("first_generated_today", True)
-            else msg.NEXT_RESULT_CAPTION
-        )
-        caption_text = _render_text(caption_source)
+        if plan.outcome is GenerationOutcome.FIRST:
+            caption_text = _render_text(msg.FIRST_RESULT_CAPTION)
+        else:
+            followup_index = max(gen_count_before, 1) - 1
+            caption_text = _resolve_followup_caption(
+                followup_index,
+                data.get("gender"),
+            )
         result_has_more = plan.remaining > 0
         keyboard_remaining = plan.remaining if result_has_more else 0
         if plan.outcome is GenerationOutcome.LIMIT:
@@ -1404,6 +1451,9 @@ def setup_router(
             source_message_id=message.message_id,
         )
         new_gen_count = await repository.increment_generation_count(user_id)
+        await state.update_data(
+            allow_try_button=True,
+        )
         new_flag = next_first_flag_value(
             data.get("first_generated_today", True), plan.outcome
         )
@@ -1421,13 +1471,15 @@ def setup_router(
             await repository.set_last_more_message(user_id, None, None, None)
         if plan.outcome is GenerationOutcome.LIMIT:
             limit_text = _render_text(msg.DAILY_LIMIT_MESSAGE)
-            await _send_delivery_message(
+            await _delete_last_aux_message(message, state)
+            limit_message = await _send_delivery_message(
                 message,
                 state,
                 message.answer,
                 limit_text,
                 reply_markup=limit_reached_keyboard(site_url),
             )
+            await state.update_data(last_aux_message_id=limit_message.message_id)
             if contact_active_before:
                 await state.update_data(contact_pending_result_state="limit")
             else:
@@ -1437,10 +1489,20 @@ def setup_router(
             )
         else:
             contact_requested_now = False
+            if deferred_contact_request:
+                await state.update_data(contact_reminder_deferred=False)
             if (
                 not contact_active_before
-                and new_gen_count >= CONTACT_INITIAL_TRIGGER
-                and (is_second_generation or new_gen_count == CONTACT_INITIAL_TRIGGER)
+                and (
+                    (
+                        new_gen_count >= CONTACT_INITIAL_TRIGGER
+                        and (
+                            is_second_generation
+                            or new_gen_count == CONTACT_INITIAL_TRIGGER
+                        )
+                    )
+                    or deferred_contact_request
+                )
             ):
                 contact_requested_now = await _maybe_request_contact(
                     message,
@@ -1534,6 +1596,9 @@ def setup_router(
         if current_state == ContactRequest.waiting_for_phone.state:
             return
         user_id = message.from_user.id
+        data = await state.get_data()
+        if not data.get("allow_try_button", False):
+            return
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
@@ -1546,10 +1611,14 @@ def setup_router(
             )
             return
         gen_count = await repository.get_generation_count(user_id)
-        prompt_source = (
-            msg.PHOTO_INSTRUCTION if gen_count == 0 else msg.NEXT_RESULT_CAPTION
-        )
-        await _prompt_for_next_photo(message, state, prompt_source)
+        if gen_count == 0:
+            prompt_text = _render_text(msg.PHOTO_INSTRUCTION)
+        else:
+            prompt_text = _resolve_followup_caption(
+                max(gen_count, 1) - 1,
+                data.get("gender"),
+            )
+        await _prompt_for_next_photo(message, state, prompt_text)
 
     @router.message(Command("privacy"))
     async def command_privacy(message: Message, state: FSMContext) -> None:
