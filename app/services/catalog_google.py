@@ -150,6 +150,7 @@ class GoogleSheetCatalog(CatalogService):
         models = list(unique_models.values())
 
         normalized_gender = _normalize_gender(gender)
+        normalized_scheme = (scheme or "GENDER_AND_UNISEX_ONLY").strip().upper()
         gender_pool: list[GlassModel] = []
         unisex_pool: list[GlassModel] = []
 
@@ -160,11 +161,19 @@ class GoogleSheetCatalog(CatalogService):
             elif group == "unisex":
                 unisex_pool.append(model)
 
-        if normalized_gender == "unisex":
+        if normalized_scheme == "UNIVERSAL":
+            picks, exhausted = _pick_universal_batch(
+                rng,
+                gender_pool,
+                unisex_pool,
+                batch_size,
+                normalized_gender,
+            )
+        elif normalized_gender == "unisex":
             picks, exhausted = _pick_unisex_batch(rng, unisex_pool, batch_size)
         else:
             picks, exhausted = _pick_gender_batch(
-                rng, gender_pool, unisex_pool, batch_size, scheme
+                rng, gender_pool, unisex_pool, batch_size, normalized_scheme
             )
 
         LOGGER.info(
@@ -595,6 +604,24 @@ def _pick_gender_batch(
 
     exhausted = len(picks) == 0
     return picks, exhausted
+
+
+def _pick_universal_batch(
+    rng: random.Random,
+    gender_pool: list[GlassModel],
+    unisex_pool: list[GlassModel],
+    batch_size: int,
+    normalized_gender: str,
+) -> tuple[list[GlassModel], bool]:
+    if normalized_gender == "unisex":
+        allowed = list(unisex_pool)
+    else:
+        allowed = list(gender_pool)
+        allowed.extend(unisex_pool)
+
+    selection = _sample(rng, allowed, min(batch_size, len(allowed)))
+    exhausted = len(selection) == 0
+    return selection, exhausted
 
 
 def _looks_like_html(payload: str) -> bool:

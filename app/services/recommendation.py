@@ -18,6 +18,7 @@ class PickScheme(Enum):
     GENDER_AND_GENDER_ONLY = "GENDER_AND_GENDER_ONLY"
     GENDER_OR_GENDER_UNISEX = "GENDER_OR_GENDER_UNISEX"
     GENDER_AND_UNISEX_ONLY = "GENDER_AND_UNISEX_ONLY"
+    UNIVERSAL = "UNIVERSAL"
 
     @classmethod
     def from_string(cls, value: str | None) -> "PickScheme":
