@@ -1118,6 +1118,59 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
     asyncio.run(scenario())
 
 
+def test_contact_reminder_after_skip_happens_post_generation(tmp_path: Path) -> None:
+    models = [
+        GlassModel(
+            unique_id="m1",
+            title="Model 1",
+            model_code="M1",
+            site_url="https://example.com/1",
+            img_user_url="https://example.com/1.jpg",
+            img_nano_url="https://example.com/1-nano.jpg",
+            gender="male",
+        ),
+        GlassModel(
+            unique_id="m2",
+            title="Model 2",
+            model_code="M2",
+            site_url="https://example.com/2",
+            img_user_url="https://example.com/2.jpg",
+            img_nano_url="https://example.com/2-nano.jpg",
+            gender="male",
+        ),
+    ]
+
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path, models=models)
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        user_id = 889
+        repository.gen_counts[user_id] = 5
+        repository.contact_skip[user_id] = True
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=user_id, bot=bot)
+        message.photo = [PhotoStub("photo1")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=False)
+
+        await handler_photo(message, state)
+
+        assert state.state is TryOnStates.SHOW_RECS
+        assert not any(msg.ASK_PHONE_TITLE in text for text, _ in message.answers)
+
+        callback = DummyCallback("pick:src=batch2:m1", message)
+        await handler_choose(callback, state)
+
+        assert repository.gen_counts[user_id] == 6
+        assert len(message.answer_photos) >= 1
+        assert state.state is ContactRequest.waiting_for_phone
+        assert message.answers[-1][0].startswith(f"<b>{msg.ASK_PHONE_TITLE}")
+
+    asyncio.run(scenario())
+
+
 def test_limit_result_sends_card_and_summary_message(tmp_path: Path) -> None:
     model = GlassModel(
         unique_id="m1",

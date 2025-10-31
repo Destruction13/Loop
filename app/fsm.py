@@ -1086,7 +1086,15 @@ def setup_router(
         await _delete_idle_nudge_message(state, message.bot, message.chat.id)
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
-        if await _maybe_request_contact(message, state, user_id):
+        contact_profile = await repository.ensure_user(user_id)
+        defer_contact_reminder = (
+            contact_profile.contact_skip_once
+            and contact_profile.gen_count >= CONTACT_REMINDER_TRIGGER
+        )
+        await state.update_data(contact_reminder_deferred=defer_contact_reminder)
+        if not defer_contact_reminder and await _maybe_request_contact(
+            message, state, user_id
+        ):
             logger.info("%s Contact request queued for %s", EVENT_ID["MODELS_SENT"], user_id)
             return
         preload_message = await _send_aux_message(
@@ -1228,6 +1236,7 @@ def setup_router(
         data = await state.get_data()
         upload_value = data.get("upload")
         upload_file_id = data.get("upload_file_id")
+        deferred_contact_request = bool(data.get("contact_reminder_deferred"))
 
         progress_message: Message | None = None
         user_photo_path: Path | None = None
@@ -1478,10 +1487,20 @@ def setup_router(
             )
         else:
             contact_requested_now = False
+            if deferred_contact_request:
+                await state.update_data(contact_reminder_deferred=False)
             if (
                 not contact_active_before
-                and new_gen_count >= CONTACT_INITIAL_TRIGGER
-                and (is_second_generation or new_gen_count == CONTACT_INITIAL_TRIGGER)
+                and (
+                    (
+                        new_gen_count >= CONTACT_INITIAL_TRIGGER
+                        and (
+                            is_second_generation
+                            or new_gen_count == CONTACT_INITIAL_TRIGGER
+                        )
+                    )
+                    or deferred_contact_request
+                )
             ):
                 contact_requested_now = await _maybe_request_contact(
                     message,
