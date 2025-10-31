@@ -1471,13 +1471,15 @@ def setup_router(
             await repository.set_last_more_message(user_id, None, None, None)
         if plan.outcome is GenerationOutcome.LIMIT:
             limit_text = _render_text(msg.DAILY_LIMIT_MESSAGE)
-            await _send_delivery_message(
+            await _delete_last_aux_message(message, state)
+            limit_message = await _send_delivery_message(
                 message,
                 state,
                 message.answer,
                 limit_text,
                 reply_markup=limit_reached_keyboard(site_url),
             )
+            await state.update_data(last_aux_message_id=limit_message.message_id)
             if contact_active_before:
                 await state.update_data(contact_pending_result_state="limit")
             else:

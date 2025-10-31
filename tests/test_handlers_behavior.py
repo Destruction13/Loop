@@ -15,6 +15,7 @@ from app.keyboards import (
     contact_request_keyboard,
     limit_reached_keyboard,
     main_reply_keyboard,
+    promo_keyboard,
 )
 from app.models import GlassModel
 from app.services.collage import CollageProcessingError, CollageSourceUnavailable
@@ -1213,6 +1214,53 @@ def test_limit_result_sends_card_and_summary_message(tmp_path: Path) -> None:
             == expected_markup.inline_keyboard
         )
         assert state.state is TryOnStates.DAILY_LIMIT_REACHED
+
+    asyncio.run(scenario())
+
+
+def test_limit_promo_removes_limit_message(tmp_path: Path) -> None:
+    model = GlassModel(
+        unique_id="m1",
+        title="Model 1",
+        model_code="M1",
+        site_url="https://example.com/1",
+        img_user_url="https://example.com/1.jpg",
+        img_nano_url="https://example.com/1-nano.jpg",
+        gender="male",
+    )
+
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path, models=[model])
+        repository.daily_limit = 1
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+        handler_limit_promo = get_callback_handler(router, "limit_promo")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=111, bot=bot)
+        message.photo = [PhotoStub("limit-photo")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler_photo(message, state)
+        await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
+
+        limit_message_id = state.data.get("last_aux_message_id")
+        assert isinstance(limit_message_id, int)
+
+        callback = DummyCallback("limit_promo", message)
+        await handler_limit_promo(callback, state)
+
+        assert (message.chat.id, limit_message_id) in bot.deleted
+
+        promo_message = message.answers[-1]
+        expected_text = msg.PROMO_MESSAGE_TEMPLATE.format(promo_code="PROMO")
+        assert promo_message[0] == expected_text
+        expected_markup = promo_keyboard("https://example.com")
+        assert isinstance(promo_message[1], InlineKeyboardMarkup)
+        assert (
+            promo_message[1].inline_keyboard == expected_markup.inline_keyboard
+        )
 
     asyncio.run(scenario())
 
