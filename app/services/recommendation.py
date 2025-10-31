@@ -15,11 +15,14 @@ from app.services.repository import Repository
 class PickScheme(Enum):
     """Available schemes for selecting recommendation batches."""
 
+    GENDER_AND_GENDER_ONLY = "GENDER_AND_GENDER_ONLY"
     GENDER_OR_GENDER_UNISEX = "GENDER_OR_GENDER_UNISEX"
+    GENDER_AND_UNISEX_ONLY = "GENDER_AND_UNISEX_ONLY"
+    UNIVERSAL = "UNIVERSAL"
 
     @classmethod
     def from_string(cls, value: str | None) -> "PickScheme":
-        normalized = (value or cls.GENDER_OR_GENDER_UNISEX.value).strip().upper()
+        normalized = (value or cls.GENDER_AND_UNISEX_ONLY.value).strip().upper()
         for member in cls:
             if member.value == normalized:
                 return member

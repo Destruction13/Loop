@@ -24,7 +24,7 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
                 "NANOBANANA_API_KEY=secret",
                 "BATCH_SIZE=5",
                 "BATCH_LAYOUT_COLS=3",
-                "PICK_SCHEME=GENDER_OR_GENDER_UNISEX",
+                "PICK_SCHEME=GENDER_AND_GENDER_ONLY",
                 "COLLAGE_SLOT_WIDTH=1100",
                 "COLLAGE_SLOT_HEIGHT=1500",
                 "COLLAGE_SEPARATOR_WIDTH=12",
@@ -63,7 +63,7 @@ def test_load_config_reads_env(tmp_path, monkeypatch) -> None:
     assert config.nanobanana_api_key == "secret"
     assert config.batch_size == 5
     assert config.batch_layout_cols == 3
-    assert config.pick_scheme == "GENDER_OR_GENDER_UNISEX"
+    assert config.pick_scheme == "GENDER_AND_GENDER_ONLY"
     assert config.collage.slot_width == 1100
     assert config.collage.slot_height == 1500
     assert config.collage.separator_width == 12

@@ -150,6 +150,7 @@ class GoogleSheetCatalog(CatalogService):
         models = list(unique_models.values())
 
         normalized_gender = _normalize_gender(gender)
+        normalized_scheme = (scheme or "GENDER_AND_UNISEX_ONLY").strip().upper()
         gender_pool: list[GlassModel] = []
         unisex_pool: list[GlassModel] = []
 
@@ -160,11 +161,19 @@ class GoogleSheetCatalog(CatalogService):
             elif group == "unisex":
                 unisex_pool.append(model)
 
-        if normalized_gender == "unisex":
+        if normalized_scheme == "UNIVERSAL":
+            picks, exhausted = _pick_universal_batch(
+                rng,
+                gender_pool,
+                unisex_pool,
+                batch_size,
+                normalized_gender,
+            )
+        elif normalized_gender == "unisex":
             picks, exhausted = _pick_unisex_batch(rng, unisex_pool, batch_size)
         else:
             picks, exhausted = _pick_gender_batch(
-                rng, gender_pool, unisex_pool, batch_size, scheme
+                rng, gender_pool, unisex_pool, batch_size, normalized_scheme
             )
 
         LOGGER.info(
@@ -518,7 +527,7 @@ def _pick_gender_batch(
     batch_size: int,
     scheme: str,
 ) -> tuple[list[GlassModel], bool]:
-    normalized_scheme = (scheme or "GENDER_OR_GENDER_UNISEX").strip().upper()
+    normalized_scheme = (scheme or "GENDER_AND_UNISEX_ONLY").strip().upper()
     picks: list[GlassModel] = []
     used_ids: set[str] = set()
 
@@ -529,7 +538,13 @@ def _pick_gender_batch(
         schemes.append("GU")
 
     chosen_scheme: str | None = None
-    if normalized_scheme == "GENDER_OR_GENDER_UNISEX" and schemes:
+    if normalized_scheme == "GENDER_AND_GENDER_ONLY":
+        if "GG" in schemes:
+            chosen_scheme = "GG"
+    elif normalized_scheme == "GENDER_AND_UNISEX_ONLY":
+        if "GU" in schemes:
+            chosen_scheme = "GU"
+    elif normalized_scheme == "GENDER_OR_GENDER_UNISEX" and schemes:
         if len(schemes) == 1:
             chosen_scheme = schemes[0]
         else:
@@ -589,6 +604,24 @@ def _pick_gender_batch(
 
     exhausted = len(picks) == 0
     return picks, exhausted
+
+
+def _pick_universal_batch(
+    rng: random.Random,
+    gender_pool: list[GlassModel],
+    unisex_pool: list[GlassModel],
+    batch_size: int,
+    normalized_gender: str,
+) -> tuple[list[GlassModel], bool]:
+    if normalized_gender == "unisex":
+        allowed = list(unisex_pool)
+    else:
+        allowed = list(gender_pool)
+        allowed.extend(unisex_pool)
+
+    selection = _sample(rng, allowed, min(batch_size, len(allowed)))
+    exhausted = len(selection) == 0
+    return selection, exhausted
 
 
 def _looks_like_html(payload: str) -> bool:

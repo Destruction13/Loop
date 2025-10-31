@@ -29,9 +29,9 @@ def test_filter_options_only_gender() -> None:
 
 def test_photo_instruction_text() -> None:
     expected_text = (
-        "Кинь нам селфи или любую чёткую фотку, где видно лицо прямо. "
-        "Можно взять из “Избранного” — не обязательно себя сейчас фоткать. "
-        "Главное — лицо в кадре"
+        "Отправь <i>селфи</i> или фото, где хорошо видно лицо спереди 👇\n\n"
+        "Не обязательно фотографироваться сейчас — можно выбрать снимок из галереи.\n\n"
+        "Главное: <b>чёткое фото и прямой ракурс</b>."
     )
     assert msg.PHOTO_INSTRUCTION == expected_text
 
@@ -80,8 +80,8 @@ def test_limit_flow_keyboards() -> None:
 def test_promo_message_inserts_code() -> None:
     text = msg.PROMO_MESSAGE_TEMPLATE.format(promo_code="DEMO 10")
 
-    assert "“DEMO 10”" in text
-    assert text.endswith("снова примерить оправы 👓")
+    assert "<b>DEMO 10</b>" in text
+    assert text.endswith("будут новые модели 👓✨")
 
 
 def test_reminder_scheduler_sends_message_with_keyboard() -> None:
