@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 from aiogram.types import (
     InlineKeyboardButton,
@@ -264,6 +264,89 @@ def all_seen_keyboard(site_url: str) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def remove_more_button(markup: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup | None:
+    """Return a copy of markup without buttons invoking more callbacks."""
+
+    if not markup or not markup.inline_keyboard:
+        return None
+    new_rows = []
+    changed = False
+    for row in markup.inline_keyboard:
+        new_row = []
+        for button in row:
+            callback_data = getattr(button, "callback_data", None)
+            if callback_data and callback_data.startswith("more|"):
+                changed = True
+                continue
+            new_row.append(button)
+        if new_row:
+            new_rows.append(new_row)
+    if not changed:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=new_rows)
+
+
+def more_buttonless_markup(
+    message_type: str, payload: Mapping[str, Any] | None = None
+) -> InlineKeyboardMarkup | None:
+    """Construct markup for supported message types without the more button."""
+
+    payload_data: Mapping[str, Any] = payload or {}
+    if message_type == "result":
+        site_url = payload_data.get("site_url")
+        if not site_url:
+            return None
+        return generation_result_keyboard(str(site_url), 0)
+    if message_type == "idle":
+        site_url = payload_data.get("site_url")
+        if not site_url:
+            return None
+        trimmed = remove_more_button(idle_reminder_keyboard(str(site_url)))
+        if trimmed is not None:
+            return trimmed
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=msg.IDLE_REMINDER_BUTTON_GO_SITE,
+                        url=str(site_url),
+                    )
+                ]
+            ]
+        )
+    if message_type == "social":
+        instagram_url = payload_data.get("instagram_url", "")
+        tiktok_url = payload_data.get("tiktok_url", "")
+        trimmed = remove_more_button(
+            social_ad_keyboard(str(instagram_url), str(tiktok_url))
+        )
+        if trimmed is not None:
+            return trimmed
+        rows = []
+        if instagram_url:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=msg.SOCIAL_AD_BTN_INST,
+                        url=str(instagram_url),
+                    )
+                ]
+            )
+        if tiktok_url:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=msg.SOCIAL_AD_BTN_TIKTOK,
+                        url=str(tiktok_url),
+                    )
+                ]
+            )
+        if not rows:
+            return None
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+    return None
 
 
 def contact_request_keyboard() -> ReplyKeyboardMarkup:

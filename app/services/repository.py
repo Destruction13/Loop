@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Generator, Iterable, List, Optional, Tuple
+from typing import Any, Generator, Iterable, List, Optional, Tuple
 
 from app.models import UserContact, UserProfile
 
@@ -226,6 +226,19 @@ class Repository:
         profile.remind_at = when
         await asyncio.to_thread(self._upsert_user, profile)
 
+    async def set_last_more_message(
+        self,
+        user_id: int,
+        message_id: int | None,
+        message_type: str | None,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        profile = await self.ensure_user(user_id)
+        profile.last_more_message_id = message_id
+        profile.last_more_message_type = message_type
+        profile.last_more_message_payload = payload
+        await asyncio.to_thread(self._upsert_user, profile)
+
     async def list_due_reminders(self, now: datetime) -> List[UserProfile]:
         return await asyncio.to_thread(self._list_due_reminders_sync, now)
 
@@ -255,7 +268,10 @@ class Repository:
                     contact_never INTEGER NOT NULL DEFAULT 0,
                     last_activity_ts INTEGER NOT NULL DEFAULT 0,
                     idle_reminder_sent INTEGER NOT NULL DEFAULT 0,
-                    social_ad_shown INTEGER NOT NULL DEFAULT 0
+                    social_ad_shown INTEGER NOT NULL DEFAULT 0,
+                    last_more_message_id INTEGER,
+                    last_more_message_type TEXT,
+                    last_more_message_payload TEXT
                 )
                 """
             )
@@ -310,6 +326,13 @@ class Repository:
         daily_used = row["daily_used"] if row["daily_used"] is not None else tries_used
         if daily_used != tries_used and tries_used >= 0:
             daily_used = tries_used
+        payload_raw = row["last_more_message_payload"] if _has("last_more_message_payload") else None
+        payload_dict = None
+        if payload_raw:
+            try:
+                payload_dict = json.loads(payload_raw)
+            except json.JSONDecodeError:
+                payload_dict = None
         return UserProfile(
             user_id=row["user_id"],
             gender=row["gender"],
@@ -332,6 +355,13 @@ class Repository:
             last_activity_ts=row["last_activity_ts"] if row["last_activity_ts"] else 0,
             idle_reminder_sent=bool(row["idle_reminder_sent"] or 0),
             social_ad_shown=bool(social_ad_raw or 0),
+            last_more_message_id=(
+                row["last_more_message_id"] if _has("last_more_message_id") else None
+            ),
+            last_more_message_type=(
+                row["last_more_message_type"] if _has("last_more_message_type") else None
+            ),
+            last_more_message_payload=payload_dict,
         )
 
     def _get_user_sync(self, user_id: int) -> Optional[UserProfile]:
@@ -362,6 +392,16 @@ class Repository:
             if isinstance(limit_value, int) and limit_value > 0
             else int(self._daily_limit)
         )
+        payload_value = data.get("last_more_message_payload")
+        if payload_value is None:
+            data["last_more_message_payload"] = None
+        elif isinstance(payload_value, str):
+            data["last_more_message_payload"] = payload_value
+        else:
+            try:
+                data["last_more_message_payload"] = json.dumps(payload_value)
+            except TypeError:
+                data["last_more_message_payload"] = None
         with self._connection() as conn:
             conn.execute(
                 """
@@ -386,7 +426,10 @@ class Repository:
                     contact_never,
                     last_activity_ts,
                     idle_reminder_sent,
-                    social_ad_shown
+                    social_ad_shown,
+                    last_more_message_id,
+                    last_more_message_type,
+                    last_more_message_payload
                 )
                 VALUES (
                     :user_id,
@@ -409,7 +452,10 @@ class Repository:
                     :contact_never,
                     :last_activity_ts,
                     :idle_reminder_sent,
-                    :social_ad_shown
+                    :social_ad_shown,
+                    :last_more_message_id,
+                    :last_more_message_type,
+                    :last_more_message_payload
                 )
                 ON CONFLICT(user_id) DO UPDATE SET
                     gender=excluded.gender,
@@ -431,7 +477,10 @@ class Repository:
                     contact_never=excluded.contact_never,
                     last_activity_ts=excluded.last_activity_ts,
                     idle_reminder_sent=excluded.idle_reminder_sent,
-                    social_ad_shown=excluded.social_ad_shown
+                    social_ad_shown=excluded.social_ad_shown,
+                    last_more_message_id=excluded.last_more_message_id,
+                    last_more_message_type=excluded.last_more_message_type,
+                    last_more_message_payload=excluded.last_more_message_payload
                 """,
                 {
                     "user_id": data["user_id"],
@@ -465,6 +514,9 @@ class Repository:
                     "last_activity_ts": data["last_activity_ts"],
                     "idle_reminder_sent": 1 if data["idle_reminder_sent"] else 0,
                     "social_ad_shown": 1 if data["social_ad_shown"] else 0,
+                    "last_more_message_id": data["last_more_message_id"],
+                    "last_more_message_type": data["last_more_message_type"],
+                    "last_more_message_payload": data["last_more_message_payload"],
                 },
             )
             conn.commit()
@@ -722,6 +774,12 @@ class Repository:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN social_ad_shown INTEGER NOT NULL DEFAULT 0"
             )
+        if "last_more_message_id" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN last_more_message_id INTEGER")
+        if "last_more_message_type" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN last_more_message_type TEXT")
+        if "last_more_message_payload" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN last_more_message_payload TEXT")
         if "tries_used" not in columns:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN tries_used INTEGER NOT NULL DEFAULT 0"
