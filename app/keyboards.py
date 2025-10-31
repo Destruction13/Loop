@@ -228,23 +228,17 @@ def idle_reminder_keyboard(site_url: str) -> InlineKeyboardMarkup:
     )
 
 
-def social_ad_keyboard(
-    instagram_url: str, tiktok_url: str
-) -> InlineKeyboardMarkup:
+def social_ad_keyboard(links: Sequence[tuple[str, str]]) -> InlineKeyboardMarkup:
     """Keyboard shown in social media advertisement messages."""
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=msg.SOCIAL_AD_BTN_INST, url=instagram_url)],
-            [InlineKeyboardButton(text=msg.SOCIAL_AD_BTN_TIKTOK, url=tiktok_url)],
-            [
-                InlineKeyboardButton(
-                    text=msg.SOCIAL_AD_BTN_TRY,
-                    callback_data="more|social",
-                )
-            ],
-        ]
-    )
+    rows: list[list[InlineKeyboardButton]] = []
+    for title, url in links:
+        title_clean = title.strip()
+        url_clean = url.strip()
+        if not title_clean or not url_clean:
+            continue
+        rows.append([InlineKeyboardButton(text=title_clean, url=url_clean)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def all_seen_keyboard(site_url: str) -> InlineKeyboardMarkup:
@@ -317,35 +311,23 @@ def more_buttonless_markup(
             ]
         )
     if message_type == "social":
-        instagram_url = payload_data.get("instagram_url", "")
-        tiktok_url = payload_data.get("tiktok_url", "")
-        trimmed = remove_more_button(
-            social_ad_keyboard(str(instagram_url), str(tiktok_url))
-        )
-        if trimmed is not None:
-            return trimmed
-        rows = []
-        if instagram_url:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=msg.SOCIAL_AD_BTN_INST,
-                        url=str(instagram_url),
-                    )
-                ]
-            )
-        if tiktok_url:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=msg.SOCIAL_AD_BTN_TIKTOK,
-                        url=str(tiktok_url),
-                    )
-                ]
-            )
-        if not rows:
+        links_raw = payload_data.get("links")
+        links: list[tuple[str, str]] = []
+        if isinstance(links_raw, Sequence) and not isinstance(links_raw, (str, bytes)):
+            for entry in links_raw:
+                if not isinstance(entry, Mapping):
+                    continue
+                title = str(entry.get("title") or "").strip()
+                url = str(entry.get("url") or "").strip()
+                if title and url:
+                    links.append((title, url))
+        if not links:
+            instagram_url = str(payload_data.get("instagram_url") or "").strip()
+            if instagram_url:
+                links.append(("Instagram", instagram_url))
+        if not links:
             return None
-        return InlineKeyboardMarkup(inline_keyboard=rows)
+        return social_ad_keyboard(links)
     return None
 
 
