@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass(slots=True)
@@ -52,6 +52,9 @@ class UserProfile:
     last_activity_ts: int = 0
     idle_reminder_sent: bool = False
     social_ad_shown: bool = False
+    last_more_message_id: Optional[int] = None
+    last_more_message_type: Optional[str] = None
+    last_more_message_payload: Optional[dict[str, Any]] = None
 
     def remaining(self, limit: int | None = None) -> int:
         """Return remaining tries respecting the current cycle state."""

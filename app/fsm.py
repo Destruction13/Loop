@@ -36,8 +36,10 @@ from app.keyboards import (
     limit_reached_keyboard,
     main_reply_keyboard,
     idle_reminder_keyboard,
+    more_buttonless_markup,
     privacy_policy_keyboard,
     promo_keyboard,
+    remove_more_button,
     send_new_photo_keyboard,
     start_keyboard,
 )
@@ -219,6 +221,7 @@ def setup_router(
             text = f"<b>{msg.IDLE_REMINDER_TITLE}</b>\n{msg.IDLE_REMINDER_BODY}"
             keyboard = idle_reminder_keyboard(site_url)
             try:
+                await _deactivate_previous_more_button(bot, user_id)
                 message = await bot.send_message(
                     chat_id=chat_id,
                     text=text,
@@ -231,6 +234,12 @@ def setup_router(
                 return
             await repository.mark_cycle_nudge_sent(user_id)
             await state.update_data(idle_nudge_message_id=message.message_id)
+            await repository.set_last_more_message(
+                user_id,
+                message.message_id,
+                "idle",
+                {"site_url": site_url},
+            )
         except asyncio.CancelledError:
             raise
         except Exception:  # pragma: no cover - defensive logging
@@ -343,26 +352,29 @@ def setup_router(
     ) -> Message:
         return await send_method(*args, **kwargs)
 
-    def _remove_more_button_from_markup(
-        markup: InlineKeyboardMarkup | None,
-    ) -> InlineKeyboardMarkup | None:
-        if not markup or not markup.inline_keyboard:
-            return None
-        new_rows = []
-        changed = False
-        for row in markup.inline_keyboard:
-            new_row = []
-            for button in row:
-                callback_data = getattr(button, "callback_data", None)
-                if callback_data and callback_data.startswith("more|"):
-                    changed = True
-                    continue
-                new_row.append(button)
-            if new_row:
-                new_rows.append(new_row)
-        if not changed:
-            return None
-        return InlineKeyboardMarkup(inline_keyboard=new_rows)
+    async def _deactivate_previous_more_button(bot: Bot, user_id: int) -> None:
+        profile = await repository.ensure_user(user_id)
+        message_id = profile.last_more_message_id
+        message_type = profile.last_more_message_type
+        if not message_id or not message_type:
+            return
+        markup = more_buttonless_markup(message_type, profile.last_more_message_payload)
+        if markup is None:
+            await repository.set_last_more_message(user_id, None, None, None)
+            return
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=user_id, message_id=message_id, reply_markup=markup
+            )
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            logger.debug(
+                "Failed to update previous more button %s for %s: %s",
+                message_id,
+                user_id,
+                exc,
+            )
+        finally:
+            await repository.set_last_more_message(user_id, None, None, None)
 
     def _render_text(source: str | Sequence[str]) -> str:
         if isinstance(source, (list, tuple)):
@@ -375,6 +387,7 @@ def setup_router(
         prompt_source: str | Sequence[str],
     ) -> None:
         prompt_text = _render_text(prompt_source)
+        await _deactivate_previous_more_button(message.bot, message.chat.id)
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await state.update_data(
             upload=None,
@@ -383,6 +396,7 @@ def setup_router(
             preload_message_id=None,
             generation_progress_message_id=None,
         )
+        await repository.set_last_more_message(message.chat.id, None, None, None)
         await _send_aux_message(
             message,
             state,
@@ -1141,7 +1155,10 @@ def setup_router(
                 message.answer,
                 msg.ASK_PHONE_SKIP_ACK,
             )
-            await _resume_after_contact(message, state, send_generation=True)
+            await _resume_after_contact(message, state, send_generation=False)
+            current_state = await state.get_state()
+            if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
+                await _prompt_for_next_photo(message, state, msg.PHOTO_INSTRUCTION)
             logger.info("%s Contact skip once for %s", EVENT_ID["MODELS_SENT"], user_id)
             return
         if text == msg.ASK_PHONE_BUTTON_NEVER:
@@ -1153,7 +1170,10 @@ def setup_router(
                 message.answer,
                 msg.ASK_PHONE_NEVER_ACK,
             )
-            await _resume_after_contact(message, state, send_generation=True)
+            await _resume_after_contact(message, state, send_generation=False)
+            current_state = await state.get_state()
+            if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
+                await _prompt_for_next_photo(message, state, msg.PHOTO_INSTRUCTION)
             logger.info("%s Contact opt-out for %s", EVENT_ID["MODELS_SENT"], user_id)
             return
         await _handle_manual_phone(message, state, source="manual")
@@ -1367,6 +1387,7 @@ def setup_router(
             model.site_url, keyboard_remaining
         )
         await _delete_state_message(message, state, "generation_progress_message_id")
+        await _deactivate_previous_more_button(message.bot, user_id)
         result_message = await _send_delivery_message(
             message,
             state,
@@ -1389,6 +1410,15 @@ def setup_router(
         await state.update_data(first_generated_today=new_flag)
         contact_data = await state.get_data()
         contact_active_before = contact_data.get("contact_request_active", False)
+        if result_has_more:
+            await repository.set_last_more_message(
+                user_id,
+                result_message.message_id,
+                "result",
+                {"site_url": model.site_url},
+            )
+        else:
+            await repository.set_last_more_message(user_id, None, None, None)
         if plan.outcome is GenerationOutcome.LIMIT:
             limit_text = _render_text(msg.DAILY_LIMIT_MESSAGE)
             await _send_delivery_message(
@@ -1438,7 +1468,7 @@ def setup_router(
         remove_source_message = callback.data in {"more|idle", "more|social"}
         if message:
             current_markup = getattr(message, "reply_markup", None)
-            updated_markup = _remove_more_button_from_markup(current_markup)
+            updated_markup = remove_more_button(current_markup)
             if updated_markup is not None:
                 try:
                     await message.edit_reply_markup(reply_markup=updated_markup)
@@ -1468,6 +1498,7 @@ def setup_router(
                     entry["has_more"] = False
                     stored_results[str(message.message_id)] = entry
                     await state.update_data(result_messages=stored_results)
+            await repository.set_last_more_message(user_id, None, None, None)
         chat_id = message.chat.id if message else user_id
         await _delete_idle_nudge_message(state, callback.bot, chat_id)
         remaining = await repository.remaining_tries(user_id)

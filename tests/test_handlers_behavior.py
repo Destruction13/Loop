@@ -166,8 +166,12 @@ class StubRepository:
         self.locked_until: Optional[datetime] = None
         self.cycle_index: int = 0
         self.nudge_sent: bool = False
+        self.more_buttons: dict[int, tuple[Optional[int], Optional[str], Optional[dict[str, Any]]]] = {}
 
     async def ensure_user(self, user_id: int) -> Any:
+        message_id, message_type, payload = self.more_buttons.get(
+            user_id, (None, None, None)
+        )
         return SimpleNamespace(
             gender=self.gender,
             tries_used=self.tries_used,
@@ -179,6 +183,9 @@ class StubRepository:
             gen_count=self.gen_counts.get(user_id, 0),
             contact_skip_once=self.contact_skip.get(user_id, False),
             contact_never=self.contact_never.get(user_id, False),
+            last_more_message_id=message_id,
+            last_more_message_type=message_type,
+            last_more_message_payload=payload,
         )
 
     async def update_filters(self, user_id: int, gender: str) -> None:
@@ -238,6 +245,15 @@ class StubRepository:
 
     async def mark_cycle_nudge_sent(self, user_id: int) -> None:
         self.nudge_sent = True
+
+    async def set_last_more_message(
+        self,
+        user_id: int,
+        message_id: Optional[int],
+        message_type: Optional[str],
+        payload: Optional[dict[str, Any]],
+    ) -> None:
+        self.more_buttons[user_id] = (message_id, message_type, payload)
 
     async def get_generation_count(self, user_id: int) -> int:
         return self.gen_counts.get(user_id, 0)

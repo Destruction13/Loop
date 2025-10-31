@@ -10,7 +10,7 @@ from typing import Optional
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
-from app.keyboards import idle_reminder_keyboard
+from app.keyboards import idle_reminder_keyboard, more_buttonless_markup
 from app.services.repository import Repository
 from app.texts import messages as msg
 
@@ -83,10 +83,11 @@ class IdleReminderService:
             await self._send_reminder(profile.user_id)
 
     async def _send_reminder(self, user_id: int) -> None:
+        await self._disable_previous_more_button(user_id)
         text = f"<b>{msg.IDLE_REMINDER_TITLE}</b>\n{msg.IDLE_REMINDER_BODY}"
         keyboard = idle_reminder_keyboard(self._site_url)
         try:
-            await self._bot.send_message(
+            message = await self._bot.send_message(
                 chat_id=user_id,
                 text=text,
                 reply_markup=keyboard,
@@ -100,3 +101,34 @@ class IdleReminderService:
             self._logger.exception("Unexpected error sending idle reminder to %s", user_id)
         else:
             await self._repository.mark_idle_reminder_sent(user_id)
+            await self._repository.set_last_more_message(
+                user_id,
+                message.message_id,
+                "idle",
+                {"site_url": self._site_url},
+            )
+
+    async def _disable_previous_more_button(self, user_id: int) -> None:
+        profile = await self._repository.ensure_user(user_id)
+        message_id = profile.last_more_message_id
+        message_type = profile.last_more_message_type
+        if not message_id or not message_type:
+            return
+        markup = more_buttonless_markup(
+            message_type, profile.last_more_message_payload
+        )
+        if markup is None:
+            await self._repository.set_last_more_message(user_id, None, None, None)
+            return
+        try:
+            await self._bot.edit_message_reply_markup(
+                chat_id=user_id,
+                message_id=message_id,
+                reply_markup=markup,
+            )
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            self._logger.debug(
+                "Failed to update previous more button for %s: %s", user_id, exc
+            )
+        finally:
+            await self._repository.set_last_more_message(user_id, None, None, None)
