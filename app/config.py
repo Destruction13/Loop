@@ -300,8 +300,8 @@ def load_config(env_file: str | None = None) -> Config:
         collage=collage,
         batch_size=batch_size,
         batch_layout_cols=batch_columns,
-        pick_scheme=_get("PICK_SCHEME", "GENDER_OR_GENDER_UNISEX")
-        or "GENDER_OR_GENDER_UNISEX",
+        pick_scheme=_get("PICK_SCHEME", "GENDER_AND_UNISEX_ONLY")
+        or "GENDER_AND_UNISEX_ONLY",
         reco_clear_on_catalog_change=_as_bool(_get("RECO_CLEAR_ON_CATALOG_CHANGE", "1"), True),
         reco_no_more_key=_get("MSG_NO_MORE_KEY", "all_seen") or "all_seen",
         contact_reward_rub=contact_reward_rub,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 from pathlib import Path
-from typing import List
+from typing import Iterable, List
 
 from app.models import GlassModel
 from app.services.catalog_base import CatalogBatch, CatalogService, CatalogSnapshot
@@ -117,7 +117,7 @@ def _pick_gender_batch(
     batch_size: int,
     scheme: str,
 ) -> tuple[list[GlassModel], bool]:
-    normalized_scheme = (scheme or "GENDER_OR_GENDER_UNISEX").strip().upper()
+    normalized_scheme = (scheme or "GENDER_AND_UNISEX_ONLY").strip().upper()
     picks: list[GlassModel] = []
     used: set[str] = set()
 
@@ -128,7 +128,13 @@ def _pick_gender_batch(
         schemes.append("GU")
 
     chosen: str | None = None
-    if normalized_scheme == "GENDER_OR_GENDER_UNISEX" and schemes:
+    if normalized_scheme == "GENDER_AND_GENDER_ONLY":
+        if "GG" in schemes:
+            chosen = "GG"
+    elif normalized_scheme == "GENDER_AND_UNISEX_ONLY":
+        if "GU" in schemes:
+            chosen = "GU"
+    elif normalized_scheme == "GENDER_OR_GENDER_UNISEX" and schemes:
         chosen = schemes[0] if len(schemes) == 1 else rng.choice(schemes)
 
     if chosen == "GG":
@@ -234,6 +240,74 @@ def test_pick_scheme_gender_or_unisex(tmp_path: Path) -> None:
         assert len(batch.items) == 1
         assert batch.exhausted is False
         assert batch.items[0].gender == "unisex"
+
+    asyncio.run(scenario())
+
+
+def test_pick_scheme_gender_and_unisex_only(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        repo = Repository(tmp_path / "scheme_gu.db", daily_limit=5)
+        await repo.init()
+        models = [
+            make_model("m1", "male"),
+            make_model("m2", "male"),
+            make_model("u1", "unisex"),
+        ]
+        catalog = DummyCatalog(models)
+
+        settings = RecommendationSettings(
+            batch_size=2,
+            pick_scheme=PickScheme.GENDER_AND_UNISEX_ONLY,
+            clear_on_catalog_change=False,
+        )
+        service = RecommendationService(
+            catalog=catalog,
+            repository=repo,
+            settings=settings,
+            rng=random.Random(3),
+        )
+
+        result = await service.recommend_for_user(1, "male")
+        genders = {model.gender for model in result.models}
+        assert genders == {"male", "unisex"}
+
+        catalog.update([make_model("m3", "male")], "v2")
+        fallback = await service.recommend_for_user(1, "male")
+        assert all(model.gender == "male" for model in fallback.models)
+
+    asyncio.run(scenario())
+
+
+def test_pick_scheme_gender_and_gender_only(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        repo = Repository(tmp_path / "scheme_gg.db", daily_limit=5)
+        await repo.init()
+        models = [
+            make_model("m1", "male"),
+            make_model("m2", "male"),
+            make_model("u1", "unisex"),
+        ]
+        catalog = DummyCatalog(models)
+
+        settings = RecommendationSettings(
+            batch_size=2,
+            pick_scheme=PickScheme.GENDER_AND_GENDER_ONLY,
+            clear_on_catalog_change=False,
+        )
+        service = RecommendationService(
+            catalog=catalog,
+            repository=repo,
+            settings=settings,
+            rng=random.Random(4),
+        )
+
+        result = await service.recommend_for_user(2, "male")
+        assert all(model.gender == "male" for model in result.models)
+
+        catalog.update([make_model("u2", "unisex")], "v2")
+        fallback = await service.recommend_for_user(2, "male")
+        assert fallback.models
+        assert all(model.gender == "unisex" for model in fallback.models)
 
     asyncio.run(scenario())
 

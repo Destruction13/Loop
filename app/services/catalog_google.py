@@ -518,7 +518,7 @@ def _pick_gender_batch(
     batch_size: int,
     scheme: str,
 ) -> tuple[list[GlassModel], bool]:
-    normalized_scheme = (scheme or "GENDER_OR_GENDER_UNISEX").strip().upper()
+    normalized_scheme = (scheme or "GENDER_AND_UNISEX_ONLY").strip().upper()
     picks: list[GlassModel] = []
     used_ids: set[str] = set()
 
@@ -529,7 +529,13 @@ def _pick_gender_batch(
         schemes.append("GU")
 
     chosen_scheme: str | None = None
-    if normalized_scheme == "GENDER_OR_GENDER_UNISEX" and schemes:
+    if normalized_scheme == "GENDER_AND_GENDER_ONLY":
+        if "GG" in schemes:
+            chosen_scheme = "GG"
+    elif normalized_scheme == "GENDER_AND_UNISEX_ONLY":
+        if "GU" in schemes:
+            chosen_scheme = "GU"
+    elif normalized_scheme == "GENDER_OR_GENDER_UNISEX" and schemes:
         if len(schemes) == 1:
             chosen_scheme = schemes[0]
         else:
