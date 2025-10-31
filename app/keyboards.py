@@ -36,7 +36,9 @@ def start_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def main_reply_keyboard(policy_url: str | None = None) -> ReplyKeyboardMarkup:
+def main_reply_keyboard(
+    policy_url: str | None = None, *, show_try_button: bool = True
+) -> ReplyKeyboardMarkup:
     """Persistent reply keyboard with quick actions."""
 
     sanitized = (policy_url or "").strip()
@@ -48,13 +50,15 @@ def main_reply_keyboard(policy_url: str | None = None) -> ReplyKeyboardMarkup:
     else:
         policy_button = KeyboardButton(text=msg.MAIN_MENU_POLICY_BUTTON)
 
+    rows: list[list[KeyboardButton]] = []
+    if show_try_button:
+        rows.append([KeyboardButton(text=msg.MAIN_MENU_TRY_BUTTON)])
+    rows.append([policy_button])
+
     return ReplyKeyboardMarkup(
         resize_keyboard=True,
         one_time_keyboard=False,
-        keyboard=[
-            [KeyboardButton(text=msg.MAIN_MENU_TRY_BUTTON)],
-            [policy_button],
-        ],
+        keyboard=rows,
     )
 
 

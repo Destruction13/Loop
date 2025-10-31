@@ -495,8 +495,10 @@ def get_message_handler(router: Any, name: str):
     raise AssertionError(f"Message handler {name} not found")
 
 
-def assert_main_menu_keyboard(markup: Any) -> None:
-    expected = main_reply_keyboard(TEST_PRIVACY_POLICY_URL)
+def assert_main_menu_keyboard(markup: Any, *, show_try_button: bool = True) -> None:
+    expected = main_reply_keyboard(
+        TEST_PRIVACY_POLICY_URL, show_try_button=show_try_button
+    )
     assert hasattr(markup, "keyboard")
     assert markup.keyboard == expected.keyboard
 
@@ -518,7 +520,7 @@ def test_select_gender_deletes_prompt_and_waits_for_photo(tmp_path: Path) -> Non
         assert repository.updated_filters == [(123, "male")]
         assert bot.deleted == [(123, message.message_id)]
         assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
-        assert_main_menu_keyboard(message.answers[-1][1])
+        assert_main_menu_keyboard(message.answers[-1][1], show_try_button=False)
 
     asyncio.run(scenario())
 
@@ -1110,7 +1112,7 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
             rub=1000, promo="PROMO1000"
         )
         assert_main_menu_keyboard(contact_message.answers[0][1])
-        assert contact_message.answers[1][0] == "".join(msg.NEXT_RESULT_CAPTION)
+        assert contact_message.answers[1][0] == "".join(msg.THIRD_RESULT_CAPTION)
         assert_main_menu_keyboard(contact_message.answers[1][1])
 
     asyncio.run(scenario())
