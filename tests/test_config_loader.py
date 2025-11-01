@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app.config import DEFAULT_NANOBANANA_API_KEY, SocialLink, load_config
+from app.config import SocialLink, load_config
 
 
 def test_load_config_reads_allowed_env(tmp_path, monkeypatch) -> None:
@@ -17,6 +17,7 @@ def test_load_config_reads_allowed_env(tmp_path, monkeypatch) -> None:
                 "CATALOG_ROW_LIMIT=15",
                 "PICK_SCHEME=GENDER_AND_GENDER_ONLY",
                 'SOCIAL_LINKS_JSON=[{"title":"One","url":"https://example.com/one"}]',
+                "NANOBANANA_API_KEY=super-secret",
                 "GOOGLE_SERVICE_ACCOUNT_JSON=custom_creds.json",
             ]
         ),
@@ -67,14 +68,23 @@ def test_load_config_reads_allowed_env(tmp_path, monkeypatch) -> None:
     assert config.collage.slot_width == 1080
     assert config.collage.output_format == "PNG"
     assert config.contact_reward_rub == 1000
-    assert config.nanobanana_api_key == DEFAULT_NANOBANANA_API_KEY
+    assert config.nanobanana_api_key == "super-secret"
     assert config.enable_leads_export is True
     assert config.enable_social_ad is True
 
 
 def test_load_config_defaults_without_optional_env(tmp_path, monkeypatch) -> None:
     env_file = tmp_path / ".env"
-    env_file.write_text("BOT_TOKEN=minimal", encoding="utf-8")
+    env_file.write_text(
+        "\n".join(
+            [
+                "BOT_TOKEN=minimal",
+                "NANOBANANA_API_KEY=hidden",
+                "GOOGLE_SHEET_URL=https://docs.google.com/spreadsheets/d/EXAMPLE/edit?gid=0",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     for name in (
         "BOT_TOKEN",
@@ -87,13 +97,17 @@ def test_load_config_defaults_without_optional_env(tmp_path, monkeypatch) -> Non
         "PICK_SCHEME",
         "GOOGLE_SHEET_URL",
         "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "NANOBANANA_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
     config = load_config(str(env_file))
 
     assert config.bot_token == "minimal"
-    assert config.sheet_csv_url == "https://docs.google.com/spreadsheets/d/e/2PACX-1vRT2CXRcmWxmWHKADYfHTadlxBUZ-R7nEX7HcAqrBo_PzSKYrCln4HFeCUJTB2q_C7asfwO7AOLNiwh/pub?output=csv"
-    assert config.catalog_sheet_id is None
+    assert (
+        config.sheet_csv_url
+        == "https://docs.google.com/spreadsheets/d/EXAMPLE/edit?gid=0"
+    )
+    assert config.catalog_sheet_id == "EXAMPLE"
     assert config.catalog_row_limit is None
     assert config.site_url == "https://loov.ru/"
     assert config.promo_code == ""
@@ -101,5 +115,9 @@ def test_load_config_defaults_without_optional_env(tmp_path, monkeypatch) -> Non
     assert config.daily_try_limit == 7
     assert config.pick_scheme == "UNIVERSAL"
     assert config.social_links == ()
-    assert config.google_service_account_json == Path("service_account.json")
-    assert config.contacts_sheet_url is None
+    assert config.google_service_account_json is None
+    assert (
+        config.contacts_sheet_url
+        == "https://docs.google.com/spreadsheets/d/EXAMPLE/edit?gid=0"
+    )
+    assert config.nanobanana_api_key == "hidden"

@@ -5,16 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
 
-import re
-from urllib.parse import urlparse, parse_qs
 
 def _extract_sheet_id_and_gid(url_or_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """
@@ -41,15 +41,7 @@ def _extract_sheet_id_and_gid(url_or_id: Optional[str]) -> tuple[Optional[str], 
         return sheet_id, gid
     except Exception:
         return None, None
-
-
-DEFAULT_SHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/e/2PACX-1vRT2CXRcmWxmWHKADYfHTadlxBUZ-"
-    "R7nEX7HcAqrBo_PzSKYrCln4HFeCUJTB2q_C7asfwO7AOLNiwh/pub?output=csv"
-)
-
 DEFAULT_PRIVACY_POLICY_URL = "https://telegra.ph/Politika-konfidencialnosti-LOOV-10-29"
-DEFAULT_NANOBANANA_API_KEY = "AIzaSyDYraCxBjpE0423vV-pn2RhdWiQhgtVwEI"
 
 
 @dataclass(slots=True)
@@ -180,7 +172,14 @@ def load_config(env_file: str | None = None) -> Config:
         load_dotenv()
 
     google_sheet_url = _get("GOOGLE_SHEET_URL")
-    sheet_csv_url = _get("SHEET_CSV_URL") or google_sheet_url or DEFAULT_SHEET_URL
+    sheet_csv_url = _get("SHEET_CSV_URL")
+    if not sheet_csv_url:
+        if google_sheet_url:
+            sheet_csv_url = google_sheet_url
+        else:
+            raise RuntimeError(
+                "Environment variable SHEET_CSV_URL is required when GOOGLE_SHEET_URL is absent"
+            )
 
     catalog_sheet_id: Optional[str] = None
     catalog_sheet_gid: Optional[str] = None
@@ -211,11 +210,7 @@ def load_config(env_file: str | None = None) -> Config:
     pick_scheme = (pick_scheme_raw or "UNIVERSAL").strip() or "UNIVERSAL"
 
     google_credentials_raw = _get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    google_credentials_path = (
-        Path(google_credentials_raw)
-        if google_credentials_raw
-        else Path("service_account.json")
-    )
+    google_credentials_path = Path(google_credentials_raw) if google_credentials_raw else None
 
     landing_url = _get("LANDING_URL")
     site_url = landing_url.strip() if landing_url else "https://loov.ru/"
@@ -239,7 +234,7 @@ def load_config(env_file: str | None = None) -> Config:
         uploads_root=Path("./uploads"),
         results_root=Path("./results"),
         button_title_max=28,
-        nanobanana_api_key=DEFAULT_NANOBANANA_API_KEY,
+        nanobanana_api_key=_get("NANOBANANA_API_KEY", required=True),
         collage=CollageConfig(
             slot_width=1080,
             slot_height=1440,
