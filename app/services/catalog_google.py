@@ -6,7 +6,7 @@ import asyncio
 import csv
 import hashlib
 import io
-import logging
+from logger import get_logger, log_event
 import random
 import time
 from dataclasses import dataclass
@@ -24,7 +24,7 @@ from app.services.catalog_base import (
 )
 from app.utils.drive import DriveFolderUrlError, DriveUrlError, drive_view_to_direct
 
-LOGGER = logging.getLogger("loop_bot.catalog.google")
+LOGGER = get_logger("sheets.catalog")
 
 
 def _normalize_header(value: str) -> str:
@@ -200,16 +200,42 @@ class GoogleSheetCatalog(CatalogService):
                     models=list(cached_snapshot.models),
                     version_hash=cached_snapshot.version_hash,
                 )
-            csv_content = await self._fetch_csv()
-            models = self._parse_csv(csv_content)
+            try:
+                csv_content = await self._fetch_csv()
+                models = self._parse_csv(csv_content)
+            except CatalogError as exc:
+                LOGGER.error(
+                    "Не удалось загрузить или разобрать каталог: %s",
+                    exc,
+                    extra={"stage": "SHEET_PARSE_ERROR"},
+                )
+                log_event(
+                    "ERROR",
+                    "sheets.load",
+                    f"Ошибка при загрузке таблицы: {exc}",
+                    stage="SHEET_PARSE_ERROR",
+                    extra={"error": str(exc)},
+                )
+                raise
+
             version_hash = _compute_version_hash(models)
             snapshot = CatalogSnapshot(models=list(models), version_hash=version_hash)
             self._cache = (time.monotonic(), snapshot)
             LOGGER.info(
-                "Catalog cache refreshed with %s entries (payload %s bytes, hash=%s)",
+                "Каталог обновлён: %s записей (хэш %s)",
                 len(models),
-                len(csv_content.encode("utf-8")),
                 version_hash,
+                extra={
+                    "stage": "SHEET_PARSE_OK",
+                    "payload": {"rows": len(models), "hash": version_hash},
+                },
+            )
+            log_event(
+                "INFO",
+                "sheets.load",
+                f"✅ Подгрузил таблицу — {len(models)} строк",
+                stage="SHEET_LOADED",
+                extra={"rows": len(models), "hash": version_hash},
             )
             return CatalogSnapshot(models=list(models), version_hash=version_hash)
 

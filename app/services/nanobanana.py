@@ -11,6 +11,11 @@ from typing import Any
 
 import aiohttp
 
+from logger import get_logger
+
+
+LOGGER = get_logger("generation.nanobanana")
+
 SYSTEM_PROMPT = (
     "Take the first image as the base photo (it can be a human, animal, or any face).\n"
     "Take the second image as the glasses reference.\n"
@@ -120,6 +125,7 @@ def configure(api_key: str) -> None:
     if not sanitized:
         raise RuntimeError("NANOBANANA_API_KEY is not configured")
     _API_KEY = sanitized
+    LOGGER.info("API NanoBanana сконфигурирован", extra={"stage": "NANO_CONFIG"})
 
 
 async def generate_glasses(face_path: str, glasses_path: str) -> GenerationSuccess:

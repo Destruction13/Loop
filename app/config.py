@@ -42,6 +42,7 @@ def _extract_sheet_id_and_gid(url_or_id: Optional[str]) -> tuple[Optional[str], 
     except Exception:
         return None, None
 DEFAULT_PRIVACY_POLICY_URL = "https://telegra.ph/Politika-konfidencialnosti-LOOV-10-29"
+DEFAULT_LANDING_URL = "https://loov.ru/"
 
 
 @dataclass(slots=True)
@@ -200,20 +201,27 @@ def load_config(env_file: str | None = None) -> Config:
         load_dotenv()
 
     bot_token = _require_env("BOT_TOKEN")
-    sheet_csv_url = _require_url("SHEET_CSV_URL")
-    landing_url = _require_url("LANDING_URL")
+    sheet_csv_url_override = _optional_env("SHEET_CSV_URL")
+    google_sheet_url = _require_url("GOOGLE_SHEET_URL")
+    sheet_csv_url = (
+        _require_url("SHEET_CSV_URL") if sheet_csv_url_override else google_sheet_url
+    )
+    landing_url_raw = _optional_env("LANDING_URL", DEFAULT_LANDING_URL) or DEFAULT_LANDING_URL
+    landing_parsed = urlparse(landing_url_raw)
+    if landing_parsed.scheme not in {"http", "https"} or not landing_parsed.netloc:
+        raise RuntimeError("LANDING_URL must be a valid HTTP(S) URL")
+    landing_url = landing_url_raw
     social_links_json = _optional_env("SOCIAL_LINKS_JSON", "[]") or "[]"
     social_links = _parse_social_links(social_links_json)
     nanobanana_api_key = _require_env("NANOBANANA_API_KEY")
     promo_code = _optional_env("PROMO_CODE", "") or ""
-    daily_try_limit = _parse_int_env("DAILY_TRY_LIMIT", 50, minimum=1)
+    daily_try_limit = _parse_int_env("DAILY_TRY_LIMIT", 7, minimum=1)
     catalog_row_raw = _parse_int_env("CATALOG_ROW_LIMIT", 0, minimum=0)
     catalog_row_limit = catalog_row_raw or None
     pick_scheme_raw = _optional_env("PICK_SCHEME", "UNIVERSAL") or "UNIVERSAL"
     pick_scheme = pick_scheme_raw.strip() or "UNIVERSAL"
-    google_sheet_url = _require_url("GOOGLE_SHEET_URL")
-    google_credentials_raw = _require_env("GOOGLE_SERVICE_ACCOUNT_JSON")
-    google_credentials_path = Path(google_credentials_raw)
+    google_credentials_raw = _optional_env("GOOGLE_SERVICE_ACCOUNT_JSON")
+    google_credentials_path = Path(google_credentials_raw) if google_credentials_raw else None
 
     catalog_sheet_id, catalog_sheet_gid = _extract_sheet_id_and_gid(google_sheet_url)
 
