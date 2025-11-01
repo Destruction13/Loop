@@ -13,6 +13,8 @@ from typing import Any, Dict, Mapping, MutableMapping
 
 from rich.console import Console
 from rich.logging import RichHandler
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(), override=False)
 
 
 _REQUEST_ID: ContextVar[str | None] = ContextVar("request_id", default=None)
