@@ -68,7 +68,7 @@ from app.services.nanobanana import (
 from app.services.recommendation import RecommendationService
 from app.utils.phone import normalize_phone
 from app.texts import messages as msg
-from logger import get_logger, log_event
+from logger import get_logger, info_domain
 
 
 class TryOnStates(StatesGroup):
@@ -507,10 +507,13 @@ def setup_router(
             prompt_text,
             reply_markup=contact_request_keyboard(),
         )
-        logger.info(
-            "📨 Пользователю %s предложен сбор контакта",
-            user_id,
-            extra={"stage": "MODELS_SENT"},
+        logger.debug("Contact request issued for user %s", user_id)
+        info_domain(
+            "bot.handlers",
+            "⛔ Генерация пропущена — причина=contact_request",
+            stage="GENERATION_SKIPPED",
+            user_id=user_id,
+            pending_state=pending_state or current_state,
         )
         return True
 
@@ -556,6 +559,13 @@ def setup_router(
             )
             await state.update_data(current_models=[], last_batch=[])
             await _delete_state_message(message, state, "preload_message_id")
+            info_domain(
+                "bot.handlers",
+                "⛔ Генерация пропущена — причина=no_models",
+                stage="GENERATION_SKIPPED",
+                user_id=user_id,
+                gender=filters.gender,
+            )
             return False
         batch = list(result.models)
         await state.update_data(current_models=batch, last_batch=batch)
@@ -734,11 +744,10 @@ def setup_router(
                 ),
                 track=False,
             )
-            logger.info(
-                "📇 Контакт сохранён для пользователя %s (источник %s)",
+            logger.debug(
+                "Contact stored for user %s (source=%s)",
                 user_id,
                 source,
-                extra={"stage": "CONTACT_STORED"},
             )
             await _resume_after_contact(message, state, send_generation=False)
             current_state = await state.get_state()
@@ -773,11 +782,7 @@ def setup_router(
                 message.answer,
                 msg.ASK_PHONE_ALREADY_HAVE,
             )
-            logger.info(
-                "Контакт уже существовал для пользователя %s",
-                user_id,
-                extra={"stage": "CONTACT_EXISTS"},
-            )
+            logger.debug("Contact already existed for user %s", user_id)
         await _resume_after_contact(message, state, send_generation=True)
 
     async def _handle_manual_phone(
@@ -871,12 +876,11 @@ def setup_router(
                 reply_markup=keyboard,
             )
             return
-        logger.info(
-            "📦 Отправлена подборка %sx%s для моделей %s",
+        logger.debug(
+            "Batch %sx%s delivered for models %s",
             collage_config.width,
             collage_config.height,
             [model.unique_id for model in group],
-            extra={"stage": "MODELS_SENT"},
         )
 
     async def _send_batch_as_photos(
@@ -1017,10 +1021,9 @@ def setup_router(
                         extra={"stage": "PROMO_VIDEO_MISSING"},
                     )
                     promo_video_missing_warned = True
-        logger.info(
-            "Параметры промо-видео: %s",
+        logger.debug(
+            "Promo video parameters: %s",
             json.dumps(promo_video_log, ensure_ascii=False),
-            extra={"stage": "PROMO_VIDEO_INFO"},
         )
 
         if not start_message_sent:
@@ -1038,10 +1041,11 @@ def setup_router(
             msg.MAIN_MENU_HINT,
             reply_markup=main_reply_keyboard(policy_url, show_try_button=False),
         )
-        logger.info(
-            "👋 Пользователь %s открыл стартовое меню",
-            message.from_user.id,
-            extra={"stage": "USER_START"},
+        info_domain(
+            "bot.handlers",
+            "👤 Пользователь открыл старт",
+            stage="USER_START",
+            user_id=message.from_user.id,
         )
 
     @router.callback_query(StateFilter(TryOnStates.START), F.data == "start_go")
@@ -1080,10 +1084,11 @@ def setup_router(
             msg.PHOTO_INSTRUCTION,
         )
         await callback.answer()
-        logger.info(
-            "⚙️ Пользователь выбрал фильтр %s",
-            gender,
-            extra={"stage": "FILTER_SELECTED"},
+        info_domain(
+            "bot.handlers",
+            f"⚙️ Выбор: пол={gender}",
+            stage="FILTER_SELECTED",
+            user_id=callback.from_user.id,
         )
 
     @router.message(StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT), ~F.photo)
@@ -1114,10 +1119,11 @@ def setup_router(
                 _render_text(msg.DAILY_LIMIT_MESSAGE),
                 reply_markup=limit_reached_keyboard(site_url),
             )
-            logger.info(
-                "⛔ Пользователь %s достиг лимита попыток",
-                user_id,
-                extra={"stage": "LIMIT_REACHED"},
+            info_domain(
+                "bot.handlers",
+                "🔒 Достигнут дневной лимит",
+                stage="DAILY_LIMIT",
+                user_id=user_id,
             )
             return
         await _delete_idle_nudge_message(state, message.bot, message.chat.id)
@@ -1132,11 +1138,6 @@ def setup_router(
         if not defer_contact_reminder and await _maybe_request_contact(
             message, state, user_id
         ):
-            logger.info(
-                "Запрос контакта поставлен в очередь для пользователя %s",
-                user_id,
-                extra={"stage": "MODELS_SENT"},
-            )
             return
         preload_message = await _send_aux_message(
             message,
@@ -1152,13 +1153,12 @@ def setup_router(
             state,
             skip_contact_prompt=True,
         )
-        log_event(
-            "INFO",
+        info_domain(
             "bot.handlers",
-            "📸 Пользователь отправил фото",
-            user_id=user_id,
+            "🖼️ Фото получено",
             stage="USER_SENT_PHOTO",
-            extra={"remaining": remaining},
+            user_id=user_id,
+            remaining=remaining,
         )
 
     @router.callback_query(StateFilter(TryOnStates.AWAITING_PHOTO), F.data == "send_new_photo")
@@ -1203,6 +1203,13 @@ def setup_router(
                 callback.message.answer,
                 _render_text(msg.DAILY_LIMIT_MESSAGE),
                 reply_markup=limit_reached_keyboard(site_url),
+            )
+            info_domain(
+                "bot.handlers",
+                "🔒 Достигнут дневной лимит",
+                stage="DAILY_LIMIT",
+                user_id=callback.from_user.id,
+                context="model_pick",
             )
             await callback.answer()
             return
@@ -1258,11 +1265,7 @@ def setup_router(
             current_state = await state.get_state()
             if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
                 await _prompt_for_next_photo(message, state, msg.ASK_PHONE_SKIP_ACK)
-            logger.info(
-                "Пользователь %s временно пропустил ввод контакта",
-                user_id,
-                extra={"stage": "CONTACT_SKIP_ONCE"},
-            )
+            logger.debug("User %s skipped contact once", user_id)
             return
         if text == msg.ASK_PHONE_BUTTON_NEVER:
             await repository.set_contact_never(user_id, True)
@@ -1271,11 +1274,7 @@ def setup_router(
             current_state = await state.get_state()
             if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
                 await _prompt_for_next_photo(message, state, msg.ASK_PHONE_NEVER_ACK)
-            logger.info(
-                "Пользователь %s отказался оставлять контакт",
-                user_id,
-                extra={"stage": "CONTACT_NEVER"},
-            )
+            logger.debug("User %s opted out of contacts", user_id)
             return
         await _handle_manual_phone(message, state, source="manual")
 
@@ -1348,13 +1347,11 @@ def setup_router(
             await _edit_progress(msg.PROGRESS_SENDING_TO_GENERATION)
             await _edit_progress(msg.PROGRESS_WAIT_GENERATION)
 
-            log_event(
-                "INFO",
+            info_domain(
                 "generation.nano",
-                "🚀 Начата генерация образа",
-                user_id=user_id,
+                f"🛠️ Генерация запущена — frame={model.unique_id}",
                 stage="GENERATION_STARTED",
-                extra={"model_id": model.unique_id},
+                user_id=user_id,
             )
 
             start_time = time.perf_counter()
@@ -1367,20 +1364,17 @@ def setup_router(
             latency_ms = int((time.perf_counter() - start_time) * 1000)
             result_bytes = generation_result.image_bytes
             result_kb = len(result_bytes) / 1024 if result_bytes else 0
-            log_event(
-                "INFO",
+            info_domain(
                 "generation.nano",
-                "✅ Генерация завершена",
-                user_id=user_id,
+                f"✅ Генерация готова — {latency_ms} ms",
                 stage="GENERATION_FINISHED",
-                extra={
-                    "model_id": model.unique_id,
-                    "latency_ms": latency_ms,
-                    "result_kb": round(result_kb, 1),
-                    "finish_reason": generation_result.finish_reason,
-                    "attempt": generation_result.attempt,
-                    "retried": generation_result.retried,
-                },
+                user_id=user_id,
+                model_id=model.unique_id,
+                latency_ms=latency_ms,
+                result_kb=round(result_kb, 1),
+                finish_reason=generation_result.finish_reason,
+                attempt=generation_result.attempt,
+                retried=generation_result.retried,
             )
 
         except NanoBananaGenerationError as exc:
@@ -1439,8 +1433,8 @@ def setup_router(
                 latency_ms,
                 exc_info=True,
                 extra={
-                    "stage": "GENERATION_FAILED",
-                    "payload": {"model_id": model.unique_id},
+                    "stage": "NANO_ERROR",
+                    "payload": {"model_id": model.unique_id, "latency_ms": latency_ms},
                 },
             )
             await _delete_state_message(message, state, "generation_progress_message_id")
@@ -1550,10 +1544,12 @@ def setup_router(
                 await state.update_data(contact_pending_result_state="limit")
             else:
                 await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
-            logger.info(
-                "⛔ Пользователь %s достиг лимита после генерации",
-                user_id,
-                extra={"stage": "LIMIT_REACHED"},
+            info_domain(
+                "bot.handlers",
+                "🔒 Достигнут дневной лимит",
+                stage="DAILY_LIMIT",
+                user_id=user_id,
+                context="post_generation",
             )
         else:
             contact_requested_now = False
@@ -1579,23 +1575,20 @@ def setup_router(
                     origin_state=TryOnStates.RESULT.state,
                 )
                 if contact_requested_now:
-                    logger.info(
-                        "Запрос контакта отправлен после генерации для пользователя %s",
+                    logger.debug(
+                        "Deferred contact request sent after generation for user %s",
                         user_id,
-                        extra={"stage": "MODELS_SENT"},
                     )
 
             if contact_active_before and not contact_requested_now:
                 await state.update_data(contact_pending_result_state="result")
             elif not contact_requested_now:
                 await state.set_state(TryOnStates.RESULT)
-        log_event(
-            "INFO",
-            "generation.nano",
-            "🏁 Результат генерации отправлен пользователю",
-            user_id=user_id,
-            stage="GENERATION_RESULT_SENT",
-            extra={"model_id": model.unique_id, "remaining": plan.remaining},
+        logger.debug(
+            "Generation result delivered to user %s (model=%s remaining=%s)",
+            user_id,
+            model.unique_id,
+            plan.remaining,
         )
 
     @router.callback_query(F.data.startswith("more|"))
@@ -1648,6 +1641,13 @@ def setup_router(
                 _render_text(msg.DAILY_LIMIT_MESSAGE),
                 reply_markup=limit_reached_keyboard(site_url),
             )
+            info_domain(
+                "bot.handlers",
+                "🔒 Достигнут дневной лимит",
+                stage="DAILY_LIMIT",
+                user_id=user_id,
+                context="more_button",
+            )
             await callback.answer()
             return
         if message:
@@ -1683,6 +1683,13 @@ def setup_router(
                 message.answer,
                 _render_text(msg.DAILY_LIMIT_MESSAGE),
                 reply_markup=limit_reached_keyboard(site_url),
+            )
+            info_domain(
+                "bot.handlers",
+                "🔒 Достигнут дневной лимит",
+                stage="DAILY_LIMIT",
+                user_id=user_id,
+                context="try_button",
             )
             return
         gen_count = await repository.get_generation_count(user_id)
@@ -1738,11 +1745,7 @@ def setup_router(
             msg.REMINDER_CONFIRMATION,
         )
         await callback.answer()
-        logger.info(
-            "🔔 Запланировано напоминание для пользователя %s",
-            user_id,
-            extra={"stage": "REMINDER_SCHEDULED"},
-        )
+        logger.debug("Scheduled reminder for user %s", user_id)
 
     @router.callback_query(F.data == "reminder_go")
     async def reminder_go(callback: CallbackQuery, state: FSMContext) -> None:

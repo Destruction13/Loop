@@ -27,7 +27,7 @@ from app.texts import messages as msg
 from app.utils.paths import ensure_dir
 from app.services.recommendation import PickScheme, RecommendationService, RecommendationSettings
 from app.infrastructure.logging_middleware import LoggingMiddleware
-from logger import get_logger, log_event, setup_logging
+from logger import get_logger, info_domain, log_event, setup_logging
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -38,7 +38,7 @@ async def _run_polling(dp: Dispatcher, bot: Bot, logger: Logger) -> None:
     stop_waiter = asyncio.create_task(stop_event.wait())
 
     def _handle_signal(sig: signal.Signals) -> None:
-        logger.info("Received %s signal. Shutting down...", sig.name)
+        logger.debug("Received %s signal. Shutting down...", sig.name)
         stop_event.set()
 
     signals = (signal.SIGINT, signal.SIGTERM)
@@ -58,7 +58,7 @@ async def _run_polling(dp: Dispatcher, bot: Bot, logger: Logger) -> None:
     )
 
     if stop_waiter in done and not polling_task.done():
-        logger.info("Stopping polling loop gracefully...")
+        logger.debug("Stopping polling loop gracefully...")
         await dp.stop_polling()
 
     await asyncio.gather(polling_task, return_exceptions=False)
@@ -78,6 +78,15 @@ async def main() -> None:
     config = load_config()
     setup_logging()
     logger = get_logger("bot.start")
+
+    info_domain(
+        "bot.start",
+        "🧩 Конфиг загружен",
+        stage="CONFIG_OK",
+        leads_export=config.enable_leads_export,
+        idle_reminder=config.enable_idle_reminder,
+        social_ad=config.enable_social_ad,
+    )
 
     ensure_dir((PROJECT_ROOT / config.uploads_root).resolve())
     ensure_dir((PROJECT_ROOT / config.results_root).resolve())
@@ -210,7 +219,7 @@ async def main() -> None:
         )
         social_ad.start()
 
-    log_event("INFO", "bot.start", "✅ Бот запущен", stage="BOT_STARTED")
+    info_domain("bot.start", "✅ Бот запущен", stage="BOT_STARTED")
     try:
         await _run_polling(dp, bot, logger)
     finally:

@@ -6,6 +6,7 @@ import logging
 import os
 from contextvars import ContextVar
 from datetime import datetime
+from logging import Filter
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Mapping, MutableMapping
@@ -230,6 +231,15 @@ class _SheetAppender:
 _INTERNAL_LOGGER = logging.getLogger("loov.logger.internal")
 
 
+class _DomainInfoFilter(Filter):
+    """Allow INFO records only when marked as domain milestones."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401 - standard interface
+        if record.levelno != logging.INFO:
+            return True
+        return bool(getattr(record, "domain", False))
+
+
 def setup_logging() -> logging.Logger:
     """Configure logging once for the entire application."""
 
@@ -261,6 +271,10 @@ def setup_logging() -> logging.Logger:
     )
     console_handler.setFormatter(formatter_console)
 
+    noise_mode = os.getenv("LOG_NOISE", "low").strip().lower() or "low"
+    if noise_mode != "debug":
+        console_handler.addFilter(_DomainInfoFilter())
+
     logs_dir = Path(__file__).resolve().parent / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     file_handler = RotatingFileHandler(
@@ -278,6 +292,13 @@ def setup_logging() -> logging.Logger:
     root.addHandler(file_handler)
     root.addHandler(sheet_handler)
 
+    # Silence verbose third-party loggers.
+    logging.getLogger("aiogram").setLevel(logging.WARNING)
+    logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+    logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+
     root._loov_configured = True  # type: ignore[attr-defined]
     return root
 
@@ -285,6 +306,28 @@ def setup_logging() -> logging.Logger:
 def get_logger(name: str) -> logging.LoggerAdapter:
     base = logging.getLogger(name)
     return _ContextLoggerAdapter(base, {"module_name": name})
+
+
+def info_domain(
+    module: str,
+    message: str,
+    *,
+    stage: str | None = None,
+    user_id: int | str | None = None,
+    **context: Any,
+) -> None:
+    """Log a milestone INFO message visible in console output."""
+
+    logger = get_logger(module)
+    extra: Dict[str, Any] = {"domain": True}
+    if stage:
+        extra["stage"] = stage
+    if context:
+        extra["payload"] = context
+    kwargs: Dict[str, Any] = {"extra": extra}
+    if user_id is not None:
+        kwargs["user_id"] = user_id
+    logger.info(message, **kwargs)
 
 
 def log_event(
@@ -333,6 +376,7 @@ def reset_context(tokens: Mapping[str, Any]) -> None:
 __all__ = [
     "setup_logging",
     "get_logger",
+    "info_domain",
     "log_event",
     "bind_context",
     "reset_context",

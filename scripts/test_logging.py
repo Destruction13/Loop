@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import asyncio
 
-from logger import get_logger, log_event, setup_logging
+from logger import info_domain, log_event, setup_logging
 
 
 async def main() -> None:
     setup_logging()
-    logger = get_logger("scripts.test")
-    logger.info("🧪 Тестовый информационный лог", extra={"stage": "TEST_INFO"})
+    info_domain("scripts.test", "🧪 Тестовый milestone", stage="TEST_INFO")
     log_event(
         "WARNING",
         "scripts.test",

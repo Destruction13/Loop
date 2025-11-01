@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
-
-import re
-from urllib.parse import urlparse, parse_qs
-
-from logger import get_logger, log_event
+from logger import get_logger, info_domain
 
 def _extract_sheet_id(url_or_id: str | None) -> str | None:
     if not url_or_id:
@@ -74,6 +72,13 @@ class LeadsExporter:
                 "Экспорт лидов отключён; пропускаем запись",
                 extra={"stage": "EXPORT_LEAD_DISABLED"},
             )
+            info_domain(
+                "leads.export",
+                "📤 Экспорт лида — пропуск",
+                stage="LEAD_EXPORT",
+                user_id=payload.tg_user_id,
+                reason="disabled",
+            )
             return False
         if not payload.phone_e164:
             self._logger.debug(
@@ -83,14 +88,28 @@ class LeadsExporter:
                     "payload": {"user_id": payload.tg_user_id},
                 },
             )
+            info_domain(
+                "leads.export",
+                "📤 Экспорт лида — пропуск",
+                stage="LEAD_EXPORT",
+                user_id=payload.tg_user_id,
+                reason="no_phone",
+            )
             return False
         if not self._spreadsheet_id or not self._credentials_path:
             self._logger.warning(
                 "Не задан spreadsheet ID или путь к ключу — экспорт лидов пропущен",
                 extra={
-                    "stage": "EXPORT_LEAD_CONFIG_MISSING",
+                    "stage": "EXPORT_ERROR",
                     "payload": {"user_id": payload.tg_user_id},
                 },
+            )
+            info_domain(
+                "leads.export",
+                "📤 Экспорт лида — пропуск",
+                stage="LEAD_EXPORT",
+                user_id=payload.tg_user_id,
+                reason="config_missing",
             )
             return False
         try:
@@ -100,7 +119,7 @@ class LeadsExporter:
                 "Библиотеки для экспорта лидов не установлены: %s",
                 exc,
                 extra={
-                    "stage": "EXPORT_LEAD_ERROR",
+                    "stage": "EXPORT_ERROR",
                     "payload": {"user_id": payload.tg_user_id},
                 },
             )
@@ -110,18 +129,17 @@ class LeadsExporter:
                 "Не удалось записать лид в таблицу: %s",
                 exc,
                 extra={
-                    "stage": "EXPORT_LEAD_ERROR",
+                    "stage": "EXPORT_ERROR",
                     "payload": {"user_id": payload.tg_user_id},
                 },
             )
             return False
-        log_event(
-            "INFO",
+        info_domain(
             "leads.export",
-            "📤 Экспорт лида завершён",
+            "📤 Экспорт лида — ok",
+            stage="LEAD_EXPORT",
             user_id=payload.tg_user_id,
-            stage="EXPORT_LEAD",
-            extra={"sheet": self._sheet_name},
+            sheet=self._sheet_name,
         )
         return True
 
