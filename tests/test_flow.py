@@ -63,7 +63,7 @@ def test_followup_resolution_variants() -> None:
 
 
 def test_limit_flow_keyboards() -> None:
-    landing = "https://example.com/booking"
+    landing = "https://booking.example"
     limit_keyboard = limit_reached_keyboard(landing)
 
     assert [len(row) for row in limit_keyboard.inline_keyboard] == [1, 1, 1]
@@ -78,9 +78,9 @@ def test_limit_flow_keyboards() -> None:
 
 
 def test_promo_message_inserts_code() -> None:
-    text = msg.PROMO_MESSAGE_TEMPLATE.format(promo_code="DEMO 10")
+    text = msg.PROMO_MESSAGE_TEMPLATE.format(promo_code="SPECIAL")
 
-    assert "<b>DEMO 10</b>" in text
+    assert "<b>SPECIAL</b>" in text
     assert text.endswith("будут новые модели 👓✨")
 
 

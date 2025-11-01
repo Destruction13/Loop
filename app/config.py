@@ -86,26 +86,6 @@ class SocialLink:
     url: str
 
 
-DEFAULT_SOCIAL_LINKS: tuple[SocialLink, ...] = (
-    SocialLink(
-        title="Основной loov.ru",
-        url="https://www.instagram.com/loov.ru?igsh=bGZreDRlNXk1cHNn&utm_source=qr",
-    ),
-    SocialLink(
-        title="Loov.raw",
-        url="https://www.instagram.com/loov.raw?igsh=bmtrYWl3OW5heWh2&utm_source=qr",
-    ),
-    SocialLink(
-        title="Loov.meta",
-        url="https://www.instagram.com/loov.meta?igsh=cmZ0Z2M0dzB3cHUx&utm_source=qr",
-    ),
-    SocialLink(
-        title="Loov.core",
-        url="https://www.instagram.com/loov.core?igsh=MWRhMmppdjdzYnYxeg%3D%3D&utm_source=qr",
-    ),
-)
-
-
 @dataclass(slots=True)
 class Config:
     """Top-level application configuration."""
@@ -217,12 +197,12 @@ def load_config(env_file: str | None = None) -> Config:
         if parsed_limit > 0:
             row_limit = parsed_limit
 
-    promo_code = _get("PROMO_CODE", "DEMO 10") or "DEMO 10"
+    promo_code = _get("PROMO_CODE") or ""
     daily_try_limit = _as_int(_get("DAILY_TRY_LIMIT"), 7)
 
     social_links_raw = _get("SOCIAL_LINKS_JSON")
     if social_links_raw is None:
-        social_links = list(DEFAULT_SOCIAL_LINKS)
+        social_links = []
     else:
         parsed_links = _parse_social_links(social_links_raw)
         social_links = parsed_links if parsed_links else []

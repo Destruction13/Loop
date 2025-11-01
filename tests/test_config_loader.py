@@ -1,11 +1,6 @@
 from pathlib import Path
 
-from app.config import (
-    DEFAULT_NANOBANANA_API_KEY,
-    DEFAULT_SOCIAL_LINKS,
-    SocialLink,
-    load_config,
-)
+from app.config import DEFAULT_NANOBANANA_API_KEY, SocialLink, load_config
 
 
 def test_load_config_reads_allowed_env(tmp_path, monkeypatch) -> None:
@@ -101,10 +96,10 @@ def test_load_config_defaults_without_optional_env(tmp_path, monkeypatch) -> Non
     assert config.catalog_sheet_id is None
     assert config.catalog_row_limit is None
     assert config.site_url == "https://loov.ru/"
-    assert config.promo_code == "DEMO 10"
-    assert config.promo_contact_code == "DEMO 10"
+    assert config.promo_code == ""
+    assert config.promo_contact_code == "CONTACT1000"
     assert config.daily_try_limit == 7
     assert config.pick_scheme == "UNIVERSAL"
-    assert config.social_links == DEFAULT_SOCIAL_LINKS
+    assert config.social_links == ()
     assert config.google_service_account_json == Path("service_account.json")
     assert config.contacts_sheet_url is None

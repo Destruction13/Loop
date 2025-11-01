@@ -36,8 +36,8 @@ pip install -r requirements.txt
 
 ```
 SOCIAL_LINKS_JSON=[
-  {"title":"Основной loov.ru","url":"https://www.instagram.com/loov.ru?utm_source=qr"},
-  {"title":"Loov.raw","url":"https://www.instagram.com/loov.raw?utm_source=qr"}
+  {"title":"Instagram","url":"https://www.instagram.com/your_profile"},
+  {"title":"VK","url":"https://vk.com/your_page"}
 ]
 ```
 
