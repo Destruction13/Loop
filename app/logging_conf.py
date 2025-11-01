@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from logging import Logger
 
 
@@ -26,6 +27,7 @@ def setup_logging() -> Logger:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        stream=sys.stdout,
     )
     logger = logging.getLogger("loop_bot")
     return logger

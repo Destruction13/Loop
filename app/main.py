@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+import signal
+from contextlib import suppress
+from logging import Logger
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
@@ -23,20 +26,61 @@ from app.services.social_ad import SocialAdService
 from app.services.scheduler import ReminderScheduler
 from app.texts import messages as msg
 from app.utils.paths import ensure_dir
-from app.services.recommendation import (
-    PickScheme,
-    RecommendationService,
-    RecommendationSettings,
-)
+from app.services.recommendation import PickScheme, RecommendationService, RecommendationSettings
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+async def _run_polling(dp: Dispatcher, bot: Bot, logger: Logger) -> None:
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    stop_waiter = asyncio.create_task(stop_event.wait())
+
+    def _handle_signal(sig: signal.Signals) -> None:
+        logger.info("Received %s signal. Shutting down...", sig.name)
+        stop_event.set()
+
+    signals = (signal.SIGINT, signal.SIGTERM)
+    for sig in signals:
+        try:
+            loop.add_signal_handler(sig, _handle_signal, sig)
+        except (NotImplementedError, RuntimeError):  # pragma: no cover - platform specific
+            continue
+
+    polling_task = asyncio.create_task(
+        dp.start_polling(bot, handle_signals=False), name="aiogram-polling"
+    )
+    polling_task.add_done_callback(lambda _: stop_event.set())
+
+    done, _pending = await asyncio.wait(
+        {polling_task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    if stop_waiter in done and not polling_task.done():
+        logger.info("Stopping polling loop gracefully...")
+        await dp.stop_polling()
+
+    await asyncio.gather(polling_task, return_exceptions=False)
+
+    stop_waiter.cancel()
+    with suppress(asyncio.CancelledError):
+        await stop_waiter
+
+    for sig in signals:
+        try:
+            loop.remove_signal_handler(sig)
+        except (ValueError, RuntimeError):  # pragma: no cover - platform specific
+            continue
+
 
 async def main() -> None:
     config = load_config()
     logger = setup_logging()
 
-    ensure_dir(config.uploads_root)
-    ensure_dir(config.results_root)
-    tmp_dir = ensure_dir(Path("tmp"))
-    ensure_dir(Path(".cache") / "frames")
+    ensure_dir((PROJECT_ROOT / config.uploads_root).resolve())
+    ensure_dir((PROJECT_ROOT / config.results_root).resolve())
+    tmp_dir = ensure_dir(PROJECT_ROOT / "var" / "tmp")
+    ensure_dir(PROJECT_ROOT / ".cache" / "frames")
 
     async def _cleanup_tmp() -> None:
         def _clean() -> None:
@@ -59,8 +103,24 @@ async def main() -> None:
     bot = Bot(token=config.bot_token, parse_mode=ParseMode.HTML)
     dp = Dispatcher()
 
-    repository = Repository(Path("loop.db"), config.daily_try_limit)
+    repository_path = (PROJECT_ROOT / "loop.db").resolve()
+    repository = Repository(repository_path, config.daily_try_limit)
     await repository.init()
+
+    google_credentials_path = None
+    if config.google_service_account_json is not None:
+        if config.google_service_account_json.is_absolute():
+            google_credentials_path = config.google_service_account_json
+        else:
+            google_credentials_path = (PROJECT_ROOT / config.google_service_account_json).resolve()
+
+    promo_video_path = (
+        config.promo_video_path
+        if config.promo_video_path.is_absolute()
+        else (PROJECT_ROOT / config.promo_video_path).resolve()
+    )
+    if not promo_video_path.exists():
+        logger.warning("Promo video not found at %s", promo_video_path)
 
     catalog_config = GoogleCatalogConfig(
         csv_url=config.sheet_csv_url,
@@ -89,13 +149,13 @@ async def main() -> None:
         promo_code=config.promo_contact_code,
         spreadsheet_id=config.catalog_sheet_id,
         spreadsheet_url=config.contacts_sheet_url,
-        credentials_path=config.google_service_account_json,
+        credentials_path=google_credentials_path,
     )
 
     contact_exporter = ContactSheetExporter(
         sheet_url=config.contacts_sheet_url or "",
         worksheet_name="Контакты",
-        credentials_path=config.google_service_account_json,
+        credentials_path=google_credentials_path,
     )
 
     router = setup_router(
@@ -116,7 +176,7 @@ async def main() -> None:
         idle_nudge_seconds=max(config.idle_reminder_minutes, 0) * 60,
         enable_idle_nudge=config.enable_idle_reminder,
         privacy_policy_url=str(config.privacy_policy_url),
-        promo_video_path=config.promo_video_path,
+        promo_video_path=promo_video_path,
         promo_video_enabled=config.promo_video_enabled,
         promo_video_width=config.promo_video_width,
         promo_video_height=config.promo_video_height,
@@ -145,7 +205,7 @@ async def main() -> None:
 
     logger.info("%s Bot started", EVENT_ID["START"])
     try:
-        await dp.start_polling(bot)
+        await _run_polling(dp, bot, logger)
     finally:
         await scheduler.stop()
         if social_ad is not None:

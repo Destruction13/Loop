@@ -9,9 +9,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
-from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -121,18 +121,47 @@ class Config:
     promo_video_height: int | None
 
 
-def _get(name: str, default: Optional[str] = None, *, required: bool = False) -> Optional[str]:
-    value = os.getenv(name, default)
-    if value is None and required:
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if value is None:
         raise RuntimeError(f"Environment variable {name} is required")
+    stripped = value.strip()
+    if not stripped:
+        raise RuntimeError(f"Environment variable {name} must not be empty")
+    return stripped
+
+
+def _optional_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    stripped = value.strip()
+    if not stripped and default is None:
+        return None
+    if not stripped:
+        return default
+    return stripped
+
+
+def _require_url(name: str) -> str:
+    value = _require_env(name)
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(f"{name} must be a valid HTTP(S) URL")
     return value
 
 
-def _as_int(value: Optional[str], fallback: int) -> int:
+def _parse_int_env(name: str, default: int, *, minimum: Optional[int] = None) -> int:
+    raw = _optional_env(name)
+    if raw is None:
+        return default
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        return fallback
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} must be an integer value") from None
+    if minimum is not None and value < minimum:
+        raise RuntimeError(f"{name} must be greater than or equal to {minimum}")
+    return value
 
 
 def _parse_social_links(raw: Optional[str]) -> list[SocialLink]:
@@ -144,22 +173,21 @@ def _parse_social_links(raw: Optional[str]) -> list[SocialLink]:
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
-        logger.warning("Invalid SOCIAL_LINKS_JSON value; ignoring")
-        return []
+        raise RuntimeError("SOCIAL_LINKS_JSON must be valid JSON") from None
     if not isinstance(data, list):
-        logger.warning("SOCIAL_LINKS_JSON must be a JSON array")
-        return []
+        raise RuntimeError("SOCIAL_LINKS_JSON must be a JSON array")
     result: list[SocialLink] = []
     for entry in data:
         if not isinstance(entry, dict):
-            continue
+            raise RuntimeError("SOCIAL_LINKS_JSON entries must be objects with title and url")
         title = str(entry.get("title") or "").strip()
         url = str(entry.get("url") or "").strip()
         if not title or not url:
-            continue
+            raise RuntimeError("Each SOCIAL_LINKS_JSON entry must contain title and url")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise RuntimeError("SOCIAL_LINKS_JSON url values must be valid HTTP(S) links")
         result.append(SocialLink(title=title, url=url))
-    if not result:
-        logger.warning("SOCIAL_LINKS_JSON does not contain valid entries")
     return result
 
 
@@ -171,58 +199,32 @@ def load_config(env_file: str | None = None) -> Config:
     else:
         load_dotenv()
 
-    google_sheet_url = _get("GOOGLE_SHEET_URL")
-    sheet_csv_url = _get("SHEET_CSV_URL")
-    if not sheet_csv_url:
-        if google_sheet_url:
-            sheet_csv_url = google_sheet_url
-        else:
-            raise RuntimeError(
-                "Environment variable SHEET_CSV_URL is required when GOOGLE_SHEET_URL is absent"
-            )
+    bot_token = _require_env("BOT_TOKEN")
+    sheet_csv_url = _require_url("SHEET_CSV_URL")
+    landing_url = _require_url("LANDING_URL")
+    social_links_json = _optional_env("SOCIAL_LINKS_JSON", "[]") or "[]"
+    social_links = _parse_social_links(social_links_json)
+    nanobanana_api_key = _require_env("NANOBANANA_API_KEY")
+    promo_code = _optional_env("PROMO_CODE", "") or ""
+    daily_try_limit = _parse_int_env("DAILY_TRY_LIMIT", 50, minimum=1)
+    catalog_row_raw = _parse_int_env("CATALOG_ROW_LIMIT", 0, minimum=0)
+    catalog_row_limit = catalog_row_raw or None
+    pick_scheme_raw = _optional_env("PICK_SCHEME", "UNIVERSAL") or "UNIVERSAL"
+    pick_scheme = pick_scheme_raw.strip() or "UNIVERSAL"
+    google_sheet_url = _require_url("GOOGLE_SHEET_URL")
+    google_credentials_raw = _require_env("GOOGLE_SERVICE_ACCOUNT_JSON")
+    google_credentials_path = Path(google_credentials_raw)
 
-    catalog_sheet_id: Optional[str] = None
-    catalog_sheet_gid: Optional[str] = None
-    if google_sheet_url:
-        catalog_sheet_id, catalog_sheet_gid = _extract_sheet_id_and_gid(google_sheet_url)
-
-    row_limit_raw = _get("CATALOG_ROW_LIMIT")
-    row_limit: int | None = None
-    if row_limit_raw:
-        try:
-            parsed_limit = int(row_limit_raw)
-        except ValueError:
-            parsed_limit = 0
-        if parsed_limit > 0:
-            row_limit = parsed_limit
-
-    promo_code = _get("PROMO_CODE") or ""
-    daily_try_limit = _as_int(_get("DAILY_TRY_LIMIT"), 7)
-
-    social_links_raw = _get("SOCIAL_LINKS_JSON")
-    if social_links_raw is None:
-        social_links = []
-    else:
-        parsed_links = _parse_social_links(social_links_raw)
-        social_links = parsed_links if parsed_links else []
-
-    pick_scheme_raw = _get("PICK_SCHEME")
-    pick_scheme = (pick_scheme_raw or "UNIVERSAL").strip() or "UNIVERSAL"
-
-    google_credentials_raw = _get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    google_credentials_path = Path(google_credentials_raw) if google_credentials_raw else None
-
-    landing_url = _get("LANDING_URL")
-    site_url = landing_url.strip() if landing_url else "https://loov.ru/"
+    catalog_sheet_id, catalog_sheet_gid = _extract_sheet_id_and_gid(google_sheet_url)
 
     promo_contact_code = promo_code or "CONTACT1000"
 
     return Config(
-        bot_token=_get("BOT_TOKEN", required=True),
+        bot_token=bot_token,
         sheet_csv_url=sheet_csv_url,
         catalog_sheet_id=catalog_sheet_id,
         catalog_sheet_gid=catalog_sheet_gid,
-        site_url=site_url,
+        site_url=landing_url,
         privacy_policy_url=DEFAULT_PRIVACY_POLICY_URL,
         promo_code=promo_code,
         daily_try_limit=daily_try_limit,
@@ -230,11 +232,11 @@ def load_config(env_file: str | None = None) -> Config:
         idle_reminder_minutes=5,
         csv_fetch_ttl_sec=60,
         csv_fetch_retries=3,
-        catalog_row_limit=row_limit,
+        catalog_row_limit=catalog_row_limit,
         uploads_root=Path("./uploads"),
         results_root=Path("./results"),
         button_title_max=28,
-        nanobanana_api_key=_get("NANOBANANA_API_KEY", required=True),
+        nanobanana_api_key=nanobanana_api_key,
         collage=CollageConfig(
             slot_width=1080,
             slot_height=1440,
