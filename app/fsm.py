@@ -21,11 +21,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
 from aiogram.types.input_file import BufferedInputFile, FSInputFile, URLInputFile
 
+from app.analytics import track_event
 from app.keyboards import (
     all_seen_keyboard,
     batch_selection_keyboard,
@@ -644,7 +646,7 @@ def setup_router(
         *,
         username: str | None,
         full_name: str | None,
-    ) -> None:
+    ) -> bool:
         payload = LeadPayload(
             tg_user_id=user_id,
             phone_e164=phone_e164,
@@ -653,7 +655,7 @@ def setup_router(
             username=username,
             full_name=full_name,
         )
-        await leads_exporter.export_lead_to_sheet(payload)
+        return await leads_exporter.export_lead_to_sheet(payload)
 
     def _map_gender_label(value: str | None) -> str:
         mapping = {
@@ -700,6 +702,7 @@ def setup_router(
     ) -> None:
         user = message.from_user
         user_id = user.id
+        await track_event(str(user_id), "phone_shared", value="yes")
         existing = await repository.get_user_contact(user_id)
         consent_ts = int(time.time())
         contact = UserContact(
@@ -725,8 +728,9 @@ def setup_router(
             original_phone or phone_e164,
             state_data.get("gender"),
         )
+        export_ok = False
         if changed:
-            await _export_lead(
+            export_ok = await _export_lead(
                 user_id,
                 phone_e164,
                 source,
@@ -734,6 +738,8 @@ def setup_router(
                 username=username,
                 full_name=full_name,
             )
+            if export_ok:
+                await track_event(str(user_id), "lead_export_ok")
         if reward_needed:
             await _send_aux_message(
                 message,
@@ -933,6 +939,7 @@ def setup_router(
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
         await repository.ensure_user(message.from_user.id)
+        await track_event(str(message.from_user.id), "start")
         text = message.text or ""
         if "ref_" in text:
             parts = text.split()
@@ -1076,6 +1083,7 @@ def setup_router(
             allow_try_button=False,
         )
         await state.set_state(TryOnStates.AWAITING_PHOTO)
+        await track_event(str(callback.from_user.id), "gender_selected", value=gender)
         await _delete_state_message(callback.message, state, "gender_prompt_message_id")
         await _send_aux_message(
             callback.message,
@@ -1106,12 +1114,14 @@ def setup_router(
         photo = message.photo[-1]
         path = await save_user_photo(message)
         await state.update_data(upload=path, upload_file_id=photo.file_id)
+        await track_event(str(user_id), "photo_uploaded")
         profile = await repository.ensure_daily_reset(user_id)
         if profile.tries_used == 0:
             await state.update_data(first_generated_today=True)
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
+            await track_event(str(user_id), "daily_limit_hit")
             await _send_aux_message(
                 message,
                 state,
@@ -1197,6 +1207,7 @@ def setup_router(
         remaining = await repository.remaining_tries(callback.from_user.id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
+            await track_event(str(callback.from_user.id), "daily_limit_hit")
             await _send_aux_message(
                 callback.message,
                 state,
@@ -1347,6 +1358,7 @@ def setup_router(
             await _edit_progress(msg.PROGRESS_SENDING_TO_GENERATION)
             await _edit_progress(msg.PROGRESS_WAIT_GENERATION)
 
+            await track_event(str(user_id), "generation_started", value=model.unique_id)
             info_domain(
                 "generation.nano",
                 f"🛠️ Генерация запущена — frame={model.unique_id}",
@@ -1364,6 +1376,7 @@ def setup_router(
             latency_ms = int((time.perf_counter() - start_time) * 1000)
             result_bytes = generation_result.image_bytes
             result_kb = len(result_bytes) / 1024 if result_bytes else 0
+            await track_event(str(user_id), "generation_finished", value=str(latency_ms))
             info_domain(
                 "generation.nano",
                 f"✅ Генерация готова — {latency_ms} ms",
@@ -1539,6 +1552,7 @@ def setup_router(
                 limit_text,
                 reply_markup=limit_reached_keyboard(site_url),
             )
+            await track_event(str(user_id), "daily_limit_hit")
             await state.update_data(last_aux_message_id=limit_message.message_id)
             if contact_active_before:
                 await state.update_data(contact_pending_result_state="limit")
@@ -1634,6 +1648,7 @@ def setup_router(
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
+            await track_event(str(user_id), "daily_limit_hit")
             await _send_aux_message(
                 callback.message,
                 state,
@@ -1677,6 +1692,7 @@ def setup_router(
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
+            await track_event(str(user_id), "daily_limit_hit")
             await _send_aux_message(
                 message,
                 state,
@@ -1746,6 +1762,44 @@ def setup_router(
         )
         await callback.answer()
         logger.debug("Scheduled reminder for user %s", user_id)
+
+    @router.callback_query(F.data == "cta_book")
+    async def handle_cta(callback: CallbackQuery) -> None:
+        await track_event(str(callback.from_user.id), "cta_book_opened")
+        sanitized = (site_url or "").strip()
+        if not sanitized:
+            await callback.answer(msg.BOOKING_LINK_UNAVAILABLE, show_alert=True)
+            return
+        follow_markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=msg.BOOKING_BUTTON_TEXT, url=sanitized)]]
+        )
+        await callback.message.answer(msg.BOOKING_OPEN_PROMPT, reply_markup=follow_markup)
+        current_markup = getattr(callback.message, "reply_markup", None)
+        if current_markup and getattr(current_markup, "inline_keyboard", None):
+            new_rows = []
+            changed = False
+            for row in current_markup.inline_keyboard:
+                new_row: list[InlineKeyboardButton] = []
+                for button in row:
+                    if getattr(button, "callback_data", None) == "cta_book":
+                        new_row.append(
+                            InlineKeyboardButton(text=msg.BOOKING_BUTTON_TEXT, url=sanitized)
+                        )
+                        changed = True
+                    else:
+                        new_row.append(button)
+                new_rows.append(new_row)
+            if changed:
+                replacement = InlineKeyboardMarkup(inline_keyboard=new_rows)
+                try:
+                    await callback.message.edit_reply_markup(reply_markup=replacement)
+                except TelegramBadRequest as exc:
+                    logger.debug(
+                        "Не удалось обновить клавиатуру после клика по CTA: %s",
+                        exc,
+                        extra={"stage": "CTA_UPDATE_FAILED"},
+                    )
+        await callback.answer()
 
     @router.callback_query(F.data == "reminder_go")
     async def reminder_go(callback: CallbackQuery, state: FSMContext) -> None:
