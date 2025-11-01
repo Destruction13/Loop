@@ -11,7 +11,7 @@
   <a href="https://github.com/Destruction13/Loop/issues"><img alt="Issues" src="https://img.shields.io/badge/Issues-Обсудить-8A8D91?logo=github" /></a>
 </p>
 
-<video src="video/promo_start.mp4" controls playsinline style="max-width:100%; border-radius:12px;"></video>
+<video src="video/promo_start.MP4" controls playsinline style="max-width:100%; border-radius:12px;"></video>
 
 <sub>⚠️ Если плеер не отобразился, <a href="video/promo_start.mp4">скачайте видео по прямой ссылке</a>.</sub>
 
