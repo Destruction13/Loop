@@ -24,7 +24,7 @@ sudo chown "$USER":"$USER" /opt/loov
 cd /opt/loov
 
 # Склонируйте репозиторий или скопируйте файлы вручную
-git clone https://example.com/your/loov.git .
+git clone https://github.com/Destruction13/Loop.git
 
 python3 -m venv .venv
 ./.venv/bin/python -m pip install --upgrade pip
