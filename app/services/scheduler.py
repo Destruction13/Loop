@@ -9,11 +9,7 @@ from typing import Optional
 
 from aiogram import Bot
 
-from app.logging_conf import EVENT_ID
 from app.services.repository import Repository
-
-import logging
-
 
 class ReminderScheduler:
     """Background scheduler sending reminder messages."""
@@ -33,7 +29,6 @@ class ReminderScheduler:
         self._interval = interval_seconds
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
-        self._logger = logging.getLogger("loop_bot.scheduler")
 
     def start(self) -> None:
         if self._task is None:

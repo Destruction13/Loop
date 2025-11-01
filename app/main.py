@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import time
 import signal
+import time
 from contextlib import suppress
 from logging import Logger
 from pathlib import Path
@@ -14,8 +14,7 @@ from aiogram.enums import ParseMode
 
 from app.config import load_config
 from app.fsm import setup_router
-from app.keyboards import reminder_keyboard, start_keyboard
-from app.logging_conf import EVENT_ID, setup_logging
+from app.keyboards import reminder_keyboard
 from app.services import nanobanana
 from app.services.catalog_google import GoogleCatalogConfig, GoogleSheetCatalog
 from app.services.collage import build_three_tile_collage
@@ -27,6 +26,8 @@ from app.services.scheduler import ReminderScheduler
 from app.texts import messages as msg
 from app.utils.paths import ensure_dir
 from app.services.recommendation import PickScheme, RecommendationService, RecommendationSettings
+from app.infrastructure.logging_middleware import LoggingMiddleware
+from logger import get_logger, info_domain, log_event, setup_logging
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -37,7 +38,7 @@ async def _run_polling(dp: Dispatcher, bot: Bot, logger: Logger) -> None:
     stop_waiter = asyncio.create_task(stop_event.wait())
 
     def _handle_signal(sig: signal.Signals) -> None:
-        logger.info("Received %s signal. Shutting down...", sig.name)
+        logger.debug("Received %s signal. Shutting down...", sig.name)
         stop_event.set()
 
     signals = (signal.SIGINT, signal.SIGTERM)
@@ -57,7 +58,7 @@ async def _run_polling(dp: Dispatcher, bot: Bot, logger: Logger) -> None:
     )
 
     if stop_waiter in done and not polling_task.done():
-        logger.info("Stopping polling loop gracefully...")
+        logger.debug("Stopping polling loop gracefully...")
         await dp.stop_polling()
 
     await asyncio.gather(polling_task, return_exceptions=False)
@@ -75,7 +76,17 @@ async def _run_polling(dp: Dispatcher, bot: Bot, logger: Logger) -> None:
 
 async def main() -> None:
     config = load_config()
-    logger = setup_logging()
+    setup_logging()
+    logger = get_logger("bot.start")
+
+    info_domain(
+        "bot.start",
+        "🧩 Конфиг загружен",
+        stage="CONFIG_OK",
+        leads_export=config.enable_leads_export,
+        idle_reminder=config.enable_idle_reminder,
+        social_ad=config.enable_social_ad,
+    )
 
     ensure_dir((PROJECT_ROOT / config.uploads_root).resolve())
     ensure_dir((PROJECT_ROOT / config.results_root).resolve())
@@ -102,6 +113,7 @@ async def main() -> None:
 
     bot = Bot(token=config.bot_token, parse_mode=ParseMode.HTML)
     dp = Dispatcher()
+    dp.update.middleware(LoggingMiddleware())
 
     repository_path = (PROJECT_ROOT / "loop.db").resolve()
     repository = Repository(repository_path, config.daily_try_limit)
@@ -120,7 +132,11 @@ async def main() -> None:
         else (PROJECT_ROOT / config.promo_video_path).resolve()
     )
     if not promo_video_path.exists():
-        logger.warning("Promo video not found at %s", promo_video_path)
+        logger.warning(
+            "Файл промо-видео не найден по пути %s",
+            promo_video_path,
+            extra={"stage": "PROMO_VIDEO_MISSING"},
+        )
 
     catalog_config = GoogleCatalogConfig(
         csv_url=config.sheet_csv_url,
@@ -203,7 +219,7 @@ async def main() -> None:
         )
         social_ad.start()
 
-    logger.info("%s Bot started", EVENT_ID["START"])
+    info_domain("bot.start", "✅ Бот запущен", stage="BOT_STARTED")
     try:
         await _run_polling(dp, bot, logger)
     finally:
@@ -215,4 +231,15 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as exc:  # noqa: BLE001
+        setup_logging()
+        log_event(
+            "CRITICAL",
+            "bot.runtime",
+            f"💥 Необработанное исключение: {exc}",
+            stage="UNHANDLED_EXCEPTION",
+            extra={"exception": repr(exc)},
+        )
+        raise

@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
-
-import re
-from urllib.parse import urlparse, parse_qs
+from logger import get_logger, info_domain
 
 def _extract_sheet_id(url_or_id: str | None) -> str | None:
     if not url_or_id:
@@ -63,30 +62,85 @@ class LeadsExporter:
         else:
             creds_str = str(credentials_path)
         self._credentials_path = creds_str.strip().strip('"').strip("'")
-        self._logger = logging.getLogger("loop_bot.leads_export")
+        self._logger = get_logger("leads.export")
 
     async def export_lead_to_sheet(self, payload: LeadPayload) -> bool:
         """Append the lead information to the configured sheet."""
 
         if not self._enabled:
-            self._logger.debug("Lead export disabled; skipping")
+            self._logger.debug(
+                "Экспорт лидов отключён; пропускаем запись",
+                extra={"stage": "EXPORT_LEAD_DISABLED"},
+            )
+            info_domain(
+                "leads.export",
+                "📤 Экспорт лида — пропуск",
+                stage="LEAD_EXPORT",
+                user_id=payload.tg_user_id,
+                reason="disabled",
+            )
             return False
         if not payload.phone_e164:
-            self._logger.debug("Lead export skipped due to empty phone")
+            self._logger.debug(
+                "Экспорт лида пропущен: отсутствует номер телефона",
+                extra={
+                    "stage": "EXPORT_LEAD_SKIPPED",
+                    "payload": {"user_id": payload.tg_user_id},
+                },
+            )
+            info_domain(
+                "leads.export",
+                "📤 Экспорт лида — пропуск",
+                stage="LEAD_EXPORT",
+                user_id=payload.tg_user_id,
+                reason="no_phone",
+            )
             return False
         if not self._spreadsheet_id or not self._credentials_path:
             self._logger.warning(
-                "Lead export skipped: missing spreadsheet id or credentials path"
+                "Не задан spreadsheet ID или путь к ключу — экспорт лидов пропущен",
+                extra={
+                    "stage": "EXPORT_ERROR",
+                    "payload": {"user_id": payload.tg_user_id},
+                },
+            )
+            info_domain(
+                "leads.export",
+                "📤 Экспорт лида — пропуск",
+                stage="LEAD_EXPORT",
+                user_id=payload.tg_user_id,
+                reason="config_missing",
             )
             return False
         try:
             await asyncio.to_thread(self._append_row, payload)
         except ImportError as exc:
-            self._logger.error("Leads exporter missing dependency: %s", exc)
+            self._logger.error(
+                "Библиотеки для экспорта лидов не установлены: %s",
+                exc,
+                extra={
+                    "stage": "EXPORT_ERROR",
+                    "payload": {"user_id": payload.tg_user_id},
+                },
+            )
             return False
         except Exception as exc:  # noqa: BLE001
-            self._logger.error("Failed to export lead to sheet: %s", exc)
+            self._logger.error(
+                "Не удалось записать лид в таблицу: %s",
+                exc,
+                extra={
+                    "stage": "EXPORT_ERROR",
+                    "payload": {"user_id": payload.tg_user_id},
+                },
+            )
             return False
+        info_domain(
+            "leads.export",
+            "📤 Экспорт лида — ok",
+            stage="LEAD_EXPORT",
+            user_id=payload.tg_user_id,
+            sheet=self._sheet_name,
+        )
         return True
 
     def _append_row(self, payload: LeadPayload) -> None:

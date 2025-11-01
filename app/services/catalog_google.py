@@ -6,7 +6,6 @@ import asyncio
 import csv
 import hashlib
 import io
-import logging
 import random
 import time
 from dataclasses import dataclass
@@ -23,8 +22,15 @@ from app.services.catalog_base import (
     CatalogSnapshot,
 )
 from app.utils.drive import DriveFolderUrlError, DriveUrlError, drive_view_to_direct
+from logger import get_logger, info_domain
 
-LOGGER = logging.getLogger("loop_bot.catalog.google")
+LOGGER = get_logger("sheets.catalog")
+
+_SOURCE_LABELS = {
+    "direct-url": "прямой CSV",
+    "doc-id": "ID таблицы",
+    "configured-url": "настроенный URL",
+}
 
 
 def _normalize_header(value: str) -> str:
@@ -118,6 +124,7 @@ class GoogleSheetCatalog(CatalogService):
         self._client_owner = client is None
         self._cache: tuple[float, CatalogSnapshot] | None = None
         self._lock = asyncio.Lock()
+        self._source_logged = False
 
     async def list_by_gender(self, gender: str) -> list[GlassModel]:
         snapshot = await self.snapshot()
@@ -176,7 +183,7 @@ class GoogleSheetCatalog(CatalogService):
                 rng, gender_pool, unisex_pool, batch_size, normalized_scheme
             )
 
-        LOGGER.info(
+        LOGGER.debug(
             "Catalog returned batch items=%s exhausted=%s for gender=%s",
             [model.unique_id for model in picks],
             exhausted,
@@ -200,29 +207,53 @@ class GoogleSheetCatalog(CatalogService):
                     models=list(cached_snapshot.models),
                     version_hash=cached_snapshot.version_hash,
                 )
-            csv_content = await self._fetch_csv()
-            models = self._parse_csv(csv_content)
+            try:
+                csv_content = await self._fetch_csv()
+                models = self._parse_csv(csv_content)
+            except CatalogError as exc:
+                LOGGER.error(
+                    "Не удалось загрузить или разобрать каталог: %s",
+                    exc,
+                    extra={"stage": "SHEET_PARSE_ERROR"},
+                )
+                raise
+
             version_hash = _compute_version_hash(models)
             snapshot = CatalogSnapshot(models=list(models), version_hash=version_hash)
             self._cache = (time.monotonic(), snapshot)
-            LOGGER.info(
-                "Catalog cache refreshed with %s entries (payload %s bytes, hash=%s)",
+            LOGGER.debug(
+                "Каталог обновлён: %s записей (хэш %s)",
                 len(models),
-                len(csv_content.encode("utf-8")),
                 version_hash,
+            )
+            info_domain(
+                "sheets.load",
+                f"🗂️ Таблица подгружена — {len(models)} строк",
+                stage="SHEET_LOADED",
+                rows=len(models),
+                hash=version_hash,
+            )
+            info_domain(
+                "sheets.load",
+                f"✅ Парсинг каталога ok — {len(models)} строк",
+                stage="SHEET_PARSE_OK",
+                rows=len(models),
             )
             return CatalogSnapshot(models=list(models), version_hash=version_hash)
 
     async def _fetch_csv(self) -> str:
         urls, source = _resolve_fetch_plan(self._config)
-        LOGGER.info("Catalog: source=%s", source)
-        if source == "direct-url":
-            LOGGER.info("Catalog: using direct csv url from env")
-        elif source == "doc-id":
-            LOGGER.info("Catalog: using doc-id derived csv urls")
-        else:
-            LOGGER.info("Catalog: using configured catalog url")
-        LOGGER.debug("Catalog: url candidates=%s", ", ".join(urls))
+        LOGGER.debug("Catalog source=%s", source)
+        if not self._source_logged:
+            source_label = _SOURCE_LABELS.get(source, source)
+            info_domain(
+                "sheets.load",
+                f"📥 Источник каталога: {source_label}",
+                stage="SHEET_SOURCE",
+                source=source,
+            )
+            self._source_logged = True
+        LOGGER.debug("Catalog url candidates=%s", ", ".join(urls))
 
         last_error: Exception | None = None
         for index, url in enumerate(urls):
@@ -246,7 +277,7 @@ class GoogleSheetCatalog(CatalogService):
         last_error: Exception | None = None
         for attempt in range(1, self._config.retries + 1):
             try:
-                LOGGER.info(
+                LOGGER.debug(
                     "Catalog fetch attempt %s/%s url=%s",
                     attempt,
                     self._config.retries,
@@ -268,7 +299,7 @@ class GoogleSheetCatalog(CatalogService):
                 break
 
             status = response.status_code
-            LOGGER.info("Catalog fetch status=%s url=%s", status, response.url)
+            LOGGER.debug("Catalog fetch status=%s url=%s", status, response.url)
             if 200 <= status < 300:
                 self._log_redirect_chain(url, response)
                 text = response.text
@@ -281,7 +312,7 @@ class GoogleSheetCatalog(CatalogService):
                         self._config.retries,
                     )
                 else:
-                    LOGGER.info("Fetched catalog CSV from %s", response.url)
+                    LOGGER.debug("Fetched catalog CSV from %s", response.url)
                     return text
             elif status == 429 or status >= 500:
                 last_error = CatalogError(f"Server responded with status {status}")
