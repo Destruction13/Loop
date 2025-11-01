@@ -12,6 +12,11 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 
+from app.analytics import (
+    AnalyticsExporter,
+    AnalyticsExporterConfig,
+    init as analytics_init,
+)
 from app.config import load_config
 from app.fsm import setup_router
 from app.keyboards import reminder_keyboard
@@ -119,6 +124,8 @@ async def main() -> None:
     repository = Repository(repository_path, config.daily_try_limit)
     await repository.init()
 
+    await analytics_init(repository_path)
+
     google_credentials_path = None
     if config.google_service_account_json is not None:
         if config.google_service_account_json.is_absolute():
@@ -208,6 +215,26 @@ async def main() -> None:
     )
     scheduler.start()
 
+    analytics_exporter: AnalyticsExporter | None = None
+    if (
+        config.analytics_spreadsheet_id
+        and google_credentials_path is not None
+    ):
+        analytics_config = AnalyticsExporterConfig(
+            spreadsheet_id=config.analytics_spreadsheet_id,
+            credentials_path=google_credentials_path,
+            events_sheet_name=config.analytics_events_sheet_name,
+            analytics_sheet_name=config.analytics_sheet_name,
+            flush_interval=config.analytics_flush_interval_sec,
+        )
+        analytics_exporter = AnalyticsExporter(analytics_config, repository_path)
+        await analytics_exporter.start()
+    else:
+        logger.warning(
+            "Событийная аналитика не запущена: нет access_id или ключей",
+            extra={"stage": "ANALYTICS_DISABLED"},
+        )
+
     social_ad: SocialAdService | None = None
     if config.enable_social_ad and config.social_ad_minutes > 0:
         social_ad = SocialAdService(
@@ -226,6 +253,8 @@ async def main() -> None:
         await scheduler.stop()
         if social_ad is not None:
             await social_ad.stop()
+        if analytics_exporter is not None:
+            await analytics_exporter.stop()
         await catalog_service.aclose()
         await bot.session.close()
 

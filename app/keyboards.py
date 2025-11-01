@@ -15,6 +15,16 @@ from aiogram.types.web_app_info import WebAppInfo
 from app.texts import messages as msg
 
 
+def _booking_button(site_url: str, *, as_callback: bool) -> InlineKeyboardButton:
+    sanitized = (site_url or "").strip()
+    if as_callback or not sanitized:
+        return InlineKeyboardButton(
+            text=msg.BOOKING_BUTTON_TEXT,
+            callback_data="cta_book",
+        )
+    return InlineKeyboardButton(text=msg.BOOKING_BUTTON_TEXT, url=sanitized)
+
+
 def start_keyboard() -> InlineKeyboardMarkup:
     """Keyboard for the start menu."""
 
@@ -143,12 +153,12 @@ def generation_result_keyboard(site_url: str, remaining: int) -> InlineKeyboardM
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def limit_reached_keyboard(site_url: str) -> InlineKeyboardMarkup:
+def limit_reached_keyboard(site_url: str, *, use_callback: bool = True) -> InlineKeyboardMarkup:
     """Keyboard displayed when daily limit is reached."""
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=msg.BOOKING_BUTTON_TEXT, url=site_url)],
+            [_booking_button(site_url, as_callback=use_callback)],
             [
                 InlineKeyboardButton(
                     text=msg.PROMO_BUTTON_TEXT,
@@ -165,12 +175,12 @@ def limit_reached_keyboard(site_url: str) -> InlineKeyboardMarkup:
     )
 
 
-def promo_keyboard(site_url: str) -> InlineKeyboardMarkup:
+def promo_keyboard(site_url: str, *, use_callback: bool = True) -> InlineKeyboardMarkup:
     """Keyboard attached to the promo code message."""
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=msg.BOOKING_BUTTON_TEXT, url=site_url)],
+            [_booking_button(site_url, as_callback=use_callback)],
             [
                 InlineKeyboardButton(
                     text=msg.REMIND_LATER_BUTTON_TEXT,
@@ -255,10 +265,7 @@ def all_seen_keyboard(site_url: str) -> InlineKeyboardMarkup:
                     text=msg.REMIND_LATER_BUTTON_TEXT,
                     callback_data="limit_remind",
                 ),
-                InlineKeyboardButton(
-                    text=msg.BOOKING_BUTTON_TEXT,
-                    url=site_url,
-                ),
+                _booking_button(site_url, as_callback=True),
             ]
         ]
     )

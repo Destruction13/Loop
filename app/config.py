@@ -13,6 +13,12 @@ from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 
+from app.analytics.constants import (
+    ANALYTICS_SHEET_DEFAULT,
+    DASHBOARD_SHEET_DEFAULT,
+    EVENTS_SHEET_DEFAULT,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -120,6 +126,11 @@ class Config:
     promo_video_enabled: bool
     promo_video_width: int | None
     promo_video_height: int | None
+    analytics_events_sheet_name: str
+    analytics_sheet_name: str
+    analytics_dashboard_sheet_name: str
+    analytics_flush_interval_sec: int
+    analytics_spreadsheet_id: str | None
 
 
 def _require_env(name: str) -> str:
@@ -227,6 +238,23 @@ def load_config(env_file: str | None = None) -> Config:
 
     promo_contact_code = promo_code or "CONTACT1000"
 
+    analytics_events_sheet_name = (
+        _optional_env("ANALYTICS_EVENTS_SHEET_NAME", EVENTS_SHEET_DEFAULT)
+        or EVENTS_SHEET_DEFAULT
+    )
+    analytics_sheet_name = (
+        _optional_env("ANALYTICS_SHEET_NAME", ANALYTICS_SHEET_DEFAULT)
+        or ANALYTICS_SHEET_DEFAULT
+    )
+    analytics_dashboard_sheet_name = (
+        _optional_env("ANALYTICS_DASHBOARD_SHEET_NAME", DASHBOARD_SHEET_DEFAULT)
+        or DASHBOARD_SHEET_DEFAULT
+    )
+    analytics_flush_interval_sec = _parse_int_env(
+        "ANALYTICS_FLUSH_INTERVAL_SEC", 30, minimum=5
+    )
+    analytics_spreadsheet_id = (_optional_env("LOG_SHEET_ID") or "").strip() or None
+
     return Config(
         bot_token=bot_token,
         sheet_csv_url=sheet_csv_url,
@@ -274,6 +302,11 @@ def load_config(env_file: str | None = None) -> Config:
         promo_video_enabled=True,
         promo_video_width=None,
         promo_video_height=None,
+        analytics_events_sheet_name=analytics_events_sheet_name,
+        analytics_sheet_name=analytics_sheet_name,
+        analytics_dashboard_sheet_name=analytics_dashboard_sheet_name,
+        analytics_flush_interval_sec=analytics_flush_interval_sec,
+        analytics_spreadsheet_id=analytics_spreadsheet_id,
     )
 
 
