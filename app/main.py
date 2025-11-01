@@ -29,20 +29,6 @@ from app.services.recommendation import (
     RecommendationSettings,
 )
 
-# app/main.py
-import os
-from dotenv import load_dotenv
-
-# грузим .env РАНО, чтобы все модули, которые читают os.getenv при импорте, получили значения
-load_dotenv(override=False)
-
-# полезно увидеть рабочую директорию и наличие файла cred
-print(f"[boot] cwd={os.getcwd()}")
-print(f"[boot] has_creds={os.path.exists(os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON', 'service_account.json'))}")
-
-# дальше — как было
-
-
 async def main() -> None:
     config = load_config()
     logger = setup_logging()
@@ -101,6 +87,9 @@ async def main() -> None:
         enabled=config.enable_leads_export,
         sheet_name=config.leads_sheet_name,
         promo_code=config.promo_contact_code,
+        spreadsheet_id=config.catalog_sheet_id,
+        spreadsheet_url=config.contacts_sheet_url,
+        credentials_path=config.google_service_account_json,
     )
 
     contact_exporter = ContactSheetExporter(

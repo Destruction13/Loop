@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 
@@ -50,20 +50,19 @@ class LeadsExporter:
         sheet_name: str,
         promo_code: str,
         spreadsheet_id: Optional[str] = None,
-        credentials_path: Optional[str] = None,
+        spreadsheet_url: Optional[str] = None,
+        credentials_path: Optional[str | Path] = None,
     ) -> None:
         self._enabled = enabled
         self._sheet_name = sheet_name
         self._promo_code = promo_code
-        raw_id = (
-        spreadsheet_id
-        or os.getenv("LEADS_SPREADSHEET_ID")         # старое имя
-        or os.getenv("GOOGLE_SHEET_ID")              # твое текущее в .env
-        or _extract_sheet_id(os.getenv("GOOGLE_SHEET_URL"))  # вытащим из URL
-    )
+        raw_id = spreadsheet_id or _extract_sheet_id(spreadsheet_url)
         self._spreadsheet_id = (raw_id or "").strip().strip('"').strip("'")
-        creds_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        self._credentials_path = (credentials_path or creds_env or "").strip().strip('"').strip("'")
+        if credentials_path is None:
+            creds_str = ""
+        else:
+            creds_str = str(credentials_path)
+        self._credentials_path = creds_str.strip().strip('"').strip("'")
         self._logger = logging.getLogger("loop_bot.leads_export")
 
     async def export_lead_to_sheet(self, payload: LeadPayload) -> bool:

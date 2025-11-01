@@ -5,16 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
 
-import re
-from urllib.parse import urlparse, parse_qs
 
 def _extract_sheet_id_and_gid(url_or_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """
@@ -41,13 +41,6 @@ def _extract_sheet_id_and_gid(url_or_id: Optional[str]) -> tuple[Optional[str], 
         return sheet_id, gid
     except Exception:
         return None, None
-
-
-DEFAULT_SHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/e/2PACX-1vRT2CXRcmWxmWHKADYfHTadlxBUZ-"
-    "R7nEX7HcAqrBo_PzSKYrCln4HFeCUJTB2q_C7asfwO7AOLNiwh/pub?output=csv"
-)
-
 DEFAULT_PRIVACY_POLICY_URL = "https://telegra.ph/Politika-konfidencialnosti-LOOV-10-29"
 
 
@@ -83,26 +76,6 @@ class SocialLink:
 
     title: str
     url: str
-
-
-DEFAULT_SOCIAL_LINKS: tuple[SocialLink, ...] = (
-    SocialLink(
-        title="Основной loov.ru",
-        url="https://www.instagram.com/loov.ru?igsh=bGZreDRlNXk1cHNn&utm_source=qr",
-    ),
-    SocialLink(
-        title="Loov.raw",
-        url="https://www.instagram.com/loov.raw?igsh=bmtrYWl3OW5heWh2&utm_source=qr",
-    ),
-    SocialLink(
-        title="Loov.meta",
-        url="https://www.instagram.com/loov.meta?igsh=cmZ0Z2M0dzB3cHUx&utm_source=qr",
-    ),
-    SocialLink(
-        title="Loov.core",
-        url="https://www.instagram.com/loov.core?igsh=MWRhMmppdjdzYnYxeg%3D%3D&utm_source=qr",
-    ),
-)
 
 
 @dataclass(slots=True)
@@ -155,39 +128,11 @@ def _get(name: str, default: Optional[str] = None, *, required: bool = False) ->
     return value
 
 
-def _as_bool(value: Optional[str], fallback: bool) -> bool:
-    if not value:
-        return fallback
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "y"}:
-        return True
-    if normalized in {"0", "false", "no", "n"}:
-        return False
-    return fallback
-
-
 def _as_int(value: Optional[str], fallback: int) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         return fallback
-
-
-def _as_positive_int_or_none(value: Optional[str]) -> int | None:
-    if value is None:
-        return None
-    normalized = value.strip()
-    if not normalized:
-        return None
-    try:
-        parsed = int(normalized)
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _as_path(value: Optional[str], fallback: str) -> Path:
-    return Path(value or fallback)
 
 
 def _parse_social_links(raw: Optional[str]) -> list[SocialLink]:
@@ -226,34 +171,20 @@ def load_config(env_file: str | None = None) -> Config:
     else:
         load_dotenv()
 
-    batch_size = max(_as_int(_get("BATCH_SIZE", "2"), 2), 1)
-    batch_columns = max(_as_int(_get("BATCH_LAYOUT_COLS", "2"), 2), 1)
     google_sheet_url = _get("GOOGLE_SHEET_URL")
-    catalog_csv_url = (
-        _get("CATALOG_CSV_URL")
-        or _get("SHEET_CSV_URL")
-        or google_sheet_url
-    )
+    sheet_csv_url = _get("SHEET_CSV_URL")
+    if not sheet_csv_url:
+        if google_sheet_url:
+            sheet_csv_url = google_sheet_url
+        else:
+            raise RuntimeError(
+                "Environment variable SHEET_CSV_URL is required when GOOGLE_SHEET_URL is absent"
+            )
 
-    catalog_sheet_id = (
-        _get("CATALOG_SHEET_ID")
-        or _get("GOOGLE_SHEET_ID")
-        or _get("SHEET_ID")
-    )
-    catalog_sheet_gid = (
-        _get("CATALOG_SHEET_GID")
-        or _get("SHEET_GID")
-        or _get("GOOGLE_SHEET_GID")
-    )
-
-    # Если ID не задан, но есть ссылка — попробуем вытащить из URL
-    if not catalog_sheet_id and google_sheet_url:
-        sid_from_url, gid_from_url = _extract_sheet_id_and_gid(google_sheet_url)
-        if sid_from_url:
-            catalog_sheet_id = sid_from_url
-            logger.info("Derived GOOGLE_SHEET_ID from GOOGLE_SHEET_URL: %s", catalog_sheet_id)
-        if gid_from_url and not catalog_sheet_gid:
-            catalog_sheet_gid = gid_from_url
+    catalog_sheet_id: Optional[str] = None
+    catalog_sheet_gid: Optional[str] = None
+    if google_sheet_url:
+        catalog_sheet_id, catalog_sheet_gid = _extract_sheet_id_and_gid(google_sheet_url)
 
     row_limit_raw = _get("CATALOG_ROW_LIMIT")
     row_limit: int | None = None
@@ -265,122 +196,74 @@ def load_config(env_file: str | None = None) -> Config:
         if parsed_limit > 0:
             row_limit = parsed_limit
 
-    collage = CollageConfig(
-        slot_width=max(_as_int(_get("COLLAGE_SLOT_WIDTH", "1080"), 1080), 1),
-        slot_height=max(_as_int(_get("COLLAGE_SLOT_HEIGHT", "1440"), 1440), 1),
-        separator_width=max(_as_int(_get("COLLAGE_SEPARATOR_WIDTH", "24"), 24), 0),
-        padding=max(_as_int(_get("COLLAGE_PADDING", "0"), 0), 0),
-        separator_color=_get("COLLAGE_SEPARATOR_COLOR", "#2A2A2A") or "#2A2A2A",
-        background=_get("COLLAGE_BACKGROUND", "#000000") or "#000000",
-        output_format=(_get("COLLAGE_FORMAT", "PNG") or "PNG").upper(),
-        jpeg_quality=_as_int(_get("COLLAGE_JPEG_QUALITY", "90"), 90),
-    )
-
-    promo_code = _get("PROMO_CODE", "DEMO 10") or "DEMO 10"
-    promo_contact_raw = _get("PROMO_CONTACT_CODE")
-    if promo_contact_raw is None:
-        promo_contact_code = promo_code or "CONTACT1000"
-    else:
-        promo_contact_code = promo_contact_raw or (promo_code or "CONTACT1000")
-    contact_reward_rub = _as_int(_get("CONTACT_REWARD_RUB", "1000"), 1000)
-    leads_sheet_name = _get("LEADS_SHEET_NAME", "Leads") or "Leads"
-    enable_leads_export = _as_bool(_get("ENABLE_LEADS_EXPORT", "1"), True)
-
-    site_url = _get("SITE_URL")
-    if site_url is None:
-        site_url = _get("LANDING_URL")
-
-    idle_timeout_raw = _get("AFK_SITE")
-    if idle_timeout_raw is None:
-        idle_timeout_raw = _get("IDLE_REMINDER_MINUTES")
-
-    privacy_policy_url = (
-        _get("PRIVACY_POLICY_URL", DEFAULT_PRIVACY_POLICY_URL)
-        or DEFAULT_PRIVACY_POLICY_URL
-    )
-
-    contacts_sheet_url = google_sheet_url
-    google_credentials_raw = _get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    google_credentials_path = (
-        Path(google_credentials_raw)
-        if google_credentials_raw
-        else None
-    )
-
-    promo_video_path = _as_path(
-        _get("PROMO_VIDEO_PATH", "video/promo_start.mp4"), "video/promo_start.mp4"
-    )
-    promo_video_enabled = _as_bool(_get("PROMO_VIDEO_ENABLED", "1"), True)
-    promo_video_width_raw = _get("PROMO_VIDEO_WIDTH")
-    promo_video_height_raw = _get("PROMO_VIDEO_HEIGHT")
-    promo_video_width = _as_positive_int_or_none(promo_video_width_raw)
-    promo_video_height = _as_positive_int_or_none(promo_video_height_raw)
-    if promo_video_width_raw and promo_video_width is None:
-        logger.warning("Invalid PROMO_VIDEO_WIDTH value %r; ignoring", promo_video_width_raw)
-    if promo_video_height_raw and promo_video_height is None:
-        logger.warning("Invalid PROMO_VIDEO_HEIGHT value %r; ignoring", promo_video_height_raw)
-    logger.info(
-        "Promo video config: path=%s, enabled=%s, width=%s, height=%s",
-        promo_video_path,
-        promo_video_enabled,
-        promo_video_width,
-        promo_video_height,
-    )
-
-    api_key = _get("NANOBANANA_API_KEY", required=True) or ""
-    if not api_key.strip():
-        raise RuntimeError("NANOBANANA_API_KEY is required")
+    promo_code = _get("PROMO_CODE") or ""
+    daily_try_limit = _as_int(_get("DAILY_TRY_LIMIT"), 7)
 
     social_links_raw = _get("SOCIAL_LINKS_JSON")
     if social_links_raw is None:
-        social_links = list(DEFAULT_SOCIAL_LINKS)
+        social_links = []
     else:
         parsed_links = _parse_social_links(social_links_raw)
         social_links = parsed_links if parsed_links else []
 
+    pick_scheme_raw = _get("PICK_SCHEME")
+    pick_scheme = (pick_scheme_raw or "UNIVERSAL").strip() or "UNIVERSAL"
+
+    google_credentials_raw = _get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    google_credentials_path = Path(google_credentials_raw) if google_credentials_raw else None
+
+    landing_url = _get("LANDING_URL")
+    site_url = landing_url.strip() if landing_url else "https://loov.ru/"
+
+    promo_contact_code = promo_code or "CONTACT1000"
+
     return Config(
         bot_token=_get("BOT_TOKEN", required=True),
-        sheet_csv_url=(
-            catalog_csv_url
-            or _get("SHEET_CSV_URL", DEFAULT_SHEET_URL)
-            or DEFAULT_SHEET_URL
-        ),
+        sheet_csv_url=sheet_csv_url,
         catalog_sheet_id=catalog_sheet_id,
         catalog_sheet_gid=catalog_sheet_gid,
-        site_url=(site_url or "https://loov.ru/") if site_url is not None else "https://loov.ru/",
-        privacy_policy_url=privacy_policy_url,
+        site_url=site_url,
+        privacy_policy_url=DEFAULT_PRIVACY_POLICY_URL,
         promo_code=promo_code,
-        daily_try_limit=_as_int(_get("DAILY_TRY_LIMIT", "7"), 7),
-        reminder_hours=_as_int(_get("REMINDER_HOURS", "24"), 24),
-        idle_reminder_minutes=_as_int(idle_timeout_raw, 5),
-        csv_fetch_ttl_sec=_as_int(_get("CSV_FETCH_TTL_SEC", "60"), 60),
-        csv_fetch_retries=_as_int(_get("CSV_FETCH_RETRIES", "3"), 3),
+        daily_try_limit=daily_try_limit,
+        reminder_hours=24,
+        idle_reminder_minutes=5,
+        csv_fetch_ttl_sec=60,
+        csv_fetch_retries=3,
         catalog_row_limit=row_limit,
-        uploads_root=_as_path(_get("UPLOADS_ROOT", "./uploads"), "./uploads"),
-        results_root=_as_path(_get("RESULTS_ROOT", "./results"), "./results"),
-        button_title_max=_as_int(_get("BUTTON_TITLE_MAX", "28"), 28),
-        nanobanana_api_key=api_key.strip(),
-        collage=collage,
-        batch_size=batch_size,
-        batch_layout_cols=batch_columns,
-        pick_scheme=_get("PICK_SCHEME", "GENDER_AND_UNISEX_ONLY")
-        or "GENDER_AND_UNISEX_ONLY",
-        reco_clear_on_catalog_change=_as_bool(_get("RECO_CLEAR_ON_CATALOG_CHANGE", "1"), True),
-        reco_no_more_key=_get("MSG_NO_MORE_KEY", "all_seen") or "all_seen",
-        contact_reward_rub=contact_reward_rub,
+        uploads_root=Path("./uploads"),
+        results_root=Path("./results"),
+        button_title_max=28,
+        nanobanana_api_key=_get("NANOBANANA_API_KEY", required=True),
+        collage=CollageConfig(
+            slot_width=1080,
+            slot_height=1440,
+            separator_width=24,
+            padding=0,
+            separator_color="#2A2A2A",
+            background="#000000",
+            output_format="PNG",
+            jpeg_quality=90,
+        ),
+        batch_size=2,
+        batch_layout_cols=2,
+        pick_scheme=pick_scheme,
+        reco_clear_on_catalog_change=True,
+        reco_no_more_key="all_seen",
+        contact_reward_rub=1000,
         promo_contact_code=promo_contact_code,
-        leads_sheet_name=leads_sheet_name,
-        enable_leads_export=enable_leads_export,
-        enable_idle_reminder=_as_bool(_get("ENABLE_IDLE_REMINDER", "1"), True),
-        social_ad_minutes=_as_int(_get("SOCIAL_AD_MINUTES", "20"), 20),
-        enable_social_ad=_as_bool(_get("ENABLE_SOCIAL_AD", "1"), True),
+        leads_sheet_name="Leads",
+        enable_leads_export=True,
+        enable_idle_reminder=True,
+        social_ad_minutes=20,
+        enable_social_ad=True,
         social_links=tuple(social_links),
-        contacts_sheet_url=contacts_sheet_url,
+        contacts_sheet_url=google_sheet_url,
         google_service_account_json=google_credentials_path,
-        promo_video_path=promo_video_path,
-        promo_video_enabled=promo_video_enabled,
-        promo_video_width=promo_video_width,
-        promo_video_height=promo_video_height,
+        promo_video_path=Path("video/promo_start.mp4"),
+        promo_video_enabled=True,
+        promo_video_width=None,
+        promo_video_height=None,
     )
 
 
