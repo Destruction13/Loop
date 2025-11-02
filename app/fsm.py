@@ -29,14 +29,16 @@ from aiogram.types.input_file import BufferedInputFile, FSInputFile, URLInputFil
 
 from app.analytics import track_event
 from app.keyboards import (
+    CONTACT_NEVER_CALLBACK,
+    CONTACT_SHARE_CALLBACK,
+    CONTACT_SKIP_CALLBACK,
     all_seen_keyboard,
     batch_selection_keyboard,
+    contact_request_keyboard,
     gender_keyboard,
     generation_result_keyboard,
-    contact_request_keyboard,
-    limit_reached_keyboard,
-    main_reply_keyboard,
     idle_reminder_keyboard,
+    limit_reached_keyboard,
     more_buttonless_markup,
     privacy_policy_keyboard,
     promo_keyboard,
@@ -319,11 +321,6 @@ def setup_router(
         finally:
             await state.update_data(last_aux_message_id=None)
 
-    async def _build_main_reply_keyboard(state: FSMContext):
-        data = await state.get_data()
-        show_try_button = bool(data.get("allow_try_button", False))
-        return main_reply_keyboard(policy_url, show_try_button=show_try_button)
-
     async def _send_aux_message(
         source_message: Message,
         state: FSMContext,
@@ -340,8 +337,8 @@ def setup_router(
             first_arg = send_args[0]
             if isinstance(first_arg, (list, tuple)):
                 send_args = ("".join(first_arg),) + send_args[1:]
-        if "reply_markup" not in kwargs or kwargs["reply_markup"] is None:
-            kwargs["reply_markup"] = await _build_main_reply_keyboard(state)
+        if "reply_markup" not in kwargs:
+            kwargs["reply_markup"] = None
         sent_message = await send_method(*send_args, **kwargs)
         if track:
             await state.update_data(last_aux_message_id=sent_message.message_id)
@@ -1147,7 +1144,6 @@ def setup_router(
             state,
             message.answer,
             msg.MAIN_MENU_HINT,
-            reply_markup=main_reply_keyboard(policy_url, show_try_button=False),
         )
         info_domain(
             "bot.handlers",
@@ -1338,6 +1334,41 @@ def setup_router(
         await state.update_data(selected_model=selected)
         await state.set_state(TryOnStates.GENERATING)
         await _perform_generation(callback.message, state, selected)
+
+    @router.callback_query(
+        StateFilter(ContactRequest.waiting_for_phone),
+        F.data == CONTACT_SHARE_CALLBACK,
+    )
+    async def contact_share_button(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+
+    @router.callback_query(
+        StateFilter(ContactRequest.waiting_for_phone),
+        F.data == CONTACT_SKIP_CALLBACK,
+    )
+    async def contact_skip_button(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await _complete_contact_skip(callback.message, state)
+
+    @router.callback_query(
+        StateFilter(ContactRequest.waiting_for_phone),
+        F.data == CONTACT_NEVER_CALLBACK,
+    )
+    async def contact_never_button(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        user_id = callback.from_user.id
+        await _reset_phone_attempts(callback.message, state)
+        await repository.set_contact_never(user_id, True)
+        await repository.set_contact_skip_once(user_id, False)
+        await _resume_after_contact(callback.message, state, send_generation=False)
+        current_state = await state.get_state()
+        if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
+            await _prompt_for_next_photo(
+                callback.message,
+                state,
+                msg.ASK_PHONE_NEVER_ACK,
+            )
+        logger.debug("User %s opted out of contacts", user_id)
 
     @router.message(StateFilter(ContactRequest.waiting_for_phone), F.contact)
     async def contact_shared(message: Message, state: FSMContext) -> None:
@@ -1766,14 +1797,37 @@ def setup_router(
                 )
         await callback.answer()
 
-    @router.message(F.text == msg.MAIN_MENU_TRY_BUTTON)
-    async def handle_main_menu_try(message: Message, state: FSMContext) -> None:
+    async def start_wear_flow(
+        message: Message,
+        state: FSMContext,
+        *,
+        bypass_allow: bool,
+        context: str,
+    ) -> None:
         current_state = await state.get_state()
         if current_state == ContactRequest.waiting_for_phone.state:
             return
-        user_id = message.from_user.id
+        if current_state == TryOnStates.GENERATING.state:
+            await message.answer(msg.GENERATION_BUSY)
+            return
         data = await state.get_data()
-        if not data.get("allow_try_button", False):
+        if not bypass_allow and not data.get("allow_try_button", False):
+            return
+        user_id = message.from_user.id
+        profile = await repository.ensure_user(user_id)
+        gender = data.get("gender") or profile.gender
+        if gender:
+            await state.update_data(gender=gender)
+        if not gender:
+            await state.set_state(TryOnStates.FOR_WHO)
+            prompt_message = await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.START_GENDER_PROMPT,
+                reply_markup=gender_keyboard(),
+            )
+            await state.update_data(gender_prompt_message_id=prompt_message.message_id)
             return
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
@@ -1791,7 +1845,7 @@ def setup_router(
                 "🔒 Достигнут дневной лимит",
                 stage="DAILY_LIMIT",
                 user_id=user_id,
-                context="try_button",
+                context=context,
             )
             return
         gen_count = await repository.get_generation_count(user_id)
@@ -1800,9 +1854,27 @@ def setup_router(
         else:
             prompt_text = _resolve_followup_caption(
                 max(gen_count, 1) - 1,
-                data.get("gender"),
+                gender,
             )
         await _prompt_for_next_photo(message, state, prompt_text)
+
+    @router.message(Command("wear"))
+    async def command_wear(message: Message, state: FSMContext) -> None:
+        await start_wear_flow(
+            message,
+            state,
+            bypass_allow=True,
+            context="wear_command",
+        )
+
+    @router.message(F.text == msg.MAIN_MENU_TRY_BUTTON)
+    async def handle_main_menu_try(message: Message, state: FSMContext) -> None:
+        await start_wear_flow(
+            message,
+            state,
+            bypass_allow=False,
+            context="try_button",
+        )
 
     @router.message(Command("privacy"))
     async def command_privacy(message: Message, state: FSMContext) -> None:

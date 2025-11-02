@@ -4,13 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-)
-from aiogram.types.web_app_info import WebAppInfo
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.texts import messages as msg
 
@@ -43,32 +37,6 @@ def start_keyboard() -> InlineKeyboardMarkup:
                 )
             ],
         ]
-    )
-
-
-def main_reply_keyboard(
-    policy_url: str | None = None, *, show_try_button: bool = True
-) -> ReplyKeyboardMarkup:
-    """Persistent reply keyboard with quick actions."""
-
-    sanitized = (policy_url or "").strip()
-    if sanitized:
-        policy_button = KeyboardButton(
-            text=msg.MAIN_MENU_POLICY_BUTTON,
-            web_app=WebAppInfo(url=sanitized),
-        )
-    else:
-        policy_button = KeyboardButton(text=msg.MAIN_MENU_POLICY_BUTTON)
-
-    rows: list[list[KeyboardButton]] = []
-    if show_try_button:
-        rows.append([KeyboardButton(text=msg.MAIN_MENU_TRY_BUTTON)])
-    rows.append([policy_button])
-
-    return ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        one_time_keyboard=False,
-        keyboard=rows,
     )
 
 
@@ -153,7 +121,7 @@ def generation_result_keyboard(site_url: str, remaining: int) -> InlineKeyboardM
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def limit_reached_keyboard(site_url: str, *, use_callback: bool = True) -> InlineKeyboardMarkup:
+def limit_reached_keyboard(site_url: str, *, use_callback: bool = False) -> InlineKeyboardMarkup:
     """Keyboard displayed when daily limit is reached."""
 
     return InlineKeyboardMarkup(
@@ -175,7 +143,7 @@ def limit_reached_keyboard(site_url: str, *, use_callback: bool = True) -> Inlin
     )
 
 
-def promo_keyboard(site_url: str, *, use_callback: bool = True) -> InlineKeyboardMarkup:
+def promo_keyboard(site_url: str, *, use_callback: bool = False) -> InlineKeyboardMarkup:
     """Keyboard attached to the promo code message."""
 
     return InlineKeyboardMarkup(
@@ -265,7 +233,7 @@ def all_seen_keyboard(site_url: str) -> InlineKeyboardMarkup:
                     text=msg.REMIND_LATER_BUTTON_TEXT,
                     callback_data="limit_remind",
                 ),
-                _booking_button(site_url, as_callback=True),
+                _booking_button(site_url, as_callback=False),
             ]
         ]
     )
@@ -340,24 +308,31 @@ def more_buttonless_markup(
             return None
         return social_ad_keyboard(links)
     return None
+CONTACT_SHARE_CALLBACK = "contact_share"
+CONTACT_SKIP_CALLBACK = "contact_skip"
+CONTACT_NEVER_CALLBACK = "contact_never"
 
 
-def contact_request_keyboard() -> ReplyKeyboardMarkup:
-    """Reply keyboard prompting the user to share their phone number."""
+def contact_request_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard prompting the user to share their phone number."""
 
-    return ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        one_time_keyboard=False,
-        keyboard=[
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
-                KeyboardButton(
+                InlineKeyboardButton(
                     text=msg.ASK_PHONE_BUTTON_SHARE,
-                    request_contact=True,
+                    callback_data=CONTACT_SHARE_CALLBACK,
                 )
             ],
             [
-                KeyboardButton(text=msg.ASK_PHONE_BUTTON_SKIP),
-                KeyboardButton(text=msg.ASK_PHONE_BUTTON_NEVER),
+                InlineKeyboardButton(
+                    text=msg.ASK_PHONE_BUTTON_SKIP,
+                    callback_data=CONTACT_SKIP_CALLBACK,
+                ),
+                InlineKeyboardButton(
+                    text=msg.ASK_PHONE_BUTTON_NEVER,
+                    callback_data=CONTACT_NEVER_CALLBACK,
+                ),
             ],
-        ],
+        ]
     )
