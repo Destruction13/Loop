@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List, Optional, Sequence
+from typing import Any, Awaitable, Callable, List, Mapping, Optional, Sequence
 
 from aiogram import BaseMiddleware, F, Router, Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -349,6 +349,31 @@ def setup_router(
             await state.update_data(last_aux_message_id=None)
         return sent_message
 
+    async def _delete_phone_invalid_message(
+        message: Message,
+        state: FSMContext,
+        *,
+        data: Mapping[str, Any] | None = None,
+    ) -> None:
+        payload = data or await state.get_data()
+        invalid_id = payload.get("phone_invalid_message_id")
+        if not invalid_id:
+            return
+        try:
+            await message.bot.delete_message(message.chat.id, int(invalid_id))
+        except TelegramBadRequest as exc:
+            logger.debug(
+                "Failed to delete invalid phone message %s: %s",
+                invalid_id,
+                exc,
+            )
+        finally:
+            await state.update_data(phone_invalid_message_id=None)
+
+    async def _reset_phone_attempts(message: Message, state: FSMContext) -> None:
+        await _delete_phone_invalid_message(message, state)
+        await state.update_data(phone_bad_attempts=0)
+
     async def _send_delivery_message(
         source_message: Message,
         state: FSMContext,
@@ -472,6 +497,14 @@ def setup_router(
         data = await state.get_data()
         if data.get("contact_request_active"):
             return True
+        cooldown = max(int(data.get("contact_request_cooldown") or 0), 0)
+        if cooldown > 0:
+            logger.debug(
+                "Contact prompt cooldown active for user %s (remaining=%s)",
+                user_id,
+                cooldown,
+            )
+            return False
         profile = await repository.ensure_user(user_id)
         if profile.contact_never:
             return False
@@ -500,15 +533,21 @@ def setup_router(
         }
         if pending_state and pending_state != data.get("contact_pending_result_state"):
             update_payload["contact_pending_result_state"] = pending_state
-        await state.update_data(**update_payload)
-        await state.set_state(ContactRequest.waiting_for_phone)
-        await _send_aux_message(
+        prompt_message = await _send_aux_message(
             message,
             state,
             message.answer,
             prompt_text,
             reply_markup=contact_request_keyboard(),
         )
+        update_payload.update(
+            phone_bad_attempts=0,
+            phone_invalid_message_id=None,
+            contact_prompt_message_id=prompt_message.message_id,
+            contact_request_cooldown=0,
+        )
+        await state.update_data(**update_payload)
+        await state.set_state(ContactRequest.waiting_for_phone)
         logger.debug("Contact request issued for user %s", user_id)
         info_domain(
             "bot.handlers",
@@ -614,6 +653,7 @@ def setup_router(
         await state.update_data(
             contact_request_active=False,
             contact_pending_result_state=None,
+            contact_prompt_message_id=None,
         )
         if pending_state == "limit":
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
@@ -637,6 +677,35 @@ def setup_router(
             )
         else:
             await state.update_data(contact_pending_generation=False)
+
+    async def _complete_contact_skip(
+        message: Message,
+        state: FSMContext,
+        *,
+        manual: bool = False,
+    ) -> None:
+        user_id = message.from_user.id
+        await repository.set_contact_skip_once(user_id, True)
+        await _reset_phone_attempts(message, state)
+        await _resume_after_contact(message, state, send_generation=False)
+        current_state = await state.get_state()
+        if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
+            await _prompt_for_next_photo(message, state, msg.ASK_PHONE_SKIP_ACK)
+        if manual:
+            logger.debug("User %s skipped contact once", user_id)
+        else:
+            logger.debug("User %s auto-skipped phone request", user_id)
+
+    async def _handle_phone_invalid_attempt(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        attempts = int(data.get("phone_bad_attempts") or 0) + 1
+        await state.update_data(phone_bad_attempts=attempts)
+        await _delete_phone_invalid_message(message, state, data=data)
+        if attempts >= 3:
+            await _complete_contact_skip(message, state)
+            return
+        invalid_message = await message.answer(msg.ASK_PHONE_INVALID)
+        await state.update_data(phone_invalid_message_id=invalid_message.message_id)
 
     async def _export_lead(
         user_id: int,
@@ -797,13 +866,9 @@ def setup_router(
         raw = (message.text or "").strip()
         normalized = normalize_phone(raw)
         if not normalized:
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
-                msg.ASK_PHONE_INVALID,
-            )
+            await _handle_phone_invalid_attempt(message, state)
             return
+        await _reset_phone_attempts(message, state)
         await _store_contact(message, state, normalized, source=source)
 
     async def _send_batch_message(
@@ -938,8 +1003,39 @@ def setup_router(
 
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
-        await repository.ensure_user(message.from_user.id)
-        await track_event(str(message.from_user.id), "start")
+        user_id = message.from_user.id
+        previous_state = await state.get_state()
+        previous_data = await state.get_data()
+        contact_was_active = (
+            previous_state == ContactRequest.waiting_for_phone.state
+            or bool(previous_data.get("contact_request_active"))
+        )
+        if previous_data:
+            await _delete_phone_invalid_message(message, state, data=previous_data)
+        await _delete_last_aux_message(message, state)
+        await state.clear()
+        profile = await repository.ensure_user(user_id)
+        ignored_phone = profile.contact_skip_once or contact_was_active
+        if contact_was_active and not profile.contact_skip_once and not profile.contact_never:
+            await repository.set_contact_skip_once(user_id, True)
+            ignored_phone = True
+        contact_record = await repository.get_user_contact(user_id)
+        has_contact = bool(contact_record and contact_record.consent)
+        remaining = await repository.remaining_tries(user_id)
+        contact_never = profile.contact_never
+        if (
+            remaining < 2
+            and ignored_phone
+            and not contact_never
+            and not has_contact
+        ):
+            await repository.set_contact_never(user_id, True)
+            await repository.set_contact_skip_once(user_id, False)
+            contact_never = True
+        contact_cooldown = 0
+        if not has_contact and not contact_never and remaining >= 2:
+            contact_cooldown = 2
+        await track_event(str(user_id), "start")
         text = message.text or ""
         if "ref_" in text:
             parts = text.split()
@@ -948,12 +1044,17 @@ def setup_router(
                 if ref_part.startswith("ref_"):
                     ref_id = ref_part.replace("ref_", "")
                     try:
-                        await repository.set_referrer(message.from_user.id, int(ref_id))
+                        await repository.set_referrer(user_id, int(ref_id))
                     except ValueError:
                         pass
         await state.set_state(TryOnStates.START)
         await state.update_data(
             allow_try_button=False,
+            contact_request_cooldown=contact_cooldown,
+            phone_bad_attempts=0,
+            phone_invalid_message_id=None,
+            contact_request_active=False,
+            contact_prompt_message_id=None,
         )
         promo_video_log = {
             "path": str(promo_video_path),
@@ -1242,22 +1343,13 @@ def setup_router(
     async def contact_shared(message: Message, state: FSMContext) -> None:
         contact = message.contact
         if not contact or not contact.phone_number:
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
-                msg.ASK_PHONE_INVALID,
-            )
+            await _handle_phone_invalid_attempt(message, state)
             return
         normalized = normalize_phone(contact.phone_number)
         if not normalized:
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
-                msg.ASK_PHONE_INVALID,
-            )
+            await _handle_phone_invalid_attempt(message, state)
             return
+        await _reset_phone_attempts(message, state)
         await _store_contact(
             message,
             state,
@@ -1271,14 +1363,10 @@ def setup_router(
         text = (message.text or "").strip()
         user_id = message.from_user.id
         if text == msg.ASK_PHONE_BUTTON_SKIP:
-            await repository.set_contact_skip_once(user_id, True)
-            await _resume_after_contact(message, state, send_generation=False)
-            current_state = await state.get_state()
-            if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
-                await _prompt_for_next_photo(message, state, msg.ASK_PHONE_SKIP_ACK)
-            logger.debug("User %s skipped contact once", user_id)
+            await _complete_contact_skip(message, state, manual=True)
             return
         if text == msg.ASK_PHONE_BUTTON_NEVER:
+            await _reset_phone_attempts(message, state)
             await repository.set_contact_never(user_id, True)
             await repository.set_contact_skip_once(user_id, False)
             await _resume_after_contact(message, state, send_generation=False)
@@ -1291,12 +1379,7 @@ def setup_router(
 
     @router.message(StateFilter(ContactRequest.waiting_for_phone))
     async def contact_fallback(message: Message, state: FSMContext) -> None:
-        await _send_aux_message(
-            message,
-            state,
-            message.answer,
-            msg.ASK_PHONE_INVALID,
-        )
+        await _handle_phone_invalid_attempt(message, state)
 
     async def _perform_generation(message: Message, state: FSMContext, model: GlassModel) -> None:
         user_id = message.chat.id
@@ -1479,6 +1562,9 @@ def setup_router(
 
         await repository.inc_used_on_success(user_id)
         remaining = await repository.remaining_tries(user_id)
+        cooldown = max(int(data.get("contact_request_cooldown") or 0), 0)
+        if cooldown > 0:
+            await state.update_data(contact_request_cooldown=cooldown - 1)
         plan = resolve_generation_followup(
             first_generated_today=data.get("first_generated_today", True),
             remaining=remaining,
