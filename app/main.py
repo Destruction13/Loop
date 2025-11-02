@@ -11,6 +11,7 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand, MenuButtonCommands
 
 from app.analytics import (
     AnalyticsExporter,
@@ -117,6 +118,14 @@ async def main() -> None:
     nanobanana.configure(config.nanobanana_api_key)
 
     bot = Bot(token=config.bot_token, parse_mode=ParseMode.HTML)
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Запуск бота"),
+            BotCommand(command="wear", description="Примерить новые очки"),
+            BotCommand(command="privacy", description="Политика конфиденциальности"),
+        ]
+    )
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     dp = Dispatcher()
     dp.update.middleware(LoggingMiddleware())
 

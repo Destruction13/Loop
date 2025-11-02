@@ -14,7 +14,6 @@ from app.fsm import ContactRequest, TryOnStates, setup_router
 from app.keyboards import (
     contact_request_keyboard,
     limit_reached_keyboard,
-    main_reply_keyboard,
     promo_keyboard,
 )
 from app.models import GlassModel
@@ -456,6 +455,11 @@ def build_router(
     fsm_module.fetch_drive_file = fake_fetch_drive_file  # type: ignore[assignment]
     fsm_module.generate_glasses = fake_generate_glasses  # type: ignore[assignment]
 
+    async def fake_track_event(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    fsm_module.track_event = fake_track_event  # type: ignore[assignment]
+
     router = setup_router(
         repository=repository,
         recommender=recommender,
@@ -496,12 +500,8 @@ def get_message_handler(router: Any, name: str):
     raise AssertionError(f"Message handler {name} not found")
 
 
-def assert_main_menu_keyboard(markup: Any, *, show_try_button: bool = True) -> None:
-    expected = main_reply_keyboard(
-        TEST_PRIVACY_POLICY_URL, show_try_button=show_try_button
-    )
-    assert hasattr(markup, "keyboard")
-    assert markup.keyboard == expected.keyboard
+def assert_no_reply_keyboard(markup: Any) -> None:
+    assert markup is None
 
 
 def test_select_gender_deletes_prompt_and_waits_for_photo(tmp_path: Path) -> None:
@@ -521,7 +521,7 @@ def test_select_gender_deletes_prompt_and_waits_for_photo(tmp_path: Path) -> Non
         assert repository.updated_filters == [(123, "male")]
         assert bot.deleted == [(123, message.message_id)]
         assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
-        assert_main_menu_keyboard(message.answers[-1][1], show_try_button=False)
+        assert_no_reply_keyboard(message.answers[-1][1])
 
     asyncio.run(scenario())
 
@@ -796,7 +796,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         await handler_more(callback_follow, state)
         assert state.state is TryOnStates.AWAITING_PHOTO
         assert upload_message.answers[-1][0] == "".join(msg.PHOTO_INSTRUCTION)
-        assert_main_menu_keyboard(upload_message.answers[-1][1])
+        assert_no_reply_keyboard(upload_message.answers[-1][1])
         assert upload_message.edited_captions
         last_caption_edit = upload_message.edited_captions[-1]
         assert last_caption_edit[0] == model.title
@@ -1029,7 +1029,7 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
         await handler_more(more_callback, state)
         assert state.state is TryOnStates.AWAITING_PHOTO
         assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
-        assert_main_menu_keyboard(message.answers[-1][1])
+        assert_no_reply_keyboard(message.answers[-1][1])
 
         message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]
         await handler_photo(message, state)
@@ -1047,9 +1047,11 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
         ] == [msg.DETAILS_BUTTON_TEXT]
         assert state.state is ContactRequest.waiting_for_phone
         assert message.answers[-1][0].startswith(f"<b>{msg.ASK_PHONE_TITLE}")
+        prompt_markup = message.answers[-1][1]
+        assert isinstance(prompt_markup, InlineKeyboardMarkup)
         assert (
-            message.answers[-1][1].keyboard
-            == contact_request_keyboard().keyboard
+            prompt_markup.inline_keyboard
+            == contact_request_keyboard().inline_keyboard
         )
 
     asyncio.run(scenario())
@@ -1112,9 +1114,9 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
         assert contact_message.answers[0][0] == msg.ASK_PHONE_THANKS.format(
             rub=1000, promo="PROMO1000"
         )
-        assert_main_menu_keyboard(contact_message.answers[0][1])
+        assert_no_reply_keyboard(contact_message.answers[0][1])
         assert contact_message.answers[1][0] == "".join(msg.THIRD_RESULT_CAPTION)
-        assert_main_menu_keyboard(contact_message.answers[1][1])
+        assert_no_reply_keyboard(contact_message.answers[1][1])
 
     asyncio.run(scenario())
 
