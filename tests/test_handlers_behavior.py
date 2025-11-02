@@ -1128,6 +1128,52 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
     asyncio.run(scenario())
 
 
+def test_phone_prompt_limit_requests_fresh_photo(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path)
+        handler_contact_text = get_message_handler(router, "contact_text")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=913, bot=bot)
+        state = DummyState()
+        await state.set_state(TryOnStates.RESULT)
+        await state.update_data(
+            contact_request_active=True,
+            contact_pending_generation=False,
+            contact_pending_result_state="result",
+        )
+
+        message.text = "не номер"
+        await handler_contact_text(message, state)
+
+        assert state.data.get("phone_prompt_attempts") == 1
+        assert message.answers[-1][0] == "".join(msg.ASK_PHONE_INVALID)
+
+        await state.update_data(
+            contact_request_active=True,
+            contact_pending_generation=False,
+            contact_pending_result_state="result",
+        )
+
+        message.text = "всё ещё нет"
+        await handler_contact_text(message, state)
+
+        assert state.data.get("phone_prompt_attempts") == 2
+        assert state.data.get("phone_prompt_disabled") is True
+        assert state.data.get("phone_prompt_disabled_reason") == "limit"
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert state.data.get("upload") is None
+        assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
+        # предыдущая подсказка о лимите должна быть отправлена и затем удалена
+        limit_message = "".join(msg.ASK_PHONE_LIMIT_REACHED)
+        assert any(text == limit_message for text, _ in message.answers)
+        assert any(
+            deleted_id > message.message_id for _, deleted_id in bot.deleted
+        )
+
+    asyncio.run(scenario())
+
+
 def test_contact_reminder_after_skip_happens_post_generation(tmp_path: Path) -> None:
     models = [
         GlassModel(

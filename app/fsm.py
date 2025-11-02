@@ -269,7 +269,6 @@ def setup_router(
             response_text,
             reply_markup=reply_markup,
         )
-        await _resume_after_contact(message, state, send_generation=True)
         if limit_reached:
             info_domain(
                 "bot.handlers",
@@ -278,6 +277,17 @@ def setup_router(
                 user_id=message.from_user.id,
                 attempt=attempt_no,
             )
+            await _resume_after_contact(message, state, send_generation=False)
+            await _prompt_for_next_photo(message, state, msg.PHOTO_INSTRUCTION)
+            info_domain(
+                "bot.handlers",
+                "📸 Запрошено новое фото после лимита номера",
+                stage="CONTACT_LIMIT_AWAIT_PHOTO",
+                user_id=message.from_user.id,
+                attempt=attempt_no,
+            )
+            return
+        await _resume_after_contact(message, state, send_generation=True)
 
 
     def _cancel_idle_timer(user_id: int) -> None:
