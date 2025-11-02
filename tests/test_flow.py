@@ -67,14 +67,20 @@ def test_limit_flow_keyboards() -> None:
     limit_keyboard = limit_reached_keyboard(landing)
 
     assert [len(row) for row in limit_keyboard.inline_keyboard] == [1, 1, 1]
-    assert limit_keyboard.inline_keyboard[0][0].url == landing
+    assert limit_keyboard.inline_keyboard[0][0].callback_data == "cta_book"
     assert limit_keyboard.inline_keyboard[1][0].callback_data == "limit_promo"
     assert limit_keyboard.inline_keyboard[2][0].callback_data == "limit_remind"
 
+    limit_keyboard_url = limit_reached_keyboard(landing, use_callback=False)
+    assert limit_keyboard_url.inline_keyboard[0][0].url == landing
+
     promo = promo_keyboard(landing)
     assert [len(row) for row in promo.inline_keyboard] == [1, 1]
-    assert promo.inline_keyboard[0][0].url == landing
+    assert promo.inline_keyboard[0][0].callback_data == "cta_book"
     assert promo.inline_keyboard[1][0].callback_data == "limit_remind"
+
+    promo_url = promo_keyboard(landing, use_callback=False)
+    assert promo_url.inline_keyboard[0][0].url == landing
 
 
 def test_promo_message_inserts_code() -> None:

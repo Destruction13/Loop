@@ -203,6 +203,9 @@ async def main() -> None:
         promo_video_enabled=config.promo_video_enabled,
         promo_video_width=config.promo_video_width,
         promo_video_height=config.promo_video_height,
+        phone_prompt_max_iter=config.phone_prompt_max_iter,
+        phone_prompt_ttl_minutes=config.phone_prompt_ttl_minutes,
+        phone_ask_enabled=config.phone_ask_enabled,
     )
     dp.include_router(router)
 

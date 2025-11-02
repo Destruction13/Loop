@@ -159,6 +159,9 @@ def setup_router(
     promo_video_enabled: bool,
     promo_video_width: int | None,
     promo_video_height: int | None,
+    phone_prompt_max_iter: int,
+    phone_prompt_ttl_minutes: int,
+    phone_ask_enabled: bool,
 ) -> Router:
     router = Router()
     logger = get_logger("bot.handlers")
@@ -168,6 +171,114 @@ def setup_router(
     idle_tasks: dict[int, asyncio.Task] = {}
 
     policy_url = (privacy_policy_url or "").strip()
+    phone_prompt_limit = max(int(phone_prompt_max_iter), 0)
+    phone_prompt_ttl = max(int(phone_prompt_ttl_minutes), 0) * 60
+    phone_prompt_enabled = bool(phone_ask_enabled)
+
+    def _mask_phone(raw: str | None) -> str:
+        if not raw:
+            return ""
+        stripped = raw.strip()
+        if len(stripped) <= 4:
+            return "*" * len(stripped)
+        return f"{'*' * (len(stripped) - 4)}{stripped[-4:]}"
+
+    async def _reset_phone_prompt_state(state: FSMContext) -> None:
+        await state.update_data(
+            phone_prompt_attempts=0,
+            phone_prompt_last_ts=None,
+            phone_prompt_disabled=False,
+            phone_prompt_disabled_reason=None,
+        )
+
+    async def _ensure_phone_prompt_meta(state: FSMContext) -> dict[str, Any]:
+        data = await state.get_data()
+        attempts = int(data.get("phone_prompt_attempts") or 0)
+        last_ts_raw = data.get("phone_prompt_last_ts")
+        last_ts = float(last_ts_raw) if last_ts_raw else 0.0
+        disabled = bool(data.get("phone_prompt_disabled", False))
+        reason = data.get("phone_prompt_disabled_reason")
+        if phone_prompt_ttl > 0 and last_ts:
+            now_ts = time.time()
+            if now_ts - last_ts >= phone_prompt_ttl:
+                attempts = 0
+                last_ts = 0.0
+                update_payload: dict[str, Any] = {
+                    "phone_prompt_attempts": attempts,
+                    "phone_prompt_last_ts": None,
+                }
+                if disabled and reason == "limit":
+                    disabled = False
+                    reason = None
+                    update_payload.update(
+                        phone_prompt_disabled=disabled,
+                        phone_prompt_disabled_reason=reason,
+                    )
+                await state.update_data(**update_payload)
+        return {
+            "attempts": attempts,
+            "last_ts": last_ts,
+            "disabled": disabled,
+            "reason": reason,
+        }
+
+    async def _register_phone_attempt(state: FSMContext) -> dict[str, Any]:
+        meta = await _ensure_phone_prompt_meta(state)
+        now_ts = time.time()
+        attempts = meta["attempts"] + 1
+        await state.update_data(
+            phone_prompt_attempts=attempts,
+            phone_prompt_last_ts=now_ts,
+        )
+        meta.update({"attempts": attempts, "last_ts": now_ts})
+        return meta
+
+    async def _disable_phone_prompt(state: FSMContext, *, reason: str) -> None:
+        await state.update_data(
+            phone_prompt_disabled=True,
+            phone_prompt_disabled_reason=reason,
+        )
+
+    async def _handle_invalid_phone_input(
+        message: Message,
+        state: FSMContext,
+        *,
+        reason: str,
+    ) -> None:
+        meta = await _register_phone_attempt(state)
+        attempt_no = meta["attempts"]
+        info_domain(
+            "bot.handlers",
+            "☎️ Номер не распознан",
+            stage="CONTACT_PHONE_INVALID",
+            user_id=message.from_user.id,
+            attempt=attempt_no,
+            reason=reason,
+        )
+        limit_reached = phone_prompt_limit > 0 and attempt_no >= phone_prompt_limit
+        if limit_reached:
+            await _disable_phone_prompt(state, reason="limit")
+        reply_markup = contact_request_keyboard() if not limit_reached else None
+        response_text = (
+            msg.ASK_PHONE_LIMIT_REACHED if limit_reached else msg.ASK_PHONE_INVALID
+        )
+        await _send_aux_message(
+            message,
+            state,
+            message.answer,
+            response_text,
+            reply_markup=reply_markup,
+        )
+        await _resume_after_contact(message, state, send_generation=True)
+        if limit_reached:
+            info_domain(
+                "bot.handlers",
+                "☎️ Достигнут лимит запросов номера",
+                stage="CONTACT_PROMPT_LIMIT",
+                user_id=message.from_user.id,
+                attempt=attempt_no,
+            )
+
 
     def _cancel_idle_timer(user_id: int) -> None:
         task = idle_tasks.pop(user_id, None)
@@ -469,9 +580,29 @@ def setup_router(
         *,
         origin_state: Optional[str] = None,
     ) -> bool:
+        if not phone_prompt_enabled:
+            return False
         data = await state.get_data()
         if data.get("contact_request_active"):
-            return True
+            await state.update_data(
+                contact_request_active=False,
+                contact_pending_generation=False,
+            )
+            info_domain(
+                "bot.handlers",
+                "☎️ Активный запрос номера пропущен",
+                stage="CONTACT_PROMPT_SKIPPED",
+                user_id=user_id,
+            )
+            return False
+        meta = await _ensure_phone_prompt_meta(state)
+        if phone_prompt_limit == 0:
+            return False
+        if meta["disabled"]:
+            return False
+        if meta["attempts"] >= phone_prompt_limit:
+            await _disable_phone_prompt(state, reason="limit")
+            return False
         profile = await repository.ensure_user(user_id)
         if profile.contact_never:
             return False
@@ -501,7 +632,6 @@ def setup_router(
         if pending_state and pending_state != data.get("contact_pending_result_state"):
             update_payload["contact_pending_result_state"] = pending_state
         await state.update_data(**update_payload)
-        await state.set_state(ContactRequest.waiting_for_phone)
         await _send_aux_message(
             message,
             state,
@@ -510,6 +640,13 @@ def setup_router(
             reply_markup=contact_request_keyboard(),
         )
         logger.debug("Contact request issued for user %s", user_id)
+        info_domain(
+            "bot.handlers",
+            "☎️ Запрос телефона показан",
+            stage="CONTACT_PROMPT",
+            user_id=user_id,
+            pending_state=pending_state or current_state,
+        )
         info_domain(
             "bot.handlers",
             "⛔ Генерация пропущена — причина=contact_request",
@@ -703,6 +840,7 @@ def setup_router(
         user = message.from_user
         user_id = user.id
         await track_event(str(user_id), "phone_shared", value="yes")
+        await _reset_phone_prompt_state(state)
         existing = await repository.get_user_contact(user_id)
         consent_ts = int(time.time())
         contact = UserContact(
@@ -755,6 +893,14 @@ def setup_router(
                 user_id,
                 source,
             )
+            info_domain(
+                "bot.handlers",
+                "☎️ Номер сохранён",
+                stage="CONTACT_SAVED",
+                user_id=user_id,
+                phone=_mask_phone(original_phone or phone_e164),
+                source=source,
+            )
             await _resume_after_contact(message, state, send_generation=False)
             current_state = await state.get_state()
             if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
@@ -789,6 +935,12 @@ def setup_router(
                 msg.ASK_PHONE_ALREADY_HAVE,
             )
             logger.debug("Contact already existed for user %s", user_id)
+            info_domain(
+                "bot.handlers",
+                "☎️ Номер уже сохранён",
+                stage="CONTACT_EXISTS",
+                user_id=user_id,
+            )
         await _resume_after_contact(message, state, send_generation=True)
 
     async def _handle_manual_phone(
@@ -797,11 +949,8 @@ def setup_router(
         raw = (message.text or "").strip()
         normalized = normalize_phone(raw)
         if not normalized:
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
-                msg.ASK_PHONE_INVALID,
+            await _handle_invalid_phone_input(
+                message, state, reason="invalid_text"
             )
             return
         await _store_contact(message, state, normalized, source=source)
@@ -940,6 +1089,18 @@ def setup_router(
     async def handle_start(message: Message, state: FSMContext) -> None:
         await repository.ensure_user(message.from_user.id)
         await track_event(str(message.from_user.id), "start")
+        await _reset_phone_prompt_state(state)
+        await state.update_data(
+            contact_request_active=False,
+            contact_pending_result_state=None,
+            contact_pending_generation=False,
+        )
+        info_domain(
+            "bot.handlers",
+            "☎️ Контактный флоу сброшен по /start",
+            stage="CONTACT_RESET",
+            user_id=message.from_user.id,
+        )
         text = message.text or ""
         if "ref_" in text:
             parts = text.split()
@@ -1238,25 +1399,37 @@ def setup_router(
         await state.set_state(TryOnStates.GENERATING)
         await _perform_generation(callback.message, state, selected)
 
-    @router.message(StateFilter(ContactRequest.waiting_for_phone), F.contact)
+    @router.message(F.contact)
     async def contact_shared(message: Message, state: FSMContext) -> None:
         contact = message.contact
+        data = await state.get_data()
+        prompt_active = bool(data.get("contact_request_active"))
         if not contact or not contact.phone_number:
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
-                msg.ASK_PHONE_INVALID,
-            )
+            if prompt_active:
+                await _handle_invalid_phone_input(
+                    message, state, reason="empty_contact"
+                )
+            else:
+                await _send_aux_message(
+                    message,
+                    state,
+                    message.answer,
+                    msg.ASK_PHONE_INVALID,
+                )
             return
         normalized = normalize_phone(contact.phone_number)
         if not normalized:
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
-                msg.ASK_PHONE_INVALID,
-            )
+            if prompt_active:
+                await _handle_invalid_phone_input(
+                    message, state, reason="invalid_contact"
+                )
+            else:
+                await _send_aux_message(
+                    message,
+                    state,
+                    message.answer,
+                    msg.ASK_PHONE_INVALID,
+                )
             return
         await _store_contact(
             message,
@@ -1266,19 +1439,34 @@ def setup_router(
             original_phone=contact.phone_number,
         )
 
-    @router.message(StateFilter(ContactRequest.waiting_for_phone), F.text)
+    @router.message(F.text)
     async def contact_text(message: Message, state: FSMContext) -> None:
         text = (message.text or "").strip()
         user_id = message.from_user.id
+        if text.startswith("/"):
+            return
+        data = await state.get_data()
+        prompt_active = bool(data.get("contact_request_active"))
         if text == msg.ASK_PHONE_BUTTON_SKIP:
+            if not prompt_active:
+                return
             await repository.set_contact_skip_once(user_id, True)
             await _resume_after_contact(message, state, send_generation=False)
             current_state = await state.get_state()
             if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
                 await _prompt_for_next_photo(message, state, msg.ASK_PHONE_SKIP_ACK)
             logger.debug("User %s skipped contact once", user_id)
+            await _reset_phone_prompt_state(state)
+            info_domain(
+                "bot.handlers",
+                "☎️ Пользователь нажал 'Не сейчас'",
+                stage="CONTACT_SKIP",
+                user_id=user_id,
+            )
             return
         if text == msg.ASK_PHONE_BUTTON_NEVER:
+            if not prompt_active:
+                return
             await repository.set_contact_never(user_id, True)
             await repository.set_contact_skip_once(user_id, False)
             await _resume_after_contact(message, state, send_generation=False)
@@ -1286,16 +1474,30 @@ def setup_router(
             if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
                 await _prompt_for_next_photo(message, state, msg.ASK_PHONE_NEVER_ACK)
             logger.debug("User %s opted out of contacts", user_id)
+            await _reset_phone_prompt_state(state)
+            await _disable_phone_prompt(state, reason="never")
+            info_domain(
+                "bot.handlers",
+                "☎️ Пользователь отключил запрос номера",
+                stage="CONTACT_NEVER",
+                user_id=user_id,
+            )
             return
-        await _handle_manual_phone(message, state, source="manual")
+        if prompt_active:
+            await _handle_manual_phone(message, state, source="manual")
+            return
+        normalized = normalize_phone(text)
+        if not normalized:
+            return
+        await _store_contact(message, state, normalized, source="manual")
 
-    @router.message(StateFilter(ContactRequest.waiting_for_phone))
+    @router.message(~F.text, ~F.contact, ~F.photo)
     async def contact_fallback(message: Message, state: FSMContext) -> None:
-        await _send_aux_message(
-            message,
-            state,
-            message.answer,
-            msg.ASK_PHONE_INVALID,
+        data = await state.get_data()
+        if not data.get("contact_request_active"):
+            return
+        await _handle_invalid_phone_input(
+            message, state, reason=message.content_type or "unknown"
         )
 
     async def _perform_generation(message: Message, state: FSMContext, model: GlassModel) -> None:
@@ -1682,9 +1884,6 @@ def setup_router(
 
     @router.message(F.text == msg.MAIN_MENU_TRY_BUTTON)
     async def handle_main_menu_try(message: Message, state: FSMContext) -> None:
-        current_state = await state.get_state()
-        if current_state == ContactRequest.waiting_for_phone.state:
-            return
         user_id = message.from_user.id
         data = await state.get_data()
         if not data.get("allow_try_button", False):

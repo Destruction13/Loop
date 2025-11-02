@@ -10,7 +10,7 @@ from aiogram.types import InlineKeyboardMarkup
 from PIL import Image
 
 from app.config import CollageConfig
-from app.fsm import ContactRequest, TryOnStates, setup_router
+from app.fsm import TryOnStates, setup_router
 from app.keyboards import (
     contact_request_keyboard,
     limit_reached_keyboard,
@@ -397,6 +397,7 @@ def build_router(
 
     from app import fsm as fsm_module
     from app.services import drive_fetch, image_io, nanobanana
+    from app.analytics import track
 
     async def fake_save_user_photo(message: DummyMessage, tmp_dir: str = "tmp") -> str:
         destination = tmp_path / f"user_{message.from_user.id}.jpg"
@@ -455,6 +456,11 @@ def build_router(
     fsm_module.resize_inplace = fake_resize_inplace  # type: ignore[assignment]
     fsm_module.fetch_drive_file = fake_fetch_drive_file  # type: ignore[assignment]
     fsm_module.generate_glasses = fake_generate_glasses  # type: ignore[assignment]
+    async def fake_track_event(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    fsm_module.track_event = fake_track_event  # type: ignore[assignment]
+    track.track_event = fake_track_event  # type: ignore[assignment]
 
     router = setup_router(
         repository=repository,
@@ -478,6 +484,9 @@ def build_router(
         promo_video_enabled=False,
         promo_video_width=None,
         promo_video_height=None,
+        phone_prompt_max_iter=2,
+        phone_prompt_ttl_minutes=15,
+        phone_ask_enabled=True,
     )
     return router, repository, tryon, builder, recommender
 
@@ -644,9 +653,9 @@ def test_exhausted_message_flow(tmp_path: Path) -> None:
         assert len(markup.inline_keyboard) == 1
         assert len(markup.inline_keyboard[0]) == 2
         assert markup.inline_keyboard[0][0].callback_data == "limit_remind"
-        assert markup.inline_keyboard[0][1].url == "https://example.com"
+        assert markup.inline_keyboard[0][1].callback_data == "cta_book"
 
-    asyncio.run(scenario())
+        asyncio.run(scenario())
 
 
 def test_collage_source_unavailable_falls_back_to_text(tmp_path: Path) -> None:
@@ -816,7 +825,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         assert [
             button.text for button in second_result[2].inline_keyboard[0]
         ] == [msg.DETAILS_BUTTON_TEXT]
-        assert state.state is ContactRequest.waiting_for_phone
+        assert state.data.get("contact_request_active") is True
         assert upload_message.answers[-1][0].startswith(
             f"<b>{msg.ASK_PHONE_TITLE}"
         )
@@ -1045,7 +1054,7 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
         assert [
             button.text for button in second_result[2].inline_keyboard[0]
         ] == [msg.DETAILS_BUTTON_TEXT]
-        assert state.state is ContactRequest.waiting_for_phone
+        assert state.data.get("contact_request_active") is True
         assert message.answers[-1][0].startswith(f"<b>{msg.ASK_PHONE_TITLE}")
         assert (
             message.answers[-1][1].keyboard
@@ -1099,7 +1108,7 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
         await handler_photo(message, state)
         await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
 
-        assert state.state is ContactRequest.waiting_for_phone
+        assert state.data.get("contact_request_active") is True
         photos_before = list(message.answer_photos)
 
         contact_message = DummyMessage(user_id=888, bot=bot, message_id=400)
@@ -1166,7 +1175,7 @@ def test_contact_reminder_after_skip_happens_post_generation(tmp_path: Path) -> 
 
         assert repository.gen_counts[user_id] == 6
         assert len(message.answer_photos) >= 1
-        assert state.state is ContactRequest.waiting_for_phone
+        assert state.data.get("contact_request_active") is True
         assert message.answers[-1][0].startswith(f"<b>{msg.ASK_PHONE_TITLE}")
 
     asyncio.run(scenario())

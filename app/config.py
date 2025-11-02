@@ -131,6 +131,9 @@ class Config:
     analytics_dashboard_sheet_name: str
     analytics_flush_interval_sec: int
     analytics_spreadsheet_id: str | None
+    phone_prompt_max_iter: int
+    phone_prompt_ttl_minutes: int
+    phone_ask_enabled: bool
 
 
 def _require_env(name: str) -> str:
@@ -174,6 +177,18 @@ def _parse_int_env(name: str, default: int, *, minimum: Optional[int] = None) ->
     if minimum is not None and value < minimum:
         raise RuntimeError(f"{name} must be greater than or equal to {minimum}")
     return value
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = _optional_env(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be a boolean value (true/false)")
 
 
 def _parse_social_links(raw: Optional[str]) -> list[SocialLink]:
@@ -254,6 +269,9 @@ def load_config(env_file: str | None = None) -> Config:
         "ANALYTICS_FLUSH_INTERVAL_SEC", 30, minimum=5
     )
     analytics_spreadsheet_id = (_optional_env("LOG_SHEET_ID") or "").strip() or None
+    phone_prompt_max_iter = _parse_int_env("PHONE_PROMPT_MAX_ITER", 2, minimum=0)
+    phone_prompt_ttl_minutes = _parse_int_env("PHONE_PROMPT_TTL_MIN", 15, minimum=0)
+    phone_ask_enabled = _parse_bool_env("PHONE_ASK_ENABLED", True)
 
     return Config(
         bot_token=bot_token,
@@ -307,6 +325,9 @@ def load_config(env_file: str | None = None) -> Config:
         analytics_dashboard_sheet_name=analytics_dashboard_sheet_name,
         analytics_flush_interval_sec=analytics_flush_interval_sec,
         analytics_spreadsheet_id=analytics_spreadsheet_id,
+        phone_prompt_max_iter=phone_prompt_max_iter,
+        phone_prompt_ttl_minutes=phone_prompt_ttl_minutes,
+        phone_ask_enabled=phone_ask_enabled,
     )
 
 
