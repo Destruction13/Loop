@@ -204,6 +204,8 @@ class StubRepository:
             daily_try_limit=self.daily_limit,
             locked_until=self.locked_until,
             nudge_sent_cycle=self.nudge_sent,
+            contact_skip_once=self.contact_skip.get(user_id, False),
+            contact_never=self.contact_never.get(user_id, False),
         )
 
     async def remaining_tries(self, user_id: int) -> int:
@@ -1064,6 +1066,98 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_start_requires_two_new_generations_before_contact(tmp_path: Path) -> None:
+    model = GlassModel(
+        unique_id="m1",
+        title="Model 1",
+        model_code="M1",
+        site_url="https://example.com/1",
+        img_user_url="https://example.com/1.jpg",
+        img_nano_url="https://example.com/1-nano.jpg",
+        gender="male",
+    )
+
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path, models=[model])
+        start_handler = get_message_handler(router, "handle_start")
+        photo_handler = get_message_handler(router, "accept_photo")
+        choose_handler = get_callback_handler(router, "choose_model")
+        more_handler = get_callback_handler(router, "result_more")
+
+        user_id = 4242
+        repository.gen_counts[user_id] = 5
+
+        bot = DummyBot()
+        start_message = DummyMessage(user_id=user_id, bot=bot)
+        start_message.text = "/start"
+        state = DummyState()
+
+        await start_handler(start_message, state)
+
+        assert state.data.get("gens_since_start_for_phone_prompt") == 0
+        assert repository.contact_skip.get(user_id, False) is False
+        assert repository.contact_never.get(user_id, False) is False
+        assert state.data.get("phone_prompt_disabled") is False
+
+        await state.set_state(TryOnStates.AWAITING_PHOTO)
+        await state.update_data(gender="male", first_generated_today=True)
+
+        start_message.photo = [PhotoStub("photo1")]  # type: ignore[attr-defined]
+        await photo_handler(start_message, state)
+        await choose_handler(DummyCallback("pick:src=batch2:m1", start_message), state)
+        await more_handler(DummyCallback("more|1", start_message), state)
+        assert state.data.get("contact_request_active") is False
+
+        baseline = len(start_message.answers)
+        start_message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]
+        await photo_handler(start_message, state)
+        new_answers = start_message.answers[baseline:]
+        assert not any(
+            text.startswith(f"<b>{msg.ASK_PHONE_TITLE}") for text, _ in new_answers
+        )
+        await choose_handler(DummyCallback("pick:src=batch2:m1", start_message), state)
+        assert state.data.get("contact_request_active") is True
+        assert start_message.answers[-1][0].startswith(
+            f"<b>{msg.ASK_PHONE_TITLE}"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_start_with_low_remaining_sets_never(tmp_path: Path) -> None:
+    model = GlassModel(
+        unique_id="m1",
+        title="Model 1",
+        model_code="M1",
+        site_url="https://example.com/1",
+        img_user_url="https://example.com/1.jpg",
+        img_nano_url="https://example.com/1-nano.jpg",
+        gender="male",
+    )
+
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path, models=[model])
+        start_handler = get_message_handler(router, "handle_start")
+
+        user_id = 5151
+        repository.daily_limit = 1
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=user_id, bot=bot)
+        message.text = "/start"
+        state = DummyState()
+
+        await start_handler(message, state)
+
+        assert repository.contact_never[user_id] is True
+        assert repository.contact_skip.get(user_id, False) is False
+        assert state.data.get("gens_since_start_for_phone_prompt") == 0
+        assert state.data.get("phone_prompt_disabled") is True
+        assert state.data.get("phone_prompt_disabled_reason") == "daily_limit"
+
+    asyncio.run(scenario())
+
+
 def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> None:
     models = [
         GlassModel(
@@ -1158,15 +1252,15 @@ def test_phone_prompt_limit_requests_fresh_photo(tmp_path: Path) -> None:
         message.text = "всё ещё нет"
         await handler_contact_text(message, state)
 
-        assert state.data.get("phone_prompt_attempts") == 2
-        assert state.data.get("phone_prompt_disabled") is True
-        assert state.data.get("phone_prompt_disabled_reason") == "limit"
+        assert state.data.get("phone_prompt_attempts") == 0
+        assert state.data.get("phone_prompt_disabled") is False
         assert state.state is TryOnStates.AWAITING_PHOTO
         assert state.data.get("upload") is None
-        assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
-        # предыдущая подсказка о лимите должна быть отправлена и затем удалена
-        limit_message = "".join(msg.ASK_PHONE_LIMIT_REACHED)
-        assert any(text == limit_message for text, _ in message.answers)
+        assert repository.contact_skip[913] is True
+        second_caption = "".join(msg.SECOND_RESULT_CAPTION)
+        assert second_caption in [text for text, _ in message.answers]
+        assert message.answers[-1][0] == "".join(msg.ASK_PHONE_SKIP_ACK)
+        assert_main_menu_keyboard(message.answers[-1][1], show_try_button=False)
         assert any(
             deleted_id > message.message_id for _, deleted_id in bot.deleted
         )
@@ -1209,7 +1303,11 @@ def test_contact_reminder_after_skip_happens_post_generation(tmp_path: Path) -> 
         message = DummyMessage(user_id=user_id, bot=bot)
         message.photo = [PhotoStub("photo1")]  # type: ignore[attr-defined]
         state = DummyState()
-        await state.update_data(gender="male", first_generated_today=False)
+        await state.update_data(
+            gender="male",
+            first_generated_today=False,
+            gens_since_start_for_phone_prompt=5,
+        )
 
         await handler_photo(message, state)
 

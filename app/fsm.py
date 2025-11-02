@@ -256,38 +256,45 @@ def setup_router(
             reason=reason,
         )
         limit_reached = phone_prompt_limit > 0 and attempt_no >= phone_prompt_limit
-        if limit_reached:
-            await _disable_phone_prompt(state, reason="limit")
-        reply_markup = contact_request_keyboard() if not limit_reached else None
-        response_text = (
-            msg.ASK_PHONE_LIMIT_REACHED if limit_reached else msg.ASK_PHONE_INVALID
-        )
-        await _send_aux_message(
-            message,
-            state,
-            message.answer,
-            response_text,
-            reply_markup=reply_markup,
-        )
-        if limit_reached:
-            info_domain(
-                "bot.handlers",
-                "☎️ Достигнут лимит запросов номера",
-                stage="CONTACT_PROMPT_LIMIT",
-                user_id=message.from_user.id,
-                attempt=attempt_no,
+        if not limit_reached:
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.ASK_PHONE_INVALID,
+                reply_markup=contact_request_keyboard(),
             )
-            await _resume_after_contact(message, state, send_generation=False)
-            await _prompt_for_next_photo(message, state, msg.PHOTO_INSTRUCTION)
-            info_domain(
-                "bot.handlers",
-                "📸 Запрошено новое фото после лимита номера",
-                stage="CONTACT_LIMIT_AWAIT_PHOTO",
-                user_id=message.from_user.id,
-                attempt=attempt_no,
-            )
+            await _resume_after_contact(message, state, send_generation=True)
             return
-        await _resume_after_contact(message, state, send_generation=True)
+
+        user_id = message.from_user.id
+        await repository.set_contact_skip_once(user_id, True)
+        info_domain(
+            "bot.handlers",
+            "☎️ Достигнут лимит запросов номера",
+            stage="CONTACT_PROMPT_LIMIT",
+            user_id=user_id,
+            attempt=attempt_no,
+        )
+        await _resume_after_contact(message, state, send_generation=False)
+        await _delete_last_aux_message(message, state)
+        second_caption_text = _render_text(msg.SECOND_RESULT_CAPTION)
+        if second_caption_text:
+            await _send_delivery_message(
+                message,
+                state,
+                message.answer,
+                second_caption_text,
+            )
+        await _prompt_for_next_photo(message, state, msg.ASK_PHONE_SKIP_ACK)
+        await _reset_phone_prompt_state(state)
+        info_domain(
+            "bot.handlers",
+            "☎️ Лимит исчерпан — авто 'Не сейчас'",
+            stage="CONTACT_AUTO_SKIP",
+            user_id=user_id,
+            attempt=attempt_no,
+        )
 
 
     def _cancel_idle_timer(user_id: int) -> None:
@@ -593,6 +600,7 @@ def setup_router(
         if not phone_prompt_enabled:
             return False
         data = await state.get_data()
+        session_generations = int(data.get("gens_since_start_for_phone_prompt") or 0)
         if data.get("contact_request_active"):
             await state.update_data(
                 contact_request_active=False,
@@ -613,13 +621,26 @@ def setup_router(
         if meta["attempts"] >= phone_prompt_limit:
             await _disable_phone_prompt(state, reason="limit")
             return False
+        if session_generations < CONTACT_INITIAL_TRIGGER:
+            return False
         profile = await repository.ensure_user(user_id)
         if profile.contact_never:
             return False
+        remaining_daily = await repository.remaining_tries(user_id)
+        if remaining_daily < CONTACT_INITIAL_TRIGGER:
+            await repository.set_contact_never(user_id, True)
+            await repository.set_contact_skip_once(user_id, False)
+            await _disable_phone_prompt(state, reason="daily_limit")
+            info_domain(
+                "bot.handlers",
+                "☎️ Запрос номера отключён из-за лимита",
+                stage="CONTACT_NEVER_LIMIT",
+                user_id=user_id,
+                remaining=remaining_daily,
+            )
+            return False
         contact = await repository.get_user_contact(user_id)
         if contact and contact.consent:
-            return False
-        if profile.gen_count < CONTACT_INITIAL_TRIGGER:
             return False
         if profile.contact_skip_once:
             if profile.gen_count >= CONTACT_REMINDER_TRIGGER:
@@ -1097,19 +1118,38 @@ def setup_router(
 
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
-        await repository.ensure_user(message.from_user.id)
-        await track_event(str(message.from_user.id), "start")
+        user_id = message.from_user.id
+        await repository.ensure_user(user_id)
+        await track_event(str(user_id), "start")
         await _reset_phone_prompt_state(state)
+        profile = await repository.ensure_daily_reset(user_id)
+        remaining_daily = await repository.remaining_tries(user_id)
         await state.update_data(
             contact_request_active=False,
             contact_pending_result_state=None,
             contact_pending_generation=False,
+            gens_since_start_for_phone_prompt=0,
         )
+        if profile.contact_never:
+            await _disable_phone_prompt(state, reason="never")
+        elif remaining_daily < CONTACT_INITIAL_TRIGGER:
+            await repository.set_contact_never(user_id, True)
+            await repository.set_contact_skip_once(user_id, False)
+            await _disable_phone_prompt(state, reason="daily_limit")
+            info_domain(
+                "bot.handlers",
+                "☎️ Запрос номера отключён из-за лимита",
+                stage="CONTACT_NEVER_LIMIT",
+                user_id=user_id,
+                remaining=remaining_daily,
+            )
+        else:
+            await repository.set_contact_skip_once(user_id, False)
         info_domain(
             "bot.handlers",
             "☎️ Контактный флоу сброшен по /start",
             stage="CONTACT_RESET",
-            user_id=message.from_user.id,
+            user_id=user_id,
         )
         text = message.text or ""
         if "ref_" in text:
@@ -1742,7 +1782,23 @@ def setup_router(
         new_flag = next_first_flag_value(
             data.get("first_generated_today", True), plan.outcome
         )
-        await state.update_data(first_generated_today=new_flag)
+        session_generations = int(data.get("gens_since_start_for_phone_prompt") or 0) + 1
+        await state.update_data(
+            first_generated_today=new_flag,
+            gens_since_start_for_phone_prompt=session_generations,
+        )
+        contact_profile = await repository.ensure_user(user_id)
+        if remaining < CONTACT_INITIAL_TRIGGER and not contact_profile.contact_never:
+            await repository.set_contact_never(user_id, True)
+            await repository.set_contact_skip_once(user_id, False)
+            await _disable_phone_prompt(state, reason="daily_limit")
+            info_domain(
+                "bot.handlers",
+                "☎️ Запрос номера отключён из-за лимита",
+                stage="CONTACT_NEVER_LIMIT",
+                user_id=user_id,
+                remaining=remaining,
+            )
         contact_data = await state.get_data()
         contact_active_before = contact_data.get("contact_request_active", False)
         if result_has_more:
@@ -1785,11 +1841,8 @@ def setup_router(
                 not contact_active_before
                 and (
                     (
-                        new_gen_count >= CONTACT_INITIAL_TRIGGER
-                        and (
-                            is_second_generation
-                            or new_gen_count == CONTACT_INITIAL_TRIGGER
-                        )
+                        session_generations >= CONTACT_INITIAL_TRIGGER
+                        and remaining >= CONTACT_INITIAL_TRIGGER
                     )
                     or deferred_contact_request
                 )
