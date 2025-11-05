@@ -179,6 +179,10 @@ class StubRepository:
         self.contact_skip: dict[int, bool] = {}
         self.contact_never: dict[int, bool] = {}
         self.contacts: dict[int, Any] = {}
+        self.contact_generations_today: dict[int, int] = {}
+        self.contact_cycle_started_at: dict[int, datetime] = {}
+        self.contact_prompt_second: set[int] = set()
+        self.contact_prompt_sixth: set[int] = set()
         self.activity: list[int] = []
         self.locked_until: Optional[datetime] = None
         self.cycle_index: int = 0
@@ -200,6 +204,10 @@ class StubRepository:
             gen_count=self.gen_counts.get(user_id, 0),
             contact_skip_once=self.contact_skip.get(user_id, False),
             contact_never=self.contact_never.get(user_id, False),
+            contact_generations_today=self.contact_generations_today.get(user_id, 0),
+            contact_generations_started_at=self.contact_cycle_started_at.get(user_id),
+            contact_prompt_second_sent=user_id in self.contact_prompt_second,
+            contact_prompt_sixth_sent=user_id in self.contact_prompt_sixth,
             last_more_message_id=message_id,
             last_more_message_type=message_type,
             last_more_message_payload=payload,
@@ -303,6 +311,37 @@ class StubRepository:
         contact = self.contacts.get(user_id)
         if contact:
             contact.reward_granted = True
+
+    async def register_contact_generation(
+        self,
+        user_id: int,
+        *,
+        now: Optional[datetime] = None,
+        initial_trigger: int,
+        reminder_trigger: int,
+    ) -> tuple[int, Optional[str]]:
+        moment = now or datetime.now(tz=UTC)
+        started = self.contact_cycle_started_at.get(user_id)
+        if started is None or moment - started >= timedelta(hours=24):
+            self.contact_cycle_started_at[user_id] = moment
+            self.contact_generations_today[user_id] = 0
+            self.contact_prompt_second.discard(user_id)
+            self.contact_prompt_sixth.discard(user_id)
+            self.contact_skip[user_id] = False
+        count = self.contact_generations_today.get(user_id, 0) + 1
+        self.contact_generations_today[user_id] = count
+        trigger: Optional[str] = None
+        if count == initial_trigger and user_id not in self.contact_prompt_second:
+            trigger = "second"
+        elif count == reminder_trigger and user_id not in self.contact_prompt_sixth:
+            trigger = "sixth"
+        return count, trigger
+
+    async def mark_contact_prompt_sent(self, user_id: int, trigger: str) -> None:
+        if trigger == "second":
+            self.contact_prompt_second.add(user_id)
+        elif trigger == "sixth":
+            self.contact_prompt_sixth.add(user_id)
 
     async def set_referrer(self, user_id: int, ref_id: int) -> None:  # noqa: D401 - no-op
         return None
@@ -670,12 +709,8 @@ def test_exhausted_message_flow(tmp_path: Path) -> None:
         await handler(message, state)
 
         fallback_text, markup = message.answers[-1]
-        assert fallback_text == msg.marketing_text("all_seen")
-        assert isinstance(markup, InlineKeyboardMarkup)
-        assert len(markup.inline_keyboard) == 1
-        assert len(markup.inline_keyboard[0]) == 2
-        assert markup.inline_keyboard[0][0].callback_data == "limit_remind"
-        assert markup.inline_keyboard[0][1].url == "https://example.com"
+        assert fallback_text == msg.CATALOG_TEMPORARILY_UNAVAILABLE
+        assert markup is None
 
     asyncio.run(scenario())
 
@@ -1196,7 +1231,7 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
     asyncio.run(scenario())
 
 
-def test_contact_reminder_after_skip_happens_post_generation(tmp_path: Path) -> None:
+def test_contact_prompt_after_skip_returns_next_cycle(tmp_path: Path) -> None:
     models = [
         GlassModel(
             unique_id="m1",
@@ -1224,8 +1259,11 @@ def test_contact_reminder_after_skip_happens_post_generation(tmp_path: Path) -> 
         handler_choose = get_callback_handler(router, "choose_model")
 
         user_id = 889
-        repository.gen_counts[user_id] = 5
+        repository.gen_counts[user_id] = 2
         repository.contact_skip[user_id] = True
+        repository.contact_generations_today[user_id] = 2
+        repository.contact_cycle_started_at[user_id] = datetime.now(UTC)
+        repository.contact_prompt_second.add(user_id)
 
         bot = DummyBot()
         message = DummyMessage(user_id=user_id, bot=bot)
@@ -1233,15 +1271,32 @@ def test_contact_reminder_after_skip_happens_post_generation(tmp_path: Path) -> 
         state = DummyState()
         await state.update_data(gender="male", first_generated_today=False)
 
+        answers_before = len(message.answers)
         await handler_photo(message, state)
+        await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
 
-        assert state.state is TryOnStates.SHOW_RECS
-        assert not any(msg.ASK_PHONE_TITLE in text for text, _ in message.answers)
+        assert state.state is TryOnStates.RESULT
+        recent_answers = message.answers[answers_before:]
+        assert not any(msg.ASK_PHONE_TITLE in text for text, _ in recent_answers)
 
+        repository.contact_cycle_started_at[user_id] = datetime.now(UTC) - timedelta(
+            hours=25
+        )
+        message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]
+        answers_before = len(message.answers)
+        await handler_photo(message, state)
+        await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
+
+        assert state.state is TryOnStates.RESULT
+        second_wave = message.answers[answers_before:]
+        assert not any(msg.ASK_PHONE_TITLE in text for text, _ in second_wave)
+
+        message.photo = [PhotoStub("photo3")]  # type: ignore[attr-defined]
+        await handler_photo(message, state)
         callback = DummyCallback("pick:src=batch2:m1", message)
         await handler_choose(callback, state)
 
-        assert repository.gen_counts[user_id] == 6
+        assert repository.gen_counts[user_id] >= 5
         assert len(message.answer_photos) >= 1
         assert state.state is ContactRequest.waiting_for_phone
         assert message.answers[-1][0].startswith(f"<b>{msg.ASK_PHONE_TITLE}")

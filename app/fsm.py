@@ -33,7 +33,6 @@ from app.keyboards import (
     CONTACT_NEVER_CALLBACK,
     CONTACT_SHARE_CALLBACK,
     CONTACT_SKIP_CALLBACK,
-    all_seen_keyboard,
     batch_selection_keyboard,
     contact_request_keyboard,
     gender_keyboard,
@@ -91,7 +90,7 @@ class ContactRequest(StatesGroup):
 
 
 CONTACT_INITIAL_TRIGGER = 2
-CONTACT_REMINDER_TRIGGER = 5
+CONTACT_REMINDER_TRIGGER = 6
 
 
 class GenerationOutcome(Enum):
@@ -183,13 +182,18 @@ def setup_router(
         current_state = await state.get_state()
         return current_state in BUSY_STATES
 
-    async def _is_command_locked(state: FSMContext) -> bool:
+    async def _is_command_locked(
+        state: FSMContext, *, allow_show_recs: bool = False
+    ) -> bool:
         data = await state.get_data()
         if data.get("is_generating"):
             return True
         current_state = await state.get_state()
         if current_state in BUSY_STATES:
-            return True
+            if allow_show_recs and current_state == TryOnStates.SHOW_RECS.state:
+                pass
+            else:
+                return True
         if current_state == TryOnStates.AWAITING_PHOTO.state:
             return bool(
                 data.get("upload")
@@ -198,8 +202,10 @@ def setup_router(
             )
         return False
 
-    async def _reject_if_busy(message: Message, state: FSMContext) -> bool:
-        if await _is_command_locked(state):
+    async def _reject_if_busy(
+        message: Message, state: FSMContext, *, allow_show_recs: bool = False
+    ) -> bool:
+        if await _is_command_locked(state, allow_show_recs=allow_show_recs):
             await message.answer(msg.GENERATION_BUSY)
             return True
         return False
@@ -218,6 +224,11 @@ def setup_router(
             return False
         if profile.nudge_sent_cycle:
             return False
+        last_activity_ts = getattr(profile, "last_activity_ts", 0) or 0
+        if last_activity_ts:
+            seconds_since = now.timestamp() - float(last_activity_ts)
+            if seconds_since < 300:
+                return False
         limit = profile.daily_try_limit if profile.daily_try_limit > 0 else None
         remaining = profile.remaining(limit)
         return remaining > 0
@@ -491,6 +502,7 @@ def setup_router(
             generation_progress_message_id=None,
             presented_model_ids=[],
             is_generating=False,
+            contact_prompt_due=None,
         )
         await repository.set_last_more_message(message.chat.id, None, None, None)
         await _send_aux_message(
@@ -525,10 +537,14 @@ def setup_router(
         user_id: int,
         *,
         origin_state: Optional[str] = None,
+        trigger: Optional[str] = None,
     ) -> bool:
         data = await state.get_data()
         if data.get("contact_request_active"):
             return True
+        effective_trigger = trigger or data.get("contact_prompt_due")
+        if not effective_trigger:
+            return False
         cooldown = max(int(data.get("contact_request_cooldown") or 0), 0)
         if cooldown > 0:
             logger.debug(
@@ -539,17 +555,17 @@ def setup_router(
             return False
         profile = await repository.ensure_user(user_id)
         if profile.contact_never:
+            await state.update_data(contact_prompt_due=None)
+            await repository.mark_contact_prompt_sent(user_id, effective_trigger)
             return False
         contact = await repository.get_user_contact(user_id)
         if contact and contact.consent:
-            return False
-        if profile.gen_count < CONTACT_INITIAL_TRIGGER:
+            await state.update_data(contact_prompt_due=None)
+            await repository.mark_contact_prompt_sent(user_id, effective_trigger)
             return False
         if profile.contact_skip_once:
-            if profile.gen_count >= CONTACT_REMINDER_TRIGGER:
-                await repository.set_contact_skip_once(user_id, False)
-            else:
-                return False
+            await state.update_data(contact_prompt_due=None)
+            return False
         current_state = origin_state or await state.get_state()
         pending_state = data.get("contact_pending_result_state")
         if not pending_state and current_state == TryOnStates.RESULT.state:
@@ -580,7 +596,10 @@ def setup_router(
             contact_prompt_message_id=prompt_message.message_id,
             contact_request_cooldown=0,
         )
-        await state.update_data(**update_payload)
+        await state.update_data(
+            **update_payload, contact_prompt_due=None
+        )
+        await repository.mark_contact_prompt_sent(user_id, effective_trigger)
         await state.set_state(ContactRequest.waiting_for_phone)
         logger.debug("Contact request issued for user %s", user_id)
         info_domain(
@@ -626,16 +645,11 @@ def setup_router(
             await _delete_state_message(message, state, "preload_message_id")
             return False
         if not result.models:
-            try:
-                marketing_message = msg.marketing_text(no_more_message_key)
-            except KeyError:
-                marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
             await _send_aux_message(
                 message,
                 state,
                 message.answer,
-                marketing_message,
-                reply_markup=all_seen_keyboard(site_url),
+                msg.CATALOG_TEMPORARILY_UNAVAILABLE,
             )
             await state.update_data(current_models=[], last_batch=[])
             await _delete_state_message(message, state, "preload_message_id")
@@ -661,16 +675,12 @@ def setup_router(
         await _send_model_batches(message, state, batch)
         await _delete_state_message(message, state, "preload_message_id")
         if result.exhausted:
-            try:
-                marketing_message = msg.marketing_text(no_more_message_key)
-            except KeyError:
-                marketing_message = msg.CATALOG_TEMPORARILY_UNAVAILABLE
+            # Карточка «Ты просмотрел все модели» отключена продуктовой командой.
             await _send_aux_message(
                 message,
                 state,
                 message.answer,
-                marketing_message,
-                reply_markup=all_seen_keyboard(site_url),
+                msg.CATALOG_TEMPORARILY_UNAVAILABLE,
             )
         return True
 
@@ -1259,12 +1269,14 @@ def setup_router(
             user_id=callback.from_user.id,
         )
 
-    @router.message(StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT), ~F.photo)
+    @router.message(
+        StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT, TryOnStates.SHOW_RECS),
+        ~F.photo,
+    )
     async def reject_non_photo(message: Message, state: FSMContext) -> None:
         text = (message.text or "").strip()
         if text:
-            command = text.split()[0].lower()
-            if command.startswith("/privacy"):
+            if text.startswith("/"):
                 return
         await _send_aux_message(
             message,
@@ -1273,7 +1285,10 @@ def setup_router(
             msg.NOT_PHOTO_WARNING,
         )
 
-    @router.message(StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT), F.photo)
+    @router.message(
+        StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT, TryOnStates.SHOW_RECS),
+        F.photo,
+    )
     async def accept_photo(message: Message, state: FSMContext) -> None:
         user_id = message.from_user.id
         photo = message.photo[-1]
@@ -1309,16 +1324,6 @@ def setup_router(
             current_models=[],
             last_batch=[],
         )
-        contact_profile = await repository.ensure_user(user_id)
-        defer_contact_reminder = (
-            contact_profile.contact_skip_once
-            and contact_profile.gen_count >= CONTACT_REMINDER_TRIGGER
-        )
-        await state.update_data(contact_reminder_deferred=defer_contact_reminder)
-        if not defer_contact_reminder and await _maybe_request_contact(
-            message, state, user_id
-        ):
-            return
         preload_message = await _send_aux_message(
             message,
             state,
@@ -1496,7 +1501,6 @@ def setup_router(
         data = await state.get_data()
         upload_value = data.get("upload")
         upload_file_id = data.get("upload_file_id")
-        deferred_contact_request = bool(data.get("contact_reminder_deferred"))
 
         progress_message: Message | None = None
         user_photo_path: Path | None = None
@@ -1680,7 +1684,6 @@ def setup_router(
             remaining=remaining,
         )
         gen_count_before = await repository.get_generation_count(user_id)
-        is_second_generation = gen_count_before == 1
         if plan.outcome is GenerationOutcome.FIRST:
             caption_text = _render_text(msg.FIRST_RESULT_CAPTION)
         else:
@@ -1721,9 +1724,18 @@ def setup_router(
             source_message_id=message.message_id,
         )
         new_gen_count = await repository.increment_generation_count(user_id)
-        await state.update_data(
-            allow_try_button=True,
+        daily_gen_count, contact_trigger = await repository.register_contact_generation(
+            user_id,
+            initial_trigger=CONTACT_INITIAL_TRIGGER,
+            reminder_trigger=CONTACT_REMINDER_TRIGGER,
         )
+        update_payload = {
+            "allow_try_button": True,
+            "contact_generations_today": daily_gen_count,
+        }
+        if contact_trigger:
+            update_payload["contact_prompt_due"] = contact_trigger
+        await state.update_data(**update_payload)
         new_flag = next_first_flag_value(
             data.get("first_generated_today", True), plan.outcome
         )
@@ -1764,26 +1776,16 @@ def setup_router(
             )
         else:
             contact_requested_now = False
-            if deferred_contact_request:
-                await state.update_data(contact_reminder_deferred=False)
-            if (
-                not contact_active_before
-                and (
-                    (
-                        new_gen_count >= CONTACT_INITIAL_TRIGGER
-                        and (
-                            is_second_generation
-                            or new_gen_count == CONTACT_INITIAL_TRIGGER
-                        )
-                    )
-                    or deferred_contact_request
-                )
-            ):
+            trigger_to_use = update_payload.get("contact_prompt_due")
+            if not trigger_to_use:
+                trigger_to_use = contact_data.get("contact_prompt_due")
+            if not contact_active_before and trigger_to_use:
                 contact_requested_now = await _maybe_request_contact(
                     message,
                     state,
                     user_id,
                     origin_state=TryOnStates.RESULT.state,
+                    trigger=trigger_to_use,
                 )
                 if contact_requested_now:
                     logger.debug(
@@ -1993,7 +1995,7 @@ def setup_router(
         current_state = await state.get_state()
         if current_state == ContactRequest.waiting_for_phone.state:
             return
-        if await _reject_if_busy(message, state):
+        if await _reject_if_busy(message, state, allow_show_recs=True):
             return
         user_id = message.from_user.id
         data = await state.get_data()
@@ -2035,7 +2037,16 @@ def setup_router(
             preload_message_id=None,
             generation_progress_message_id=None,
             is_generating=False,
+            contact_prompt_due=None,
         )
+        if current_state == TryOnStates.SHOW_RECS.state:
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.PHOTO_INSTRUCTION,
+            )
+            return
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await _send_aux_message(
             message,
@@ -2069,6 +2080,7 @@ def setup_router(
             selected_model=None,
             current_models=[],
             is_generating=False,
+            contact_prompt_due=None,
         )
         await message.answer(msg.CANCEL_CONFIRMATION)
 
