@@ -177,14 +177,29 @@ def setup_router(
     BUSY_STATES = {TryOnStates.GENERATING.state, TryOnStates.SHOW_RECS.state}
 
     async def _is_generation_in_progress(state: FSMContext) -> bool:
+        data = await state.get_data()
+        if data.get("is_generating"):
+            return True
+        current_state = await state.get_state()
+        return current_state in BUSY_STATES
+
+    async def _is_command_locked(state: FSMContext) -> bool:
+        data = await state.get_data()
+        if data.get("is_generating"):
+            return True
         current_state = await state.get_state()
         if current_state in BUSY_STATES:
             return True
-        data = await state.get_data()
-        return bool(data.get("is_generating"))
+        if current_state == TryOnStates.AWAITING_PHOTO.state:
+            return bool(
+                data.get("upload")
+                or data.get("upload_file_id")
+                or data.get("generation_progress_message_id")
+            )
+        return False
 
     async def _reject_if_busy(message: Message, state: FSMContext) -> bool:
-        if await _is_generation_in_progress(state):
+        if await _is_command_locked(state):
             await message.answer(msg.GENERATION_BUSY)
             return True
         return False
@@ -1037,10 +1052,9 @@ def setup_router(
 
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
-        user_id = message.from_user.id
-        if await _is_generation_in_progress(state):
-            await message.answer(msg.GENERATION_BUSY)
+        if await _reject_if_busy(message, state):
             return
+        user_id = message.from_user.id
         previous_state = await state.get_state()
         previous_data = await state.get_data()
         contact_was_active = (
@@ -1247,6 +1261,11 @@ def setup_router(
 
     @router.message(StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT), ~F.photo)
     async def reject_non_photo(message: Message, state: FSMContext) -> None:
+        text = (message.text or "").strip()
+        if text:
+            command = text.split()[0].lower()
+            if command.startswith("/privacy"):
+                return
         await _send_aux_message(
             message,
             state,
@@ -1974,10 +1993,16 @@ def setup_router(
         current_state = await state.get_state()
         if current_state == ContactRequest.waiting_for_phone.state:
             return
-        if await _is_generation_in_progress(state):
-            await message.answer(msg.GENERATION_BUSY)
+        if await _reject_if_busy(message, state):
             return
         user_id = message.from_user.id
+        data = await state.get_data()
+        profile = await repository.ensure_user(user_id)
+        gender = data.get("gender") or profile.gender
+        if not gender:
+            gender = "male"
+            await repository.update_filters(user_id, gender=gender)
+        await state.update_data(gender=gender)
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
@@ -2021,8 +2046,6 @@ def setup_router(
 
     @router.message(Command("help"))
     async def command_help(message: Message, state: FSMContext) -> None:
-        if await _reject_if_busy(message, state):
-            return
         await message.answer(msg.HELP_TEXT, parse_mode=ParseMode.MARKDOWN_V2)
 
     @router.message(Command("cancel"))
@@ -2040,7 +2063,13 @@ def setup_router(
         await state.clear()
         await repository.reset_user_session(user_id)
         await state.set_state(TryOnStates.START)
-        await state.update_data(is_generating=False)
+        await state.update_data(
+            upload=None,
+            upload_file_id=None,
+            selected_model=None,
+            current_models=[],
+            is_generating=False,
+        )
         await message.answer(msg.CANCEL_CONFIRMATION)
 
     @router.message(F.text == msg.MAIN_MENU_TRY_BUTTON)
@@ -2054,8 +2083,6 @@ def setup_router(
 
     @router.message(Command("privacy"))
     async def command_privacy(message: Message, state: FSMContext) -> None:
-        if await _reject_if_busy(message, state):
-            return
         markup = privacy_policy_keyboard(policy_button_url)
         if markup:
             await _send_aux_message(

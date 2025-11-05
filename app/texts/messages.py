@@ -89,8 +89,8 @@ PHOTO_NOT_SUITABLE_MAIN = (
 BTN_SEND_NEW_PHOTO = "Загрузить другое фото"
 
 # Подсказка для перехода на другую фотографию.
-WEAR_FOOTNOTE = "Хочешь примерить на другой фотографии? Используй команду /wear"
-WEAR_FOOTNOTE_LINE = f"{WEAR_FOOTNOTE}."
+WEAR_FOOTNOTE = "Хочешь примерить на другой фотографии?\nИспользуй команду <b>/wear</b>"
+WEAR_FOOTNOTE_LINE = WEAR_FOOTNOTE
 
 # Подпись к первой удачной примерке за день.
 FIRST_RESULT_CAPTION = (
@@ -315,4 +315,4 @@ PRIVACY_POLICY_TEXT = (
     "<b>Контакты оператора:</b> LOOV, сайт: <a href=\"https://loov.ru\">loov.ru</a>."
 )
 # Ответ на команду отмены.
-CANCEL_CONFIRMATION = "Готово! Начнём заново — выбери пол и загрузи фото."
+CANCEL_CONFIRMATION = "Готово. Если хочешь начать заново — нажми /start"

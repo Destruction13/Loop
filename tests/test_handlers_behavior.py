@@ -74,7 +74,9 @@ class DummyMessage:
         self.reply_markup: Optional[Any] = None
         self._next_message_id = message_id + 1
 
-    async def answer(self, text: str, reply_markup: Optional[Any] = None) -> "DummySentMessage":
+    async def answer(
+        self, text: str, reply_markup: Optional[Any] = None, **_: Any
+    ) -> "DummySentMessage":
         sent = DummySentMessage(self.bot, self.chat.id, self._next_message_id, text, reply_markup)
         self._next_message_id += 1
         self.answers.append((text, reply_markup))
@@ -86,6 +88,7 @@ class DummyMessage:
         *,
         caption: Optional[str] = None,
         reply_markup: Optional[Any] = None,
+        **_: Any,
     ) -> "DummySentMessage":
         sent = DummySentMessage(
             self.bot,
@@ -157,6 +160,10 @@ class DummyState:
 
     async def get_state(self) -> Optional[Any]:
         return self.state
+
+    async def clear(self) -> None:
+        self.data.clear()
+        self.state = None
 
 
 class StubRepository:
@@ -1331,6 +1338,154 @@ def test_limit_promo_removes_limit_message(tmp_path: Path) -> None:
         assert (
             promo_message[1].inline_keyboard == expected_markup.inline_keyboard
         )
+
+    asyncio.run(scenario())
+
+
+def test_start_command_blocked_during_generation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "handle_start")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=555, bot=bot)
+        message.text = "/start"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.GENERATING.state)
+        await state.update_data(is_generating=True)
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.GENERATION_BUSY
+        assert state.state == TryOnStates.GENERATING.state
+
+    asyncio.run(scenario())
+
+
+def test_wear_sets_default_gender_when_missing(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "command_wear")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=777, bot=bot)
+        message.text = "/wear"  # type: ignore[attr-defined]
+        state = DummyState()
+
+        await handler(message, state)
+
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        data = await state.get_data()
+        assert data.get("gender") == "male"
+        assert repository.updated_filters == [(777, "male")]
+        assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
+
+    asyncio.run(scenario())
+
+
+def test_help_allowed_during_generation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "command_help")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=888, bot=bot)
+        message.text = "/help"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.GENERATING.state)
+        await state.update_data(is_generating=True)
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.HELP_TEXT
+
+    asyncio.run(scenario())
+
+
+def test_privacy_command_ignores_non_photo_warning(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        privacy_handler = get_message_handler(router, "command_privacy")
+        fallback_handler = get_message_handler(router, "reject_non_photo")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=9990, bot=bot)
+        message.text = "/privacy"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.AWAITING_PHOTO.state)
+        await state.update_data(is_generating=True)
+
+        await privacy_handler(message, state)
+
+        text, markup = message.answers[-1]
+        assert text == msg.PRIVACY_POLICY_TEXT
+        assert isinstance(markup, InlineKeyboardMarkup)
+        button = markup.inline_keyboard[0][0]
+        assert button.text == msg.MAIN_MENU_POLICY_BUTTON
+        assert button.url == TEST_PRIVACY_POLICY_URL
+
+        second_message = DummyMessage(user_id=9991, bot=bot)
+        second_message.text = "/privacy"  # type: ignore[attr-defined]
+        second_state = DummyState()
+        await second_state.set_state(TryOnStates.AWAITING_PHOTO.state)
+
+        await fallback_handler(second_message, second_state)
+
+        assert second_message.answers == []
+
+    asyncio.run(scenario())
+
+
+def test_cancel_blocked_during_generation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "command_cancel")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=4321, bot=bot)
+        message.text = "/cancel"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.GENERATING.state)
+        await state.update_data(is_generating=True)
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.GENERATION_BUSY
+        assert state.state == TryOnStates.GENERATING.state
+
+    asyncio.run(scenario())
+
+
+def test_cancel_resets_session(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "command_cancel")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=5432, bot=bot)
+        message.text = "/cancel"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.RESULT.state)
+        await state.update_data(
+            upload="/tmp/upload.jpg",
+            upload_file_id="file123",
+            selected_model="model",
+            current_models=["model"],
+            is_generating=False,
+        )
+        repository.more_buttons[5432] = (321, "result", {"site_url": "https://example.com"})
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.CANCEL_CONFIRMATION
+        assert state.state is TryOnStates.START
+        data = await state.get_data()
+        assert data.get("upload") is None
+        assert data.get("upload_file_id") is None
+        assert data.get("selected_model") is None
+        assert data.get("current_models") == []
+        assert data.get("is_generating") is False
+        assert repository.more_buttons.get(5432) == (None, None, None)
 
     asyncio.run(scenario())
 
