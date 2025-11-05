@@ -171,6 +171,23 @@ def setup_router(
     idle_tasks: dict[int, asyncio.Task] = {}
 
     policy_url = (privacy_policy_url or "").strip()
+    policy_button_url = (
+        policy_url or "https://telegra.ph/Politika-konfidencialnosti-LOOV-10-29"
+    )
+    BUSY_STATES = {TryOnStates.GENERATING.state, TryOnStates.SHOW_RECS.state}
+
+    async def _is_generation_in_progress(state: FSMContext) -> bool:
+        current_state = await state.get_state()
+        if current_state in BUSY_STATES:
+            return True
+        data = await state.get_data()
+        return bool(data.get("is_generating"))
+
+    async def _reject_if_busy(message: Message, state: FSMContext) -> bool:
+        if await _is_generation_in_progress(state):
+            await message.answer(msg.GENERATION_BUSY)
+            return True
+        return False
 
     def _cancel_idle_timer(user_id: int) -> None:
         task = idle_tasks.pop(user_id, None)
@@ -458,6 +475,7 @@ def setup_router(
             preload_message_id=None,
             generation_progress_message_id=None,
             presented_model_ids=[],
+            is_generating=False,
         )
         await repository.set_last_more_message(message.chat.id, None, None, None)
         await _send_aux_message(
@@ -532,6 +550,8 @@ def setup_router(
         }
         if pending_state and pending_state != data.get("contact_pending_result_state"):
             update_payload["contact_pending_result_state"] = pending_state
+        await _deactivate_previous_more_button(message.bot, user_id)
+        await repository.set_last_more_message(user_id, None, None, None)
         prompt_message = await _send_aux_message(
             message,
             state,
@@ -667,6 +687,7 @@ def setup_router(
             contact_request_active=False,
             contact_pending_result_state=None,
             contact_prompt_message_id=None,
+            is_generating=False,
         )
         if pending_state == "limit":
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
@@ -1017,6 +1038,9 @@ def setup_router(
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
         user_id = message.from_user.id
+        if await _is_generation_in_progress(state):
+            await message.answer(msg.GENERATION_BUSY)
+            return
         previous_state = await state.get_state()
         previous_data = await state.get_data()
         contact_was_active = (
@@ -1076,6 +1100,7 @@ def setup_router(
             last_batch=[],
             presented_model_ids=[],
             selected_model=None,
+            is_generating=False,
         )
         promo_video_log = {
             "path": str(promo_video_path),
@@ -1320,6 +1345,9 @@ def setup_router(
             batch_source_key = "unknown"
             model_id = callback.data.replace("pick:", "", 1)
         data = await state.get_data()
+        if data.get("is_generating"):
+            await callback.answer(msg.GENERATION_BUSY, show_alert=True)
+            return
         models_data: List[GlassModel] = data.get("current_models", [])
         selected = next((model for model in models_data if model.unique_id == model_id), None)
         if not selected:
@@ -1362,6 +1390,7 @@ def setup_router(
                 extra={"stage": "MESSAGE_CLEANUP"},
             )
         await state.update_data(selected_model=selected)
+        await state.update_data(is_generating=True)
         await state.set_state(TryOnStates.GENERATING)
         await _perform_generation(callback.message, state, selected)
 
@@ -1444,6 +1473,7 @@ def setup_router(
 
     async def _perform_generation(message: Message, state: FSMContext, model: GlassModel) -> None:
         user_id = message.chat.id
+        await state.update_data(is_generating=True)
         data = await state.get_data()
         upload_value = data.get("upload")
         upload_file_id = data.get("upload_file_id")
@@ -1619,7 +1649,7 @@ def setup_router(
                         "Не удалось удалить временный файл %s",
                         user_photo_path,
                     )
-            await state.update_data(upload=None)
+            await state.update_data(upload=None, is_generating=False)
 
         await repository.inc_used_on_success(user_id)
         remaining = await repository.remaining_tries(user_id)
@@ -1646,8 +1676,13 @@ def setup_router(
             caption_text = model.title
             result_has_more = False
             keyboard_remaining = 0
+        contact_active = bool(data.get("contact_request_active"))
+        if contact_active:
+            result_has_more = False
         result_markup = generation_result_keyboard(
-            model.site_url, keyboard_remaining
+            model.site_url,
+            keyboard_remaining,
+            show_more=result_has_more,
         )
         await _delete_state_message(message, state, "generation_progress_message_id")
         await _deactivate_previous_more_button(message.bot, user_id)
@@ -1754,6 +1789,13 @@ def setup_router(
         message = callback.message
         remove_source_message = callback.data in {"more|idle", "more|social"}
         if message is None:
+            await callback.answer()
+            return
+        if await _is_generation_in_progress(state):
+            await callback.answer(msg.GENERATION_BUSY)
+            return
+        current_state = await state.get_state()
+        if current_state == ContactRequest.waiting_for_phone.state:
             await callback.answer()
             return
         data_before = await state.get_data()
@@ -1876,7 +1918,7 @@ def setup_router(
         current_state = await state.get_state()
         if current_state == ContactRequest.waiting_for_phone.state:
             return
-        if current_state == TryOnStates.GENERATING.state:
+        if await _is_generation_in_progress(state):
             await message.answer(msg.GENERATION_BUSY)
             return
         data = await state.get_data()
@@ -1932,7 +1974,7 @@ def setup_router(
         current_state = await state.get_state()
         if current_state == ContactRequest.waiting_for_phone.state:
             return
-        if current_state == TryOnStates.GENERATING.state:
+        if await _is_generation_in_progress(state):
             await message.answer(msg.GENERATION_BUSY)
             return
         user_id = message.from_user.id
@@ -1967,6 +2009,7 @@ def setup_router(
             presented_model_ids=[],
             preload_message_id=None,
             generation_progress_message_id=None,
+            is_generating=False,
         )
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await _send_aux_message(
@@ -1977,8 +2020,28 @@ def setup_router(
         )
 
     @router.message(Command("help"))
-    async def command_help(message: Message) -> None:
+    async def command_help(message: Message, state: FSMContext) -> None:
+        if await _reject_if_busy(message, state):
+            return
         await message.answer(msg.HELP_TEXT, parse_mode=ParseMode.MARKDOWN_V2)
+
+    @router.message(Command("cancel"))
+    async def command_cancel(message: Message, state: FSMContext) -> None:
+        if await _reject_if_busy(message, state):
+            return
+        user_id = message.from_user.id
+        previous_data = await state.get_data()
+        if previous_data:
+            await _delete_phone_invalid_message(message, state, data=previous_data)
+        await _delete_last_aux_message(message, state)
+        await _deactivate_previous_more_button(message.bot, user_id)
+        await repository.set_last_more_message(user_id, None, None, None)
+        _cancel_idle_timer(user_id)
+        await state.clear()
+        await repository.reset_user_session(user_id)
+        await state.set_state(TryOnStates.START)
+        await state.update_data(is_generating=False)
+        await message.answer(msg.CANCEL_CONFIRMATION)
 
     @router.message(F.text == msg.MAIN_MENU_TRY_BUTTON)
     async def handle_main_menu_try(message: Message, state: FSMContext) -> None:
@@ -1991,13 +2054,15 @@ def setup_router(
 
     @router.message(Command("privacy"))
     async def command_privacy(message: Message, state: FSMContext) -> None:
-        if policy_url:
-            markup = privacy_policy_keyboard(policy_url)
+        if await _reject_if_busy(message, state):
+            return
+        markup = privacy_policy_keyboard(policy_button_url)
+        if markup:
             await _send_aux_message(
                 message,
                 state,
                 message.answer,
-                policy_url,
+                msg.PRIVACY_POLICY_TEXT,
                 reply_markup=markup,
             )
             return

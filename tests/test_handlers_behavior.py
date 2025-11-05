@@ -40,6 +40,7 @@ class DummyBot:
         self.deleted: list[tuple[int, int]] = []
         self.downloads: list[tuple[Any, Path]] = []
         self.chat_actions: list[tuple[int, Any]] = []
+        self.edited_markups: list[tuple[int, int, Any]] = []
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
@@ -49,6 +50,15 @@ class DummyBot:
 
     async def send_chat_action(self, chat_id: int, action: Any) -> None:
         self.chat_actions.append((chat_id, action))
+
+    async def edit_message_reply_markup(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        reply_markup: Optional[Any] = None,
+    ) -> None:
+        self.edited_markups.append((chat_id, message_id, reply_markup))
 
 
 class DummyMessage:

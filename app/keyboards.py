@@ -105,11 +105,13 @@ def _truncate_title(title: str, max_length: int) -> str:
     return title[: max_length - 1] + "…"
 
 
-def generation_result_keyboard(site_url: str, remaining: int) -> InlineKeyboardMarkup:
+def generation_result_keyboard(
+    site_url: str, remaining: int, *, show_more: bool = True
+) -> InlineKeyboardMarkup:
     """Keyboard attached to the generation result message."""
 
     rows = [[InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, url=site_url)]]
-    if remaining > 0:
+    if show_more and remaining > 0:
         rows.append(
             [
                 InlineKeyboardButton(
