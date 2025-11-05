@@ -207,10 +207,14 @@ def setup_router(
         return False
 
     async def _reject_if_busy(
-        message: Message, state: FSMContext, *, allow_show_recs: bool = False
+        message: Message,
+        state: FSMContext,
+        *,
+        allow_show_recs: bool = False,
+        busy_message: str | None = None,
     ) -> bool:
         if await _is_command_locked(state, allow_show_recs=allow_show_recs):
-            await message.answer(msg.GENERATION_BUSY)
+            await message.answer(busy_message or msg.GENERATION_BUSY)
             return True
         return False
 
@@ -908,6 +912,7 @@ def setup_router(
         if reward_needed:
             contact.reward_granted = True
         await repository.upsert_user_contact(contact)
+        await repository.save_contact(user_id, original_phone or phone_e164)
         await repository.set_contact_skip_once(user_id, False)
         await repository.set_contact_never(user_id, False)
         full_name = getattr(user, "full_name", None)
@@ -935,11 +940,18 @@ def setup_router(
                 message,
                 state,
                 message.answer,
+                msg.PHONE_SAVED_CONFIRMATION,
+                track=False,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
                 msg.ASK_PHONE_THANKS.format(
                     rub=contact_reward_rub, promo=promo_contact_code
                 ),
                 track=False,
-                reply_markup=ReplyKeyboardRemove(),
             )
             logger.debug(
                 "Contact stored for user %s (source=%s)",
@@ -1173,6 +1185,7 @@ def setup_router(
             contact_prompt_message_id=None,
             upload=None,
             upload_file_id=None,
+            last_photo_file_id=None,
             current_models=[],
             last_batch=[],
             presented_model_ids=[],
@@ -1349,7 +1362,11 @@ def setup_router(
         user_id = message.from_user.id
         photo = message.photo[-1]
         path = await save_user_photo(message)
-        await state.update_data(upload=path, upload_file_id=photo.file_id)
+        await state.update_data(
+            upload=path,
+            upload_file_id=photo.file_id,
+            last_photo_file_id=photo.file_id,
+        )
         await track_event(str(user_id), "photo_uploaded")
         profile = await repository.ensure_daily_reset(user_id)
         if profile.tries_used == 0:
@@ -1567,6 +1584,7 @@ def setup_router(
         data = await state.get_data()
         upload_value = data.get("upload")
         upload_file_id = data.get("upload_file_id")
+        last_photo_file_id = data.get("last_photo_file_id")
 
         progress_message: Message | None = None
         user_photo_path: Path | None = None
@@ -1596,6 +1614,15 @@ def setup_router(
                     message.bot, upload_file_id, user_id
                 )
                 await state.update_data(upload=downloaded)
+                user_photo_path = Path(downloaded)
+            elif last_photo_file_id:
+                downloaded = await redownload_user_photo(
+                    message.bot, last_photo_file_id, user_id
+                )
+                await state.update_data(
+                    upload=downloaded,
+                    upload_file_id=last_photo_file_id,
+                )
                 user_photo_path = Path(downloaded)
             else:
                 raise RuntimeError("User photo is not available")
@@ -1687,6 +1714,7 @@ def setup_router(
                 current_models=[],
                 upload=None,
                 upload_file_id=None,
+                last_photo_file_id=None,
             )
             await state.set_state(TryOnStates.AWAITING_PHOTO)
             await _send_aux_message(
@@ -1719,6 +1747,7 @@ def setup_router(
                 current_models=[],
                 upload=None,
                 upload_file_id=None,
+                last_photo_file_id=None,
             )
             await state.set_state(TryOnStates.AWAITING_PHOTO)
             await _send_aux_message(
@@ -1949,7 +1978,9 @@ def setup_router(
             return
         upload_exists = bool(data_before.get("upload"))
         upload_file_id = data_before.get("upload_file_id")
-        if not upload_exists and not upload_file_id:
+        last_photo_file_id = data_before.get("last_photo_file_id")
+        active_file_id = upload_file_id or last_photo_file_id
+        if not upload_exists and not active_file_id:
             if message:
                 await _prompt_for_next_photo(message, state, msg.PHOTO_INSTRUCTION)
             else:
@@ -1967,11 +1998,14 @@ def setup_router(
             return
         filters = await _ensure_filters(user_id, state)
         presented = set(data_before.get("presented_model_ids", []))
-        await state.update_data(
-            selected_model=None,
-            current_models=[],
-            last_batch=[],
-        )
+        updates: dict[str, Any] = {
+            "selected_model": None,
+            "current_models": [],
+            "last_batch": [],
+        }
+        if active_file_id:
+            updates["upload_file_id"] = active_file_id
+        await state.update_data(**updates)
         preload_message = await _send_aux_message(
             message,
             state,
@@ -2037,7 +2071,9 @@ def setup_router(
             return
         upload_exists = bool(data.get("upload"))
         upload_file_id = data.get("upload_file_id")
-        if not upload_exists and not upload_file_id:
+        last_photo_file_id = data.get("last_photo_file_id")
+        active_file_id = upload_file_id or last_photo_file_id
+        if not upload_exists and not active_file_id:
             await _prompt_for_next_photo(message, state, msg.PHOTO_INSTRUCTION)
             await callback.answer()
             return
@@ -2046,12 +2082,15 @@ def setup_router(
         await repository.set_last_more_message(user_id, None, None, None)
         filters = await _ensure_filters(user_id, state)
         presented = set(data.get("presented_model_ids", []))
-        await state.update_data(
-            selected_model=None,
-            current_models=[],
-            last_batch=[],
-            suppress_more_button=True,
-        )
+        reuse_updates: dict[str, Any] = {
+            "selected_model": None,
+            "current_models": [],
+            "last_batch": [],
+            "suppress_more_button": True,
+        }
+        if active_file_id:
+            reuse_updates["upload_file_id"] = active_file_id
+        await state.update_data(**reuse_updates)
         preload_message = await _send_aux_message(
             message,
             state,
@@ -2140,7 +2179,12 @@ def setup_router(
         if current_state == ContactRequest.waiting_for_phone.state:
             await message.answer(msg.GENERATION_BUSY)
             return
-        if await _reject_if_busy(message, state, allow_show_recs=True):
+        if await _reject_if_busy(
+            message,
+            state,
+            allow_show_recs=True,
+            busy_message=msg.WEAR_BUSY_MESSAGE,
+        ):
             return
         user_id = message.from_user.id
         data = await state.get_data()
@@ -2176,6 +2220,7 @@ def setup_router(
         await state.update_data(
             upload=None,
             upload_file_id=None,
+            last_photo_file_id=None,
             selected_model=None,
             current_models=[],
             last_batch=[],
@@ -2227,6 +2272,7 @@ def setup_router(
         await state.update_data(
             upload=None,
             upload_file_id=None,
+            last_photo_file_id=None,
             selected_model=None,
             current_models=[],
             is_generating=False,

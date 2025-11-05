@@ -225,6 +225,16 @@ class Repository:
     async def mark_contact_reward_granted(self, user_id: int) -> None:
         await asyncio.to_thread(self._mark_contact_reward_sync, user_id)
 
+    async def save_contact(
+        self,
+        user_id: int,
+        phone_number: str,
+        *,
+        saved_at: Optional[datetime] = None,
+    ) -> None:
+        moment = saved_at or datetime.now(timezone.utc)
+        await asyncio.to_thread(self._save_contact_sync, user_id, phone_number, moment)
+
     async def add_seen_models(
         self, user_id: int, model_ids: Iterable[str], *, context: str = "global"
     ) -> None:
@@ -389,6 +399,16 @@ class Repository:
                 """
             )
             self._ensure_contact_table(conn)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS contact_shares (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    phone_number TEXT NOT NULL,
+                    saved_at TEXT NOT NULL
+                )
+                """
+            )
             conn.commit()
 
     def _row_to_profile(self, row: sqlite3.Row) -> UserProfile:
@@ -844,6 +864,19 @@ class Repository:
             conn.execute(
                 "UPDATE user_contacts SET reward_granted = 1 WHERE tg_user_id = ?",
                 (user_id,),
+            )
+            conn.commit()
+
+    def _save_contact_sync(
+        self, user_id: int, phone_number: str, when: datetime
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO contact_shares (user_id, phone_number, saved_at)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, phone_number, when.isoformat()),
             )
             conn.commit()
 

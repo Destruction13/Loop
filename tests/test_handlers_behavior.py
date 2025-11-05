@@ -191,6 +191,7 @@ class StubRepository:
         self.cycle_index: int = 0
         self.nudge_sent: bool = False
         self.more_buttons: dict[int, tuple[Optional[int], Optional[str], Optional[dict[str, Any]]]] = {}
+        self.saved_contacts: list[tuple[int, str]] = []
 
     async def ensure_user(self, user_id: int) -> Any:
         message_id, message_type, payload = self.more_buttons.get(
@@ -314,6 +315,9 @@ class StubRepository:
         contact = self.contacts.get(user_id)
         if contact:
             contact.reward_granted = True
+
+    async def save_contact(self, user_id: int, phone_number: str) -> None:
+        self.saved_contacts.append((user_id, phone_number))
 
     async def register_contact_generation(
         self,
@@ -1229,13 +1233,18 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
         await contact_handler(contact_message, state)
 
         assert state.state is TryOnStates.RESULT
+        assert repository.saved_contacts == [(888, "+79991234567")]
         assert list(message.answer_photos) == photos_before
-        thanks_text, thanks_markup = contact_message.answers[0]
+        assert len(contact_message.answers) == 3
+        ack_text, ack_markup = contact_message.answers[0]
+        assert ack_text == msg.PHONE_SAVED_CONFIRMATION
+        assert isinstance(ack_markup, ReplyKeyboardRemove)
+        thanks_text, thanks_markup = contact_message.answers[1]
         assert thanks_text == msg.ASK_PHONE_THANKS.format(
             rub=1000, promo="PROMO1000"
         )
-        assert isinstance(thanks_markup, ReplyKeyboardRemove)
-        followup_text, followup_markup = contact_message.answers[1]
+        assert thanks_markup is None
+        followup_text, followup_markup = contact_message.answers[2]
         assert followup_text == "".join(msg.THIRD_RESULT_CAPTION)
         assert isinstance(followup_markup, InlineKeyboardMarkup)
         assert (
@@ -1575,6 +1584,26 @@ def test_wear_rejected_during_contact_request(tmp_path: Path) -> None:
 
         assert message.answers[-1][0] == msg.GENERATION_BUSY
         assert state.state == ContactRequest.waiting_for_phone.state
+
+    asyncio.run(scenario())
+
+
+def test_wear_rejected_during_generation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "command_wear")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=779, bot=bot)
+        message.text = "/wear"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.GENERATING.state)
+        await state.update_data(is_generating=True)
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.WEAR_BUSY_MESSAGE
+        assert state.state == TryOnStates.GENERATING.state
 
     asyncio.run(scenario())
 
