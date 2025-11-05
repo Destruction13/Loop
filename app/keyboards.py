@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from app.texts import messages as msg
 
@@ -313,6 +318,7 @@ def more_buttonless_markup(
 CONTACT_SHARE_CALLBACK = "contact_share"
 CONTACT_SKIP_CALLBACK = "contact_skip"
 CONTACT_NEVER_CALLBACK = "contact_never"
+REUSE_SAME_PHOTO_CALLBACK = "reuse_same_photo"
 
 
 def contact_request_keyboard() -> InlineKeyboardMarkup:
@@ -336,5 +342,37 @@ def contact_request_keyboard() -> InlineKeyboardMarkup:
                     callback_data=CONTACT_NEVER_CALLBACK,
                 ),
             ],
+        ]
+    )
+
+
+def contact_share_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Reply keyboard that requests the user's contact information."""
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(
+                    text=msg.ASK_PHONE_BUTTON_SHARE,
+                    request_contact=True,
+                )
+            ]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def reuse_same_photo_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard offering to reuse the existing uploaded photo."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=msg.REUSE_SAME_PHOTO_BUTTON_TEXT,
+                    callback_data=REUSE_SAME_PHOTO_CALLBACK,
+                )
+            ]
         ]
     )

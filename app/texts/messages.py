@@ -92,6 +92,8 @@ BTN_SEND_NEW_PHOTO = "Загрузить другое фото"
 WEAR_FOOTNOTE = "Хочешь примерить на другой фотографии?\nИспользуй команду <b>/wear</b>"
 WEAR_FOOTNOTE_LINE = WEAR_FOOTNOTE
 
+REUSE_SAME_PHOTO_BUTTON_TEXT = "Использовать то же фото"
+
 # Подпись к первой удачной примерке за день.
 FIRST_RESULT_CAPTION = (
     (
