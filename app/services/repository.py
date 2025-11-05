@@ -202,6 +202,47 @@ class Repository:
             self._record_seen_models_sync, user_id, ids, timestamp, context
         )
 
+    async def clear_seen_models(
+        self, user_id: int, *, context: str | None = None
+    ) -> None:
+        await asyncio.to_thread(self._clear_seen_models_sync, user_id, context)
+
+    async def reset_user_session(self, user_id: int) -> None:
+        lock = self._ensure_lock()
+        async with lock:
+            profile = await self.ensure_user(user_id)
+            if profile is None:
+                return
+            preserved_contact_never = profile.contact_never
+            new_profile = UserProfile(
+                user_id=user_id,
+                gender=None,
+                age_bucket=None,
+                style="normal",
+                daily_used=profile.daily_used,
+                tries_used=profile.tries_used,
+                daily_try_limit=profile.daily_try_limit,
+                cycle_started_at=profile.cycle_started_at,
+                cycle_index=profile.cycle_index,
+                locked_until=profile.locked_until,
+                nudge_sent_cycle=profile.nudge_sent_cycle,
+                last_reset_at=profile.last_reset_at,
+                seen_models=[],
+                remind_at=None,
+                referrer_id=profile.referrer_id,
+                gen_count=0,
+                contact_skip_once=False,
+                contact_never=preserved_contact_never,
+                last_activity_ts=profile.last_activity_ts,
+                idle_reminder_sent=profile.idle_reminder_sent,
+                social_ad_shown=profile.social_ad_shown,
+                last_more_message_id=None,
+                last_more_message_type=None,
+                last_more_message_payload=None,
+            )
+            await asyncio.to_thread(self._upsert_user, new_profile)
+            await asyncio.to_thread(self._clear_seen_models_sync, user_id, None)
+
     async def list_seen_models(self, user_id: int, *, context: str) -> set[str]:
         return await asyncio.to_thread(self._list_seen_models_sync, user_id, context)
 
@@ -607,6 +648,22 @@ class Repository:
                 """,
                 [(user_id, context, model_id, timestamp) for model_id in model_ids],
             )
+            conn.commit()
+
+    def _clear_seen_models_sync(
+        self, user_id: int, context: str | None
+    ) -> None:
+        with self._connection() as conn:
+            if context is None:
+                conn.execute(
+                    "DELETE FROM user_seen_models WHERE user_id = ?",
+                    (user_id,),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM user_seen_models WHERE user_id = ? AND context = ?",
+                    (user_id, context),
+                )
             conn.commit()
 
     def _list_seen_models_sync(self, user_id: int, context: str) -> set[str]:

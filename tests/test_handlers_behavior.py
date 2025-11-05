@@ -296,6 +296,9 @@ class StubRepository:
     async def list_due_reminders(self, now: Any) -> list[Any]:  # noqa: D401 - no reminders in tests
         return []
 
+    async def reset_user_session(self, user_id: int) -> None:  # noqa: D401 - no-op
+        return None
+
 
 class StubRecommendationService:
     def __init__(self, models: list[GlassModel]) -> None:
@@ -304,12 +307,23 @@ class StubRecommendationService:
         self.calls: list[tuple[int, str]] = []
 
     async def recommend_for_user(
-        self, user_id: int, gender: str
+        self,
+        user_id: int,
+        gender: str,
+        *,
+        exclude_ids: set[str] | None = None,
     ) -> RecommendationResult:
         self.calls.append((user_id, gender))
+        exclude = set(exclude_ids or set())
         if self.queue:
-            return self.queue.pop(0)
-        return RecommendationResult(models=list(self.default), exhausted=False)
+            result = self.queue.pop(0)
+        else:
+            result = RecommendationResult(models=list(self.default), exhausted=False)
+        filtered_models = [
+            model for model in result.models if model.unique_id not in exclude
+        ]
+        exhausted = result.exhausted or not filtered_models
+        return RecommendationResult(models=filtered_models, exhausted=exhausted)
 
 
 class StubTryOn:
@@ -762,7 +776,18 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         gender="male",
     )
     async def scenario() -> None:
-        router, repository, tryon, _, _ = build_router(tmp_path, models=[model])
+        alt_model = GlassModel(
+            unique_id="m2",
+            title="Model 2",
+            model_code="M2",
+            site_url="https://example.com/2",
+            img_user_url="https://example.com/2.jpg",
+            img_nano_url="https://example.com/2-nano.jpg",
+            gender="male",
+        )
+        router, repository, tryon, _, recommender = build_router(
+            tmp_path, models=[model]
+        )
         handler_photo = get_message_handler(router, "accept_photo")
         handler_choose = get_callback_handler(router, "choose_model")
 
@@ -793,10 +818,16 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
 
         callback_follow = DummyCallback("more|1", upload_message)
         handler_more = get_callback_handler(router, "result_more")
+        recommender.queue.append(
+            RecommendationResult(models=[alt_model], exhausted=False)
+        )
+        previous_photo_messages = len(upload_message.answer_photos)
         await handler_more(callback_follow, state)
-        assert state.state is TryOnStates.AWAITING_PHOTO
-        assert upload_message.answers[-1][0] == "".join(msg.PHOTO_INSTRUCTION)
-        assert_no_reply_keyboard(upload_message.answers[-1][1])
+        assert state.state is TryOnStates.SHOW_RECS
+        assert upload_message.answers[-1][0] == msg.SEARCHING_MODELS_PROMPT
+        assert len(upload_message.answer_photos) == previous_photo_messages + 1
+        followup_photo = upload_message.answer_photos[-1]
+        assert isinstance(followup_photo[2], InlineKeyboardMarkup)
         assert upload_message.edited_captions
         last_caption_edit = upload_message.edited_captions[-1]
         assert last_caption_edit[0] == model.title
@@ -805,13 +836,12 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
             button.text for button in last_caption_edit[1].inline_keyboard[0]
         ] == [msg.DETAILS_BUTTON_TEXT]
 
-        upload_message.photo = [PhotoStub("upload2")]  # type: ignore[attr-defined]
-        await handler_photo(upload_message, state)
-
-        callback_second = DummyCallback("pick:src=batch2:m1", upload_message)
+        callback_second = DummyCallback(
+            f"pick:src=batch2:{alt_model.unique_id}", upload_message
+        )
         await handler_choose(callback_second, state)
         second_result = upload_message.answer_photos[-1]
-        assert second_result[1] == model.title
+        assert second_result[1] == "".join(msg.SECOND_RESULT_CAPTION)
         assert isinstance(second_result[2], InlineKeyboardMarkup)
         assert [
             button.text for button in second_result[2].inline_keyboard[0]
@@ -978,6 +1008,7 @@ def test_idle_reminder_message_removed_when_user_requests_more(tmp_path: Path) -
         callback = DummyCallback("more|idle", message)
         await handler_more(callback, state)
 
+        assert state.state is TryOnStates.AWAITING_PHOTO
         assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
         assert (555, message.message_id) in bot.deleted
 
@@ -1007,7 +1038,18 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
     ]
 
     async def scenario() -> None:
-        router, repository, _, _, _ = build_router(tmp_path, models=models)
+        extra_model = GlassModel(
+            unique_id="m3",
+            title="Model 3",
+            model_code="M3",
+            site_url="https://example.com/3",
+            img_user_url="https://example.com/3.jpg",
+            img_nano_url="https://example.com/3-nano.jpg",
+            gender="male",
+        )
+        router, repository, _, _, recommender = build_router(
+            tmp_path, models=models
+        )
         handler_photo = get_message_handler(router, "accept_photo")
         handler_choose = get_callback_handler(router, "choose_model")
         handler_more = get_callback_handler(router, "result_more")
@@ -1026,21 +1068,23 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
         assert not any(msg.ASK_PHONE_TITLE in text for text, _ in message.answers)
 
         more_callback = DummyCallback("more|1", message)
+        recommender.queue.append(
+            RecommendationResult(models=[extra_model], exhausted=False)
+        )
+        previous_photos = list(message.answer_photos)
         await handler_more(more_callback, state)
-        assert state.state is TryOnStates.AWAITING_PHOTO
-        assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
-        assert_no_reply_keyboard(message.answers[-1][1])
+        assert state.state is TryOnStates.SHOW_RECS
+        assert message.answers[-1][0] == msg.SEARCHING_MODELS_PROMPT
+        assert len(message.answer_photos) == len(previous_photos) + 1
 
-        message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]
-        await handler_photo(message, state)
-        assert repository.gen_counts[777] == 1
-
-        second_callback = DummyCallback("pick:src=batch2:m1", message)
+        second_callback = DummyCallback(
+            f"pick:src=batch2:{extra_model.unique_id}", message
+        )
         await handler_choose(second_callback, state)
         assert repository.gen_counts[777] == 2
 
         second_result = message.answer_photos[-1]
-        assert second_result[1] == models[0].title
+        assert second_result[1] == "".join(msg.SECOND_RESULT_CAPTION)
         assert isinstance(second_result[2], InlineKeyboardMarkup)
         assert [
             button.text for button in second_result[2].inline_keyboard[0]
@@ -1080,7 +1124,18 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
     ]
 
     async def scenario() -> None:
-        router, repository, _, _, _ = build_router(tmp_path, models=models)
+        extra_model = GlassModel(
+            unique_id="m3",
+            title="Model 3",
+            model_code="M3",
+            site_url="https://example.com/3",
+            img_user_url="https://example.com/3.jpg",
+            img_nano_url="https://example.com/3-nano.jpg",
+            gender="male",
+        )
+        router, repository, _, _, recommender = build_router(
+            tmp_path, models=models
+        )
         handler_photo = get_message_handler(router, "accept_photo")
         handler_choose = get_callback_handler(router, "choose_model")
         handler_more = get_callback_handler(router, "result_more")
@@ -1094,12 +1149,15 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
 
         await handler_photo(message, state)
         await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
+        recommender.queue.append(
+            RecommendationResult(models=[extra_model], exhausted=False)
+        )
         await handler_more(DummyCallback("more|1", message), state)
-        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert state.state is TryOnStates.SHOW_RECS
 
-        message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]
-        await handler_photo(message, state)
-        await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
+        await handler_choose(
+            DummyCallback(f"pick:src=batch2:{extra_model.unique_id}", message), state
+        )
 
         assert state.state is ContactRequest.waiting_for_phone
         photos_before = list(message.answer_photos)

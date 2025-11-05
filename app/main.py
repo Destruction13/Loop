@@ -122,6 +122,7 @@ async def main() -> None:
         [
             BotCommand(command="start", description="Запуск бота"),
             BotCommand(command="wear", description="Примерить новые очки"),
+            BotCommand(command="help", description="Как это работает"),
             BotCommand(command="privacy", description="Политика конфиденциальности"),
         ]
     )

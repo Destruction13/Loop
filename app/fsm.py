@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, List, Mapping, Optional, Sequence
 
 from aiogram import BaseMiddleware, F, Router, Bot
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -456,6 +457,7 @@ def setup_router(
             last_batch=[],
             preload_message_id=None,
             generation_progress_message_id=None,
+            presented_model_ids=[],
         )
         await repository.set_last_more_message(message.chat.id, None, None, None)
         await _send_aux_message(
@@ -562,12 +564,17 @@ def setup_router(
         state: FSMContext,
         *,
         skip_contact_prompt: bool = False,
+        exclude_ids: set[str] | None = None,
     ) -> bool:
         if not skip_contact_prompt:
             if await _maybe_request_contact(message, state, user_id):
                 return False
         try:
-            result = await recommender.recommend_for_user(user_id, filters.gender)
+            result = await recommender.recommend_for_user(
+                user_id,
+                filters.gender,
+                exclude_ids=exclude_ids or set(),
+            )
         except CatalogError as exc:
             logger.error(
                 "Ошибка при получении каталога: %s",
@@ -606,7 +613,16 @@ def setup_router(
             )
             return False
         batch = list(result.models)
-        await state.update_data(current_models=batch, last_batch=batch)
+        data = await state.get_data()
+        presented = list(dict.fromkeys(data.get("presented_model_ids", [])))
+        for model in batch:
+            if model.unique_id not in presented:
+                presented.append(model.unique_id)
+        await state.update_data(
+            current_models=batch,
+            last_batch=batch,
+            presented_model_ids=presented,
+        )
         await _send_model_batches(message, state, batch)
         await _delete_state_message(message, state, "preload_message_id")
         if result.exhausted:
@@ -1010,10 +1026,12 @@ def setup_router(
         if previous_data:
             await _delete_phone_invalid_message(message, state, data=previous_data)
         await _delete_last_aux_message(message, state)
+        profile_before = await repository.ensure_user(user_id)
+        ignored_phone = profile_before.contact_skip_once or contact_was_active
         await state.clear()
+        await repository.reset_user_session(user_id)
         profile = await repository.ensure_user(user_id)
-        ignored_phone = profile.contact_skip_once or contact_was_active
-        if contact_was_active and not profile.contact_skip_once and not profile.contact_never:
+        if contact_was_active and not profile_before.contact_skip_once and not profile.contact_never:
             await repository.set_contact_skip_once(user_id, True)
             ignored_phone = True
         contact_record = await repository.get_user_contact(user_id)
@@ -1052,6 +1070,12 @@ def setup_router(
             phone_invalid_message_id=None,
             contact_request_active=False,
             contact_prompt_message_id=None,
+            upload=None,
+            upload_file_id=None,
+            current_models=[],
+            last_batch=[],
+            presented_model_ids=[],
+            selected_model=None,
         )
         promo_video_log = {
             "path": str(promo_video_path),
@@ -1236,6 +1260,11 @@ def setup_router(
         await _delete_idle_nudge_message(state, message.bot, message.chat.id)
         filters = await _ensure_filters(user_id, state)
         await state.set_state(TryOnStates.SHOW_RECS)
+        await state.update_data(
+            presented_model_ids=[],
+            current_models=[],
+            last_batch=[],
+        )
         contact_profile = await repository.ensure_user(user_id)
         defer_contact_reminder = (
             contact_profile.contact_skip_once
@@ -1259,6 +1288,7 @@ def setup_router(
             filters,
             state,
             skip_contact_prompt=True,
+            exclude_ids=None,
         )
         info_domain(
             "bot.handlers",
@@ -1616,10 +1646,6 @@ def setup_router(
             caption_text = model.title
             result_has_more = False
             keyboard_remaining = 0
-        elif is_second_generation:
-            caption_text = model.title
-            result_has_more = False
-            keyboard_remaining = 0
         result_markup = generation_result_keyboard(
             model.site_url, keyboard_remaining
         )
@@ -1727,6 +1753,10 @@ def setup_router(
         user_id = callback.from_user.id
         message = callback.message
         remove_source_message = callback.data in {"more|idle", "more|social"}
+        if message is None:
+            await callback.answer()
+            return
+        data_before = await state.get_data()
         if message:
             current_markup = getattr(message, "reply_markup", None)
             updated_markup = remove_more_button(current_markup)
@@ -1782,10 +1812,49 @@ def setup_router(
             )
             await callback.answer()
             return
-        if message:
-            await _prompt_for_next_photo(message, state, msg.PHOTO_INSTRUCTION)
-        else:
-            await state.set_state(TryOnStates.AWAITING_PHOTO)
+        upload_exists = bool(data_before.get("upload"))
+        upload_file_id = data_before.get("upload_file_id")
+        if not upload_exists and not upload_file_id:
+            if message:
+                await _prompt_for_next_photo(message, state, msg.PHOTO_INSTRUCTION)
+            else:
+                await state.set_state(TryOnStates.AWAITING_PHOTO)
+            if remove_source_message:
+                try:
+                    await message.bot.delete_message(message.chat.id, message.message_id)
+                except TelegramBadRequest as exc:
+                    logger.debug(
+                        "Failed to delete reminder message %s: %s",
+                        message.message_id,
+                        exc,
+                    )
+            await callback.answer()
+            return
+        filters = await _ensure_filters(user_id, state)
+        presented = set(data_before.get("presented_model_ids", []))
+        await state.update_data(
+            selected_model=None,
+            current_models=[],
+            last_batch=[],
+        )
+        preload_message = await _send_aux_message(
+            message,
+            state,
+            message.answer,
+            msg.SEARCHING_MODELS_PROMPT,
+        )
+        await state.update_data(preload_message_id=preload_message.message_id)
+        await state.set_state(TryOnStates.SHOW_RECS)
+        success = await _send_models(
+            message,
+            user_id,
+            filters,
+            state,
+            skip_contact_prompt=True,
+            exclude_ids=presented,
+        )
+        if not success:
+            await state.set_state(TryOnStates.RESULT)
         if remove_source_message and message:
             try:
                 await message.bot.delete_message(message.chat.id, message.message_id)
@@ -1860,12 +1929,56 @@ def setup_router(
 
     @router.message(Command("wear"))
     async def command_wear(message: Message, state: FSMContext) -> None:
-        await start_wear_flow(
+        current_state = await state.get_state()
+        if current_state == ContactRequest.waiting_for_phone.state:
+            return
+        if current_state == TryOnStates.GENERATING.state:
+            await message.answer(msg.GENERATION_BUSY)
+            return
+        user_id = message.from_user.id
+        remaining = await repository.remaining_tries(user_id)
+        if remaining <= 0:
+            await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
+            await track_event(str(user_id), "daily_limit_hit")
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                _render_text(msg.DAILY_LIMIT_MESSAGE),
+                reply_markup=limit_reached_keyboard(site_url),
+            )
+            info_domain(
+                "bot.handlers",
+                "🔒 Достигнут дневной лимит",
+                stage="DAILY_LIMIT",
+                user_id=user_id,
+                context="wear_command",
+            )
+            return
+        await _delete_idle_nudge_message(state, message.bot, message.chat.id)
+        await _deactivate_previous_more_button(message.bot, user_id)
+        await repository.set_last_more_message(user_id, None, None, None)
+        await state.update_data(
+            upload=None,
+            upload_file_id=None,
+            selected_model=None,
+            current_models=[],
+            last_batch=[],
+            presented_model_ids=[],
+            preload_message_id=None,
+            generation_progress_message_id=None,
+        )
+        await state.set_state(TryOnStates.AWAITING_PHOTO)
+        await _send_aux_message(
             message,
             state,
-            bypass_allow=True,
-            context="wear_command",
+            message.answer,
+            msg.PHOTO_INSTRUCTION,
         )
+
+    @router.message(Command("help"))
+    async def command_help(message: Message) -> None:
+        await message.answer(msg.HELP_TEXT, parse_mode=ParseMode.MARKDOWN_V2)
 
     @router.message(F.text == msg.MAIN_MENU_TRY_BUTTON)
     async def handle_main_menu_try(message: Message, state: FSMContext) -> None:
