@@ -876,9 +876,10 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         callback = DummyCallback("pick:src=batch2:m1", upload_message)
         await handler_choose(callback, state)
 
-        deleted_ids = [mid for _, mid in bot.deleted]
-        assert upload_message.message_id in deleted_ids
-        assert any(mid > upload_message.message_id for mid in deleted_ids)
+        assert upload_message.edited_captions
+        first_edit_caption, first_edit_markup = upload_message.edited_captions[0]
+        assert first_edit_caption == model.title
+        assert first_edit_markup is None
         assert state.data.get("generation_progress_message_id") is None
         assert repository.tries_used == 1
         assert state.state is TryOnStates.RESULT
@@ -1285,7 +1286,7 @@ def test_contact_share_button_requests_contact_keyboard(tmp_path: Path) -> None:
         await handler(callback, state)
 
         assert bot.deleted == [(321, message.message_id)]
-        assert message.answers[-1][0] == msg.ASK_PHONE_SHARE_REQUEST
+        assert message.answers[-1][0] == "\u2060"
         markup = message.answers[-1][1]
         expected = contact_share_reply_keyboard()
         assert type(markup) is type(expected)
@@ -1616,7 +1617,7 @@ def test_wear_rejected_during_generation(tmp_path: Path) -> None:
 
         await handler(message, state)
 
-        assert message.answers[-1][0] == msg.WEAR_BUSY_MESSAGE
+        assert message.answers[-1][0] == msg.GENERATION_BUSY
         assert state.state == TryOnStates.GENERATING.state
 
     asyncio.run(scenario())

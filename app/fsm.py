@@ -178,6 +178,195 @@ def setup_router(
         policy_url or "https://telegra.ph/Politika-konfidencialnosti-LOOV-10-29"
     )
     BUSY_STATES = {TryOnStates.GENERATING.state, TryOnStates.SHOW_RECS.state}
+    INVISIBLE_PROMPT = "\u2060"
+
+    def _detect_card_mode(message: Message) -> str:
+        content_type = getattr(message, "content_type", "")
+        return "text" if content_type == "text" else "caption"
+
+    def _resolve_chat_id(message: Message | None) -> int | None:
+        if not message:
+            return None
+        chat = getattr(message, "chat", None)
+        if chat is not None and hasattr(chat, "id"):
+            try:
+                return int(chat.id)
+            except (TypeError, ValueError):
+                return None
+        chat_id = getattr(message, "chat_id", None)
+        if chat_id is not None:
+            try:
+                return int(chat_id)
+            except (TypeError, ValueError):
+                return None
+        from_user = getattr(message, "from_user", None)
+        if from_user is not None and hasattr(from_user, "id"):
+            try:
+                return int(from_user.id)
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    async def _remember_card_message(
+        state: FSMContext,
+        message: Message | None,
+        *,
+        title: str | None,
+        trimmed: bool = False,
+    ) -> None:
+        if not message:
+            return
+        chat_id = _resolve_chat_id(message)
+        if chat_id is None:
+            return
+        entry = {
+            "message_id": int(message.message_id),
+            "chat_id": chat_id,
+            "type": _detect_card_mode(message),
+            "title": title,
+            "trimmed": trimmed,
+            "trim_failed": False,
+        }
+        await state.update_data(last_card_message=entry)
+
+    async def _trim_last_card_message(
+        message: Message | None,
+        state: FSMContext,
+        *,
+        title: str | None = None,
+    ) -> None:
+        if not message:
+            return
+        data = await state.get_data()
+        entry = dict(data.get("last_card_message") or {})
+        if not entry:
+            return
+        message_id = entry.get("message_id")
+        if not message_id:
+            return
+        if entry.get("trim_failed") and title is None:
+            return
+        stored_title = entry.get("title")
+        if entry.get("trimmed") and title is None:
+            return
+        if entry.get("trimmed") and title is not None and stored_title == title:
+            return
+        final_title = title or stored_title
+        if not final_title:
+            return
+        chat_id = entry.get("chat_id") or _resolve_chat_id(message)
+        if chat_id is None:
+            return
+        mode = entry.get("type") or "caption"
+        bot = message.bot
+        try:
+            if mode == "text":
+                await bot.edit_message_text(
+                    final_title,
+                    chat_id=chat_id,
+                    message_id=int(message_id),
+                    reply_markup=None,
+                )
+            else:
+                edit_caption = getattr(bot, "edit_message_caption", None)
+                if callable(edit_caption):
+                    await edit_caption(
+                        chat_id=chat_id,
+                        message_id=int(message_id),
+                        caption=final_title,
+                        reply_markup=None,
+                    )
+                else:
+                    await bot.edit_message_text(
+                        final_title,
+                        chat_id=chat_id,
+                        message_id=int(message_id),
+                        reply_markup=None,
+                    )
+        except (TelegramBadRequest, TelegramForbiddenError, AttributeError) as exc:
+            logger.debug(
+                "Failed to trim card message %s: %s",
+                message_id,
+                exc,
+                extra={"stage": "CARD_TRIM"},
+            )
+            entry["trim_failed"] = True
+            await state.update_data(last_card_message=entry)
+        else:
+            entry.update(
+                {
+                    "title": final_title,
+                    "trimmed": True,
+                    "trim_failed": False,
+                    "type": mode,
+                    "chat_id": chat_id,
+                }
+            )
+            await state.update_data(last_card_message=entry)
+
+    async def _trim_message_card(
+        message: Message | None,
+        state: FSMContext,
+        *,
+        title: str,
+    ) -> None:
+        if not message:
+            return
+        mode = _detect_card_mode(message)
+        try:
+            if mode == "text":
+                await message.edit_text(title, reply_markup=None)
+            else:
+                await message.edit_caption(caption=title, reply_markup=None)
+        except TelegramBadRequest as exc:
+            logger.debug(
+                "Failed to trim inline card %s: %s",
+                message.message_id,
+                exc,
+                extra={"stage": "CARD_TRIM"},
+            )
+            try:
+                await message.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:
+                pass
+            chat_id = _resolve_chat_id(message)
+            if chat_id is None:
+                return
+            entry = {
+                "message_id": int(message.message_id),
+                "chat_id": chat_id,
+                "type": mode,
+                "title": title,
+                "trimmed": False,
+                "trim_failed": True,
+            }
+            await state.update_data(last_card_message=entry)
+        else:
+            chat_id = _resolve_chat_id(message)
+            if chat_id is None:
+                return
+            entry = {
+                "message_id": int(message.message_id),
+                "chat_id": chat_id,
+                "type": mode,
+                "title": title,
+                "trimmed": True,
+                "trim_failed": False,
+            }
+            await state.update_data(last_card_message=entry)
+
+    async def _dismiss_reply_keyboard(message: Message | None) -> None:
+        if not message:
+            return
+        try:
+            await message.answer(INVISIBLE_PROMPT, reply_markup=ReplyKeyboardRemove())
+        except TelegramBadRequest as exc:
+            logger.debug(
+                "Failed to hide reply keyboard for %s: %s",
+                message.message_id,
+                exc,
+                extra={"stage": "CONTACT_KEYBOARD_REMOVE"},
+            )
 
     async def _is_generation_in_progress(state: FSMContext) -> bool:
         data = await state.get_data()
@@ -620,6 +809,7 @@ def setup_router(
         if source_message_id is not None:
             stored[str(source_message_id)] = entry
         await state.update_data(result_messages=stored)
+        await _remember_card_message(state, message, title=model.title, trimmed=False)
 
     async def _maybe_request_contact(
         message: Message,
@@ -661,6 +851,7 @@ def setup_router(
         pending_state = data.get("contact_pending_result_state")
         if not pending_state and current_state == TryOnStates.RESULT.state:
             pending_state = "result"
+        await _trim_last_card_message(message, state)
         prompt_text = (
             f"<b>{msg.ASK_PHONE_TITLE}</b>\n\n"
             f"{msg.ASK_PHONE_BODY.format(rub=contact_reward_rub)}"
@@ -724,6 +915,7 @@ def setup_router(
         skip_contact_prompt: bool = False,
         exclude_ids: set[str] | None = None,
     ) -> bool:
+        await _trim_last_card_message(message, state)
         if not skip_contact_prompt:
             if await _maybe_request_contact(message, state, user_id):
                 return False
@@ -850,6 +1042,7 @@ def setup_router(
     ) -> None:
         user_id = message.from_user.id
         await _delete_contact_prompt_message(message, state)
+        await _dismiss_reply_keyboard(message)
         await repository.set_contact_skip_once(user_id, True)
         await _reset_phone_attempts(message, state)
         await state.update_data(contact_request_cooldown=4, contact_prompt_due=None)
@@ -1547,15 +1740,7 @@ def setup_router(
             await callback.answer()
             return
         await callback.answer()
-        try:
-            await callback.message.delete()
-        except TelegramBadRequest as exc:
-            logger.warning(
-                "Не удалось удалить сообщение с рекомендацией %s: %s",
-                callback.message.message_id,
-                exc,
-                extra={"stage": "MESSAGE_CLEANUP"},
-            )
+        await _trim_message_card(callback.message, state, title=selected.title)
         updates: dict[str, Any] = {"selected_model": selected}
         if data.get("allow_more_button_next"):
             updates["suppress_more_button"] = False
@@ -1574,7 +1759,7 @@ def setup_router(
         if callback.message:
             await _delete_contact_prompt_message(callback.message, state)
         await callback.message.answer(
-            msg.ASK_PHONE_SHARE_REQUEST,
+            INVISIBLE_PROMPT,
             reply_markup=contact_share_reply_keyboard(),
         )
 
@@ -1595,6 +1780,7 @@ def setup_router(
         user_id = callback.from_user.id
         if callback.message:
             await _delete_contact_prompt_message(callback.message, state)
+            await _dismiss_reply_keyboard(callback.message)
         await _reset_phone_attempts(callback.message, state)
         await repository.set_contact_never(user_id, True)
         await repository.set_contact_skip_once(user_id, False)
@@ -1637,6 +1823,7 @@ def setup_router(
             return
         if text == msg.ASK_PHONE_BUTTON_NEVER:
             await _reset_phone_attempts(message, state)
+            await _dismiss_reply_keyboard(message)
             await repository.set_contact_never(user_id, True)
             await repository.set_contact_skip_once(user_id, False)
             await state.update_data(contact_request_cooldown=0, contact_prompt_due=None)
@@ -1654,6 +1841,7 @@ def setup_router(
 
     async def _perform_generation(message: Message, state: FSMContext, model: GlassModel) -> None:
         user_id = message.chat.id
+        await _trim_last_card_message(message, state, title=model.title)
         await state.update_data(is_generating=True)
         data = await state.get_data()
         upload_value = data.get("upload")
@@ -2237,14 +2425,7 @@ def setup_router(
                 context=context,
             )
             return
-        gen_count = await repository.get_generation_count(user_id)
-        if gen_count == 0:
-            prompt_text = _render_text(msg.PHOTO_INSTRUCTION)
-        else:
-            prompt_text = _resolve_followup_caption(
-                max(gen_count, 1) - 1,
-                gender,
-            )
+        prompt_text = _render_text(msg.PHOTO_INSTRUCTION)
         await _prompt_for_next_photo(message, state, prompt_text)
 
     @router.message(Command("wear"))
@@ -2257,7 +2438,7 @@ def setup_router(
             message,
             state,
             allow_show_recs=True,
-            busy_message=msg.WEAR_BUSY_MESSAGE,
+            busy_message=msg.GENERATION_BUSY,
         ):
             return
         user_id = message.from_user.id
@@ -2308,6 +2489,7 @@ def setup_router(
             reuse_offer_active=False,
             allow_more_button_next=False,
         )
+        await _trim_last_card_message(message, state)
         async def _deliver_instruction() -> None:
             if await _edit_last_aux_message(message, state, msg.PHOTO_INSTRUCTION):
                 return
