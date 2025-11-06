@@ -44,6 +44,7 @@ class DummyBot:
         self.downloads: list[tuple[Any, Path]] = []
         self.chat_actions: list[tuple[int, Any]] = []
         self.edited_markups: list[tuple[int, int, Any]] = []
+        self.edited_texts: list[tuple[int, int, str, Optional[Any]]] = []
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
@@ -62,6 +63,16 @@ class DummyBot:
         reply_markup: Optional[Any] = None,
     ) -> None:
         self.edited_markups.append((chat_id, message_id, reply_markup))
+
+    async def edit_message_text(
+        self,
+        text: str,
+        *,
+        chat_id: int,
+        message_id: int,
+        reply_markup: Optional[Any] = None,
+    ) -> None:
+        self.edited_texts.append((chat_id, message_id, text, reply_markup))
 
 
 class DummyMessage:
@@ -1235,16 +1246,13 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
         assert state.state is TryOnStates.RESULT
         assert repository.saved_contacts == [(888, "+79991234567")]
         assert list(message.answer_photos) == photos_before
-        assert len(contact_message.answers) == 3
-        ack_text, ack_markup = contact_message.answers[0]
-        assert ack_text == msg.PHONE_SAVED_CONFIRMATION
-        assert isinstance(ack_markup, ReplyKeyboardRemove)
-        thanks_text, thanks_markup = contact_message.answers[1]
+        assert len(contact_message.answers) == 2
+        thanks_text, thanks_markup = contact_message.answers[0]
         assert thanks_text == msg.ASK_PHONE_THANKS.format(
             rub=1000, promo="PROMO1000"
         )
-        assert thanks_markup is None
-        followup_text, followup_markup = contact_message.answers[2]
+        assert isinstance(thanks_markup, ReplyKeyboardRemove)
+        followup_text, followup_markup = contact_message.answers[1]
         assert followup_text == "".join(msg.THIRD_RESULT_CAPTION)
         assert isinstance(followup_markup, InlineKeyboardMarkup)
         assert (
@@ -1253,6 +1261,7 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
         )
         state_data = await state.get_data()
         assert state_data.get("suppress_more_button") is True
+        assert state_data.get("contact_prompt_message_id") is None
 
     asyncio.run(scenario())
 
@@ -1266,12 +1275,17 @@ def test_contact_share_button_requests_contact_keyboard(tmp_path: Path) -> None:
         message = DummyMessage(user_id=321, bot=bot)
         state = DummyState()
         await state.set_state(ContactRequest.waiting_for_phone.state)
+        await state.update_data(
+            contact_prompt_message_id=message.message_id,
+            last_aux_message_id=message.message_id,
+        )
 
         callback = DummyCallback("contact_share", message)
 
         await handler(callback, state)
 
-        assert message.answers[-1][0] == msg.ASK_PHONE_PROMPT_MANUAL
+        assert bot.deleted == [(321, message.message_id)]
+        assert message.answers[-1][0] == msg.ASK_PHONE_SHARE_REQUEST
         markup = message.answers[-1][1]
         expected = contact_share_reply_keyboard()
         assert type(markup) is type(expected)

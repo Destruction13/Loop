@@ -373,6 +373,30 @@ def setup_router(
         finally:
             await state.update_data(last_aux_message_id=None)
 
+    async def _edit_last_aux_message(
+        message: Message,
+        state: FSMContext,
+        text: str,
+        *,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> bool:
+        data = await state.get_data()
+        message_id = data.get("last_aux_message_id")
+        if not message_id:
+            return False
+        try:
+            await message.bot.edit_message_text(
+                text,
+                chat_id=message.chat.id,
+                message_id=int(message_id),
+                reply_markup=reply_markup,
+            )
+        except (TelegramBadRequest, TelegramForbiddenError):
+            return False
+        else:
+            await state.update_data(last_aux_message_id=int(message_id))
+            return True
+
     async def _send_aux_message(
         source_message: Message,
         state: FSMContext,
@@ -519,7 +543,8 @@ def setup_router(
         return _render_text(source)
 
     def _compose_result_caption(model: GlassModel, body: str) -> str:
-        title_line = f"<b>{model.title}</b>"
+        model_name = getattr(model, "name", None) or model.title
+        title_line = f"<b>{model_name}</b>"
         stripped = body.strip()
         if not stripped:
             return title_line
@@ -546,6 +571,7 @@ def setup_router(
             suppress_more_button=False,
             reuse_offer_message_id=None,
             reuse_offer_active=False,
+            allow_more_button_next=False,
         )
         await repository.set_last_more_message(message.chat.id, None, None, None)
         await _send_aux_message(
@@ -637,8 +663,7 @@ def setup_router(
             pending_state = "result"
         prompt_text = (
             f"<b>{msg.ASK_PHONE_TITLE}</b>\n\n"
-            f"{msg.ASK_PHONE_BODY.format(rub=contact_reward_rub)}\n\n"
-            f"{msg.ASK_PHONE_PROMPT_MANUAL}"
+            f"{msg.ASK_PHONE_BODY.format(rub=contact_reward_rub)}"
         )
         update_payload = {
             "contact_request_active": True,
@@ -647,18 +672,32 @@ def setup_router(
         if pending_state and pending_state != data.get("contact_pending_result_state"):
             update_payload["contact_pending_result_state"] = pending_state
         await _deactivate_previous_more_button(message.bot, user_id)
+        await _clear_reuse_offer(state, message.bot, message.chat.id)
         await repository.set_last_more_message(user_id, None, None, None)
-        prompt_message = await _send_aux_message(
-            message,
-            state,
-            message.answer,
-            prompt_text,
-            reply_markup=contact_request_keyboard(),
-        )
+        markup = contact_request_keyboard()
+        prompt_message_id: int | None = None
+        if await _edit_last_aux_message(
+            message, state, prompt_text, reply_markup=markup
+        ):
+            refreshed = await state.get_data()
+            stored_id = refreshed.get("last_aux_message_id")
+            if stored_id:
+                prompt_message_id = int(stored_id)
+        if prompt_message_id is None:
+            prompt_message = await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                prompt_text,
+                reply_markup=markup,
+            )
+            prompt_message_id = prompt_message.message_id
+        else:
+            await state.update_data(last_aux_message_id=prompt_message_id)
         update_payload.update(
             phone_bad_attempts=0,
             phone_invalid_message_id=None,
-            contact_prompt_message_id=prompt_message.message_id,
+            contact_prompt_message_id=prompt_message_id,
             contact_request_cooldown=0,
         )
         await state.update_data(
@@ -778,6 +817,7 @@ def setup_router(
             contact_pending_result_state=None,
             contact_prompt_message_id=None,
             is_generating=False,
+            suppress_more_button=False,
         )
         if pending_state == "limit":
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
@@ -809,6 +849,7 @@ def setup_router(
         manual: bool = False,
     ) -> None:
         user_id = message.from_user.id
+        await _delete_contact_prompt_message(message, state)
         await repository.set_contact_skip_once(user_id, True)
         await _reset_phone_attempts(message, state)
         await state.update_data(contact_request_cooldown=4, contact_prompt_due=None)
@@ -894,6 +935,7 @@ def setup_router(
         source: str,
         original_phone: str | None = None,
     ) -> None:
+        await _delete_contact_prompt_message(message, state)
         user = message.from_user
         user_id = user.id
         await track_event(str(user_id), "phone_shared", value="yes")
@@ -940,25 +982,23 @@ def setup_router(
                 message,
                 state,
                 message.answer,
-                msg.PHONE_SAVED_CONFIRMATION,
-                track=False,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            await _send_aux_message(
-                message,
-                state,
-                message.answer,
                 msg.ASK_PHONE_THANKS.format(
                     rub=contact_reward_rub, promo=promo_contact_code
                 ),
                 track=False,
+                delete_previous=False,
+                reply_markup=ReplyKeyboardRemove(),
             )
             logger.debug(
                 "Contact stored for user %s (source=%s)",
                 user_id,
                 source,
             )
-            await state.update_data(contact_request_cooldown=0, contact_prompt_due=None)
+            await state.update_data(
+                contact_request_cooldown=0,
+                contact_prompt_due=None,
+                allow_more_button_next=True,
+            )
             await _resume_after_contact(message, state, send_generation=False)
             current_state = await state.get_state()
             if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
@@ -980,7 +1020,11 @@ def setup_router(
                 reply_markup=ReplyKeyboardRemove(),
             )
             logger.debug("Contact already existed for user %s", user_id)
-        await state.update_data(contact_request_cooldown=0, contact_prompt_due=None)
+        await state.update_data(
+            contact_request_cooldown=0,
+            contact_prompt_due=None,
+            allow_more_button_next=False,
+        )
         await _resume_after_contact(message, state, send_generation=True)
 
     async def _handle_manual_phone(
@@ -1122,6 +1166,26 @@ def setup_router(
                 await state.update_data(last_aux_message_id=None)
             await state.update_data(**{key: None})
 
+    async def _delete_contact_prompt_message(
+        message: Message,
+        state: FSMContext,
+    ) -> None:
+        data = await state.get_data()
+        prompt_id = data.get("contact_prompt_message_id")
+        if not prompt_id:
+            return
+        try:
+            await message.bot.delete_message(message.chat.id, int(prompt_id))
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            logger.debug(
+                "Failed to delete contact prompt %s: %s",
+                prompt_id,
+                exc,
+                extra={"stage": "CONTACT_PROMPT_DELETE"},
+            )
+        finally:
+            await state.update_data(contact_prompt_message_id=None, last_aux_message_id=None)
+
     promo_video_missing_warned = False
 
     @router.message(CommandStart())
@@ -1194,6 +1258,7 @@ def setup_router(
             suppress_more_button=False,
             reuse_offer_message_id=None,
             reuse_offer_active=False,
+            allow_more_button_next=False,
         )
         promo_video_log = {
             "path": str(promo_video_path),
@@ -1400,6 +1465,7 @@ def setup_router(
             suppress_more_button=False,
             reuse_offer_message_id=None,
             reuse_offer_active=False,
+            allow_more_button_next=False,
         )
         preload_message = await _send_aux_message(
             message,
@@ -1490,7 +1556,11 @@ def setup_router(
                 exc,
                 extra={"stage": "MESSAGE_CLEANUP"},
             )
-        await state.update_data(selected_model=selected)
+        updates: dict[str, Any] = {"selected_model": selected}
+        if data.get("allow_more_button_next"):
+            updates["suppress_more_button"] = False
+            updates["allow_more_button_next"] = False
+        await state.update_data(**updates)
         await state.update_data(is_generating=True)
         await state.set_state(TryOnStates.GENERATING)
         await _perform_generation(callback.message, state, selected)
@@ -1501,8 +1571,10 @@ def setup_router(
     )
     async def contact_share_button(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
+        if callback.message:
+            await _delete_contact_prompt_message(callback.message, state)
         await callback.message.answer(
-            msg.ASK_PHONE_PROMPT_MANUAL,
+            msg.ASK_PHONE_SHARE_REQUEST,
             reply_markup=contact_share_reply_keyboard(),
         )
 
@@ -1521,6 +1593,8 @@ def setup_router(
     async def contact_never_button(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         user_id = callback.from_user.id
+        if callback.message:
+            await _delete_contact_prompt_message(callback.message, state)
         await _reset_phone_attempts(callback.message, state)
         await repository.set_contact_never(user_id, True)
         await repository.set_contact_skip_once(user_id, False)
@@ -2232,22 +2306,23 @@ def setup_router(
             suppress_more_button=False,
             reuse_offer_message_id=None,
             reuse_offer_active=False,
+            allow_more_button_next=False,
         )
-        if current_state == TryOnStates.SHOW_RECS.state:
+        async def _deliver_instruction() -> None:
+            if await _edit_last_aux_message(message, state, msg.PHOTO_INSTRUCTION):
+                return
             await _send_aux_message(
                 message,
                 state,
                 message.answer,
                 msg.PHOTO_INSTRUCTION,
             )
+
+        if current_state == TryOnStates.SHOW_RECS.state:
+            await _deliver_instruction()
             return
         await state.set_state(TryOnStates.AWAITING_PHOTO)
-        await _send_aux_message(
-            message,
-            state,
-            message.answer,
-            msg.PHOTO_INSTRUCTION,
-        )
+        await _deliver_instruction()
 
     @router.message(Command("help"))
     async def command_help(message: Message, state: FSMContext) -> None:
@@ -2280,6 +2355,7 @@ def setup_router(
             suppress_more_button=False,
             reuse_offer_message_id=None,
             reuse_offer_active=False,
+            allow_more_button_next=False,
         )
         await message.answer(msg.CANCEL_CONFIRMATION)
 
