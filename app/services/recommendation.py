@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from app.models import GlassModel
-from app.services.catalog_base import CatalogService
+from app.services.catalog_base import CatalogService, CatalogSnapshot
 from app.services.repository import Repository
 
 
@@ -66,7 +66,11 @@ class RecommendationService:
         self._scheme = self._settings.pick_scheme
 
     async def recommend_for_user(
-        self, user_id: int, selected_gender: str
+        self,
+        user_id: int,
+        selected_gender: str,
+        *,
+        exclude_ids: set[str] | None = None,
     ) -> RecommendationResult:
         """Return models for the user based on configured quotas."""
 
@@ -85,19 +89,36 @@ class RecommendationService:
         normalized_gender = self._normalize_group_key(
             selected_gender, log_unknown=False
         )
+        exclude: set[str] = set(exclude_ids or set())
+        available_models = [
+            model for model in snapshot.models if model.unique_id not in exclude
+        ]
+        if not available_models:
+            return RecommendationResult(models=[], exhausted=True)
+
+        working_snapshot = CatalogSnapshot(
+            models=list(available_models),
+            version_hash=snapshot.version_hash,
+        )
         batch = await self._catalog.pick_batch(
             gender=selected_gender,
             batch_size=self._batch_size,
             scheme=self._scheme.value,
             rng=self._rng,
-            snapshot=snapshot,
+            snapshot=working_snapshot,
         )
 
-        picks = list(batch.items)
-        exhausted = batch.exhausted
-
+        picks = [model for model in batch.items if model.unique_id not in exclude]
         if not picks:
-            return RecommendationResult(models=[], exhausted=exhausted)
+            return RecommendationResult(models=[], exhausted=True)
+
+        remaining_after_batch = max(
+            len({model.unique_id for model in available_models})
+            - len({model.unique_id for model in picks}),
+            0,
+        )
+        exhausted = batch.exhausted or remaining_after_batch <= 0
+
         self._logger.debug(
             "Selected models for user %s: %s",
             user_id,

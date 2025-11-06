@@ -55,6 +55,10 @@ class UserProfile:
     last_more_message_id: Optional[int] = None
     last_more_message_type: Optional[str] = None
     last_more_message_payload: Optional[dict[str, Any]] = None
+    contact_generations_today: int = 0
+    contact_generations_started_at: Optional[datetime] = None
+    contact_prompt_second_sent: bool = False
+    contact_prompt_sixth_sent: bool = False
 
     def remaining(self, limit: int | None = None) -> int:
         """Return remaining tries respecting the current cycle state."""

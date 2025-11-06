@@ -6,15 +6,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, Optional, Sequence
 
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardRemove
 from PIL import Image
 
 from app.config import CollageConfig
 from app.fsm import ContactRequest, TryOnStates, setup_router
 from app.keyboards import (
+    REUSE_SAME_PHOTO_CALLBACK,
     contact_request_keyboard,
+    contact_share_reply_keyboard,
     limit_reached_keyboard,
     promo_keyboard,
+    reuse_same_photo_keyboard,
 )
 from app.models import GlassModel
 from app.services.collage import CollageProcessingError, CollageSourceUnavailable
@@ -40,6 +43,8 @@ class DummyBot:
         self.deleted: list[tuple[int, int]] = []
         self.downloads: list[tuple[Any, Path]] = []
         self.chat_actions: list[tuple[int, Any]] = []
+        self.edited_markups: list[tuple[int, int, Any]] = []
+        self.edited_texts: list[tuple[int, int, str, Optional[Any]]] = []
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
@@ -49,6 +54,25 @@ class DummyBot:
 
     async def send_chat_action(self, chat_id: int, action: Any) -> None:
         self.chat_actions.append((chat_id, action))
+
+    async def edit_message_reply_markup(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        reply_markup: Optional[Any] = None,
+    ) -> None:
+        self.edited_markups.append((chat_id, message_id, reply_markup))
+
+    async def edit_message_text(
+        self,
+        text: str,
+        *,
+        chat_id: int,
+        message_id: int,
+        reply_markup: Optional[Any] = None,
+    ) -> None:
+        self.edited_texts.append((chat_id, message_id, text, reply_markup))
 
 
 class DummyMessage:
@@ -64,7 +88,9 @@ class DummyMessage:
         self.reply_markup: Optional[Any] = None
         self._next_message_id = message_id + 1
 
-    async def answer(self, text: str, reply_markup: Optional[Any] = None) -> "DummySentMessage":
+    async def answer(
+        self, text: str, reply_markup: Optional[Any] = None, **_: Any
+    ) -> "DummySentMessage":
         sent = DummySentMessage(self.bot, self.chat.id, self._next_message_id, text, reply_markup)
         self._next_message_id += 1
         self.answers.append((text, reply_markup))
@@ -76,6 +102,7 @@ class DummyMessage:
         *,
         caption: Optional[str] = None,
         reply_markup: Optional[Any] = None,
+        **_: Any,
     ) -> "DummySentMessage":
         sent = DummySentMessage(
             self.bot,
@@ -148,6 +175,10 @@ class DummyState:
     async def get_state(self) -> Optional[Any]:
         return self.state
 
+    async def clear(self) -> None:
+        self.data.clear()
+        self.state = None
+
 
 class StubRepository:
     def __init__(self) -> None:
@@ -162,11 +193,16 @@ class StubRepository:
         self.contact_skip: dict[int, bool] = {}
         self.contact_never: dict[int, bool] = {}
         self.contacts: dict[int, Any] = {}
+        self.contact_generations_today: dict[int, int] = {}
+        self.contact_cycle_started_at: dict[int, datetime] = {}
+        self.contact_prompt_second: set[int] = set()
+        self.contact_prompt_sixth: set[int] = set()
         self.activity: list[int] = []
         self.locked_until: Optional[datetime] = None
         self.cycle_index: int = 0
         self.nudge_sent: bool = False
         self.more_buttons: dict[int, tuple[Optional[int], Optional[str], Optional[dict[str, Any]]]] = {}
+        self.saved_contacts: list[tuple[int, str]] = []
 
     async def ensure_user(self, user_id: int) -> Any:
         message_id, message_type, payload = self.more_buttons.get(
@@ -183,6 +219,10 @@ class StubRepository:
             gen_count=self.gen_counts.get(user_id, 0),
             contact_skip_once=self.contact_skip.get(user_id, False),
             contact_never=self.contact_never.get(user_id, False),
+            contact_generations_today=self.contact_generations_today.get(user_id, 0),
+            contact_generations_started_at=self.contact_cycle_started_at.get(user_id),
+            contact_prompt_second_sent=user_id in self.contact_prompt_second,
+            contact_prompt_sixth_sent=user_id in self.contact_prompt_sixth,
             last_more_message_id=message_id,
             last_more_message_type=message_type,
             last_more_message_payload=payload,
@@ -287,6 +327,40 @@ class StubRepository:
         if contact:
             contact.reward_granted = True
 
+    async def save_contact(self, user_id: int, phone_number: str) -> None:
+        self.saved_contacts.append((user_id, phone_number))
+
+    async def register_contact_generation(
+        self,
+        user_id: int,
+        *,
+        now: Optional[datetime] = None,
+        initial_trigger: int,
+        reminder_trigger: int,
+    ) -> tuple[int, Optional[str]]:
+        moment = now or datetime.now(tz=UTC)
+        started = self.contact_cycle_started_at.get(user_id)
+        if started is None or moment - started >= timedelta(hours=24):
+            self.contact_cycle_started_at[user_id] = moment
+            self.contact_generations_today[user_id] = 0
+            self.contact_prompt_second.discard(user_id)
+            self.contact_prompt_sixth.discard(user_id)
+            self.contact_skip[user_id] = False
+        count = self.contact_generations_today.get(user_id, 0) + 1
+        self.contact_generations_today[user_id] = count
+        trigger: Optional[str] = None
+        if count == initial_trigger and user_id not in self.contact_prompt_second:
+            trigger = "second"
+        elif count == reminder_trigger and user_id not in self.contact_prompt_sixth:
+            trigger = "sixth"
+        return count, trigger
+
+    async def mark_contact_prompt_sent(self, user_id: int, trigger: str) -> None:
+        if trigger == "second":
+            self.contact_prompt_second.add(user_id)
+        elif trigger == "sixth":
+            self.contact_prompt_sixth.add(user_id)
+
     async def set_referrer(self, user_id: int, ref_id: int) -> None:  # noqa: D401 - no-op
         return None
 
@@ -296,6 +370,9 @@ class StubRepository:
     async def list_due_reminders(self, now: Any) -> list[Any]:  # noqa: D401 - no reminders in tests
         return []
 
+    async def reset_user_session(self, user_id: int) -> None:  # noqa: D401 - no-op
+        return None
+
 
 class StubRecommendationService:
     def __init__(self, models: list[GlassModel]) -> None:
@@ -304,12 +381,23 @@ class StubRecommendationService:
         self.calls: list[tuple[int, str]] = []
 
     async def recommend_for_user(
-        self, user_id: int, gender: str
+        self,
+        user_id: int,
+        gender: str,
+        *,
+        exclude_ids: set[str] | None = None,
     ) -> RecommendationResult:
         self.calls.append((user_id, gender))
+        exclude = set(exclude_ids or set())
         if self.queue:
-            return self.queue.pop(0)
-        return RecommendationResult(models=list(self.default), exhausted=False)
+            result = self.queue.pop(0)
+        else:
+            result = RecommendationResult(models=list(self.default), exhausted=False)
+        filtered_models = [
+            model for model in result.models if model.unique_id not in exclude
+        ]
+        exhausted = result.exhausted or not filtered_models
+        return RecommendationResult(models=filtered_models, exhausted=exhausted)
 
 
 class StubTryOn:
@@ -639,12 +727,8 @@ def test_exhausted_message_flow(tmp_path: Path) -> None:
         await handler(message, state)
 
         fallback_text, markup = message.answers[-1]
-        assert fallback_text == msg.marketing_text("all_seen")
-        assert isinstance(markup, InlineKeyboardMarkup)
-        assert len(markup.inline_keyboard) == 1
-        assert len(markup.inline_keyboard[0]) == 2
-        assert markup.inline_keyboard[0][0].callback_data == "limit_remind"
-        assert markup.inline_keyboard[0][1].url == "https://example.com"
+        assert fallback_text == msg.CATALOG_TEMPORARILY_UNAVAILABLE
+        assert markup is None
 
     asyncio.run(scenario())
 
@@ -762,7 +846,18 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         gender="male",
     )
     async def scenario() -> None:
-        router, repository, tryon, _, _ = build_router(tmp_path, models=[model])
+        alt_model = GlassModel(
+            unique_id="m2",
+            title="Model 2",
+            model_code="M2",
+            site_url="https://example.com/2",
+            img_user_url="https://example.com/2.jpg",
+            img_nano_url="https://example.com/2-nano.jpg",
+            gender="male",
+        )
+        router, repository, tryon, _, recommender = build_router(
+            tmp_path, models=[model]
+        )
         handler_photo = get_message_handler(router, "accept_photo")
         handler_choose = get_callback_handler(router, "choose_model")
 
@@ -788,15 +883,25 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         assert repository.tries_used == 1
         assert state.state is TryOnStates.RESULT
         assert len(upload_message.answer_photos) == initial_photo_count + 1
-        assert upload_message.answer_photos[-1][1] == "".join(msg.FIRST_RESULT_CAPTION)
+        expected_first = "".join(msg.FIRST_RESULT_CAPTION).strip()
+        assert (
+            upload_message.answer_photos[-1][1]
+            == f"<b>{model.title}</b>\n\n{expected_first}"
+        )
         assert tryon.calls  # ensure generation was triggered
 
         callback_follow = DummyCallback("more|1", upload_message)
         handler_more = get_callback_handler(router, "result_more")
+        recommender.queue.append(
+            RecommendationResult(models=[alt_model], exhausted=False)
+        )
+        previous_photo_messages = len(upload_message.answer_photos)
         await handler_more(callback_follow, state)
-        assert state.state is TryOnStates.AWAITING_PHOTO
-        assert upload_message.answers[-1][0] == "".join(msg.PHOTO_INSTRUCTION)
-        assert_no_reply_keyboard(upload_message.answers[-1][1])
+        assert state.state is TryOnStates.SHOW_RECS
+        assert upload_message.answers[-1][0] == msg.SEARCHING_MODELS_PROMPT
+        assert len(upload_message.answer_photos) == previous_photo_messages + 1
+        followup_photo = upload_message.answer_photos[-1]
+        assert isinstance(followup_photo[2], InlineKeyboardMarkup)
         assert upload_message.edited_captions
         last_caption_edit = upload_message.edited_captions[-1]
         assert last_caption_edit[0] == model.title
@@ -805,13 +910,13 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
             button.text for button in last_caption_edit[1].inline_keyboard[0]
         ] == [msg.DETAILS_BUTTON_TEXT]
 
-        upload_message.photo = [PhotoStub("upload2")]  # type: ignore[attr-defined]
-        await handler_photo(upload_message, state)
-
-        callback_second = DummyCallback("pick:src=batch2:m1", upload_message)
+        callback_second = DummyCallback(
+            f"pick:src=batch2:{alt_model.unique_id}", upload_message
+        )
         await handler_choose(callback_second, state)
         second_result = upload_message.answer_photos[-1]
-        assert second_result[1] == model.title
+        expected_second = "".join(msg.SECOND_RESULT_CAPTION).strip()
+        assert second_result[1] == f"<b>{alt_model.title}</b>\n\n{expected_second}"
         assert isinstance(second_result[2], InlineKeyboardMarkup)
         assert [
             button.text for button in second_result[2].inline_keyboard[0]
@@ -978,6 +1083,7 @@ def test_idle_reminder_message_removed_when_user_requests_more(tmp_path: Path) -
         callback = DummyCallback("more|idle", message)
         await handler_more(callback, state)
 
+        assert state.state is TryOnStates.AWAITING_PHOTO
         assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
         assert (555, message.message_id) in bot.deleted
 
@@ -1007,7 +1113,18 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
     ]
 
     async def scenario() -> None:
-        router, repository, _, _, _ = build_router(tmp_path, models=models)
+        extra_model = GlassModel(
+            unique_id="m3",
+            title="Model 3",
+            model_code="M3",
+            site_url="https://example.com/3",
+            img_user_url="https://example.com/3.jpg",
+            img_nano_url="https://example.com/3-nano.jpg",
+            gender="male",
+        )
+        router, repository, _, _, recommender = build_router(
+            tmp_path, models=models
+        )
         handler_photo = get_message_handler(router, "accept_photo")
         handler_choose = get_callback_handler(router, "choose_model")
         handler_more = get_callback_handler(router, "result_more")
@@ -1026,21 +1143,24 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
         assert not any(msg.ASK_PHONE_TITLE in text for text, _ in message.answers)
 
         more_callback = DummyCallback("more|1", message)
+        recommender.queue.append(
+            RecommendationResult(models=[extra_model], exhausted=False)
+        )
+        previous_photos = list(message.answer_photos)
         await handler_more(more_callback, state)
-        assert state.state is TryOnStates.AWAITING_PHOTO
-        assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
-        assert_no_reply_keyboard(message.answers[-1][1])
+        assert state.state is TryOnStates.SHOW_RECS
+        assert message.answers[-1][0] == msg.SEARCHING_MODELS_PROMPT
+        assert len(message.answer_photos) == len(previous_photos) + 1
 
-        message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]
-        await handler_photo(message, state)
-        assert repository.gen_counts[777] == 1
-
-        second_callback = DummyCallback("pick:src=batch2:m1", message)
+        second_callback = DummyCallback(
+            f"pick:src=batch2:{extra_model.unique_id}", message
+        )
         await handler_choose(second_callback, state)
         assert repository.gen_counts[777] == 2
 
         second_result = message.answer_photos[-1]
-        assert second_result[1] == models[0].title
+        expected_second = "".join(msg.SECOND_RESULT_CAPTION).strip()
+        assert second_result[1] == f"<b>{extra_model.title}</b>\n\n{expected_second}"
         assert isinstance(second_result[2], InlineKeyboardMarkup)
         assert [
             button.text for button in second_result[2].inline_keyboard[0]
@@ -1080,7 +1200,18 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
     ]
 
     async def scenario() -> None:
-        router, repository, _, _, _ = build_router(tmp_path, models=models)
+        extra_model = GlassModel(
+            unique_id="m3",
+            title="Model 3",
+            model_code="M3",
+            site_url="https://example.com/3",
+            img_user_url="https://example.com/3.jpg",
+            img_nano_url="https://example.com/3-nano.jpg",
+            gender="male",
+        )
+        router, repository, _, _, recommender = build_router(
+            tmp_path, models=models
+        )
         handler_photo = get_message_handler(router, "accept_photo")
         handler_choose = get_callback_handler(router, "choose_model")
         handler_more = get_callback_handler(router, "result_more")
@@ -1094,12 +1225,15 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
 
         await handler_photo(message, state)
         await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
+        recommender.queue.append(
+            RecommendationResult(models=[extra_model], exhausted=False)
+        )
         await handler_more(DummyCallback("more|1", message), state)
-        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert state.state is TryOnStates.SHOW_RECS
 
-        message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]
-        await handler_photo(message, state)
-        await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
+        await handler_choose(
+            DummyCallback(f"pick:src=batch2:{extra_model.unique_id}", message), state
+        )
 
         assert state.state is ContactRequest.waiting_for_phone
         photos_before = list(message.answer_photos)
@@ -1109,19 +1243,140 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
 
         await contact_handler(contact_message, state)
 
-        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert state.state is TryOnStates.RESULT
+        assert repository.saved_contacts == [(888, "+79991234567")]
         assert list(message.answer_photos) == photos_before
-        assert contact_message.answers[0][0] == msg.ASK_PHONE_THANKS.format(
+        assert len(contact_message.answers) == 2
+        thanks_text, thanks_markup = contact_message.answers[0]
+        assert thanks_text == msg.ASK_PHONE_THANKS.format(
             rub=1000, promo="PROMO1000"
         )
-        assert_no_reply_keyboard(contact_message.answers[0][1])
-        assert contact_message.answers[1][0] == "".join(msg.THIRD_RESULT_CAPTION)
-        assert_no_reply_keyboard(contact_message.answers[1][1])
+        assert isinstance(thanks_markup, ReplyKeyboardRemove)
+        followup_text, followup_markup = contact_message.answers[1]
+        assert followup_text == "".join(msg.THIRD_RESULT_CAPTION)
+        assert isinstance(followup_markup, InlineKeyboardMarkup)
+        assert (
+            followup_markup.inline_keyboard
+            == reuse_same_photo_keyboard().inline_keyboard
+        )
+        state_data = await state.get_data()
+        assert state_data.get("suppress_more_button") is True
+        assert state_data.get("contact_prompt_message_id") is None
 
     asyncio.run(scenario())
 
 
-def test_contact_reminder_after_skip_happens_post_generation(tmp_path: Path) -> None:
+def test_contact_share_button_requests_contact_keyboard(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        handler = get_callback_handler(router, "contact_share_button")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=321, bot=bot)
+        state = DummyState()
+        await state.set_state(ContactRequest.waiting_for_phone.state)
+        await state.update_data(
+            contact_prompt_message_id=message.message_id,
+            last_aux_message_id=message.message_id,
+        )
+
+        callback = DummyCallback("contact_share", message)
+
+        await handler(callback, state)
+
+        assert bot.deleted == [(321, message.message_id)]
+        assert message.answers[-1][0] == msg.ASK_PHONE_SHARE_REQUEST
+        markup = message.answers[-1][1]
+        expected = contact_share_reply_keyboard()
+        assert type(markup) is type(expected)
+        assert markup.keyboard == expected.keyboard
+        assert markup.one_time_keyboard == expected.one_time_keyboard
+
+    asyncio.run(scenario())
+
+
+def test_reuse_same_photo_suppresses_more_button(tmp_path: Path) -> None:
+    model = GlassModel(
+        unique_id="m1",
+        title="Model 1",
+        model_code="M1",
+        site_url="https://example.com/1",
+        img_user_url="https://example.com/1.jpg",
+        img_nano_url="https://example.com/1-nano.jpg",
+        gender="male",
+    )
+    new_model = GlassModel(
+        unique_id="m2",
+        title="Model 2",
+        model_code="M2",
+        site_url="https://example.com/2",
+        img_user_url="https://example.com/2.jpg",
+        img_nano_url="https://example.com/2-nano.jpg",
+        gender="male",
+    )
+
+    async def scenario() -> None:
+        router, repository, tryon, _, recommender = build_router(
+            tmp_path, models=[model]
+        )
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+        reuse_handler = get_callback_handler(router, "reuse_same_photo")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=654, bot=bot)
+        message.photo = [PhotoStub("photo1")]  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        await handler_photo(message, state)
+        await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
+
+        assert repository.gen_counts[654] == 1
+        assert state.state is TryOnStates.RESULT
+
+        recommender.queue.append(
+            RecommendationResult(models=[new_model], exhausted=False)
+        )
+        await state.update_data(suppress_more_button=True)
+
+        previous_photos = list(message.answer_photos)
+
+        callback = DummyCallback(REUSE_SAME_PHOTO_CALLBACK, message)
+        await reuse_handler(callback, state)
+
+        assert state.state is TryOnStates.SHOW_RECS
+        assert message.answers[-1][0] == msg.SEARCHING_MODELS_PROMPT
+        assert len(message.answer_photos) == len(previous_photos) + 1
+        collage_photo = message.answer_photos[-1]
+        assert collage_photo[1] is None
+        assert isinstance(collage_photo[2], InlineKeyboardMarkup)
+        option_texts = [button.text for button in collage_photo[2].inline_keyboard[0]]
+        assert option_texts
+
+        await handler_choose(
+            DummyCallback(f"pick:src=batch2:{new_model.unique_id}", message), state
+        )
+
+        result_photo = message.answer_photos[-1]
+        expected_caption = "".join(msg.SECOND_RESULT_CAPTION).strip()
+        assert result_photo[1] == f"<b>{new_model.title}</b>\n\n{expected_caption}"
+        result_markup = result_photo[2]
+        assert isinstance(result_markup, InlineKeyboardMarkup)
+        assert len(result_markup.inline_keyboard) == 1
+        assert [button.text for button in result_markup.inline_keyboard[0]] == [
+            msg.DETAILS_BUTTON_TEXT
+        ]
+        assert repository.gen_counts[654] == 2
+        assert len(tryon.calls) >= 2
+        assert state.state == ContactRequest.waiting_for_phone.state
+        data_after = await state.get_data()
+        assert data_after.get("suppress_more_button") is True
+
+    asyncio.run(scenario())
+
+
+def test_contact_prompt_after_skip_returns_next_cycle(tmp_path: Path) -> None:
     models = [
         GlassModel(
             unique_id="m1",
@@ -1149,8 +1404,11 @@ def test_contact_reminder_after_skip_happens_post_generation(tmp_path: Path) -> 
         handler_choose = get_callback_handler(router, "choose_model")
 
         user_id = 889
-        repository.gen_counts[user_id] = 5
+        repository.gen_counts[user_id] = 2
         repository.contact_skip[user_id] = True
+        repository.contact_generations_today[user_id] = 2
+        repository.contact_cycle_started_at[user_id] = datetime.now(UTC)
+        repository.contact_prompt_second.add(user_id)
 
         bot = DummyBot()
         message = DummyMessage(user_id=user_id, bot=bot)
@@ -1158,15 +1416,32 @@ def test_contact_reminder_after_skip_happens_post_generation(tmp_path: Path) -> 
         state = DummyState()
         await state.update_data(gender="male", first_generated_today=False)
 
+        answers_before = len(message.answers)
         await handler_photo(message, state)
+        await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
 
-        assert state.state is TryOnStates.SHOW_RECS
-        assert not any(msg.ASK_PHONE_TITLE in text for text, _ in message.answers)
+        assert state.state is TryOnStates.RESULT
+        recent_answers = message.answers[answers_before:]
+        assert not any(msg.ASK_PHONE_TITLE in text for text, _ in recent_answers)
 
+        repository.contact_cycle_started_at[user_id] = datetime.now(UTC) - timedelta(
+            hours=25
+        )
+        message.photo = [PhotoStub("photo2")]  # type: ignore[attr-defined]
+        answers_before = len(message.answers)
+        await handler_photo(message, state)
+        await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
+
+        assert state.state is TryOnStates.RESULT
+        second_wave = message.answers[answers_before:]
+        assert not any(msg.ASK_PHONE_TITLE in text for text, _ in second_wave)
+
+        message.photo = [PhotoStub("photo3")]  # type: ignore[attr-defined]
+        await handler_photo(message, state)
         callback = DummyCallback("pick:src=batch2:m1", message)
         await handler_choose(callback, state)
 
-        assert repository.gen_counts[user_id] == 6
+        assert repository.gen_counts[user_id] >= 5
         assert len(message.answer_photos) >= 1
         assert state.state is ContactRequest.waiting_for_phone
         assert message.answers[-1][0].startswith(f"<b>{msg.ASK_PHONE_TITLE}")
@@ -1201,7 +1476,7 @@ def test_limit_result_sends_card_and_summary_message(tmp_path: Path) -> None:
         await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
 
         result_photo = message.answer_photos[-1]
-        assert result_photo[1] == model.title
+        assert result_photo[1] == f"<b>{model.title}</b>"
         assert isinstance(result_photo[2], InlineKeyboardMarkup)
         assert [
             button.text for button in result_photo[2].inline_keyboard[0]
@@ -1263,6 +1538,193 @@ def test_limit_promo_removes_limit_message(tmp_path: Path) -> None:
         assert (
             promo_message[1].inline_keyboard == expected_markup.inline_keyboard
         )
+
+    asyncio.run(scenario())
+
+
+def test_start_command_blocked_during_generation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "handle_start")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=555, bot=bot)
+        message.text = "/start"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.GENERATING.state)
+        await state.update_data(is_generating=True)
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.GENERATION_BUSY
+        assert state.state == TryOnStates.GENERATING.state
+
+    asyncio.run(scenario())
+
+
+def test_wear_sets_default_gender_when_missing(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "command_wear")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=777, bot=bot)
+        message.text = "/wear"  # type: ignore[attr-defined]
+        state = DummyState()
+
+        await handler(message, state)
+
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        data = await state.get_data()
+        assert data.get("gender") == "male"
+        assert repository.updated_filters == [(777, "male")]
+        assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
+
+    asyncio.run(scenario())
+
+
+def test_wear_rejected_during_contact_request(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "command_wear")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=778, bot=bot)
+        message.text = "/wear"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(ContactRequest.waiting_for_phone.state)
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.GENERATION_BUSY
+        assert state.state == ContactRequest.waiting_for_phone.state
+
+    asyncio.run(scenario())
+
+
+def test_wear_rejected_during_generation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "command_wear")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=779, bot=bot)
+        message.text = "/wear"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.GENERATING.state)
+        await state.update_data(is_generating=True)
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.WEAR_BUSY_MESSAGE
+        assert state.state == TryOnStates.GENERATING.state
+
+    asyncio.run(scenario())
+
+
+def test_help_allowed_during_generation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "command_help")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=888, bot=bot)
+        message.text = "/help"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.GENERATING.state)
+        await state.update_data(is_generating=True)
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.HELP_TEXT
+
+    asyncio.run(scenario())
+
+
+def test_privacy_command_ignores_non_photo_warning(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        privacy_handler = get_message_handler(router, "command_privacy")
+        fallback_handler = get_message_handler(router, "reject_non_photo")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=9990, bot=bot)
+        message.text = "/privacy"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.AWAITING_PHOTO.state)
+        await state.update_data(is_generating=True)
+
+        await privacy_handler(message, state)
+
+        text, markup = message.answers[-1]
+        assert text == msg.PRIVACY_POLICY_TEXT
+        assert isinstance(markup, InlineKeyboardMarkup)
+        button = markup.inline_keyboard[0][0]
+        assert button.text == msg.MAIN_MENU_POLICY_BUTTON
+        assert button.url == TEST_PRIVACY_POLICY_URL
+
+        second_message = DummyMessage(user_id=9991, bot=bot)
+        second_message.text = "/privacy"  # type: ignore[attr-defined]
+        second_state = DummyState()
+        await second_state.set_state(TryOnStates.AWAITING_PHOTO.state)
+
+        await fallback_handler(second_message, second_state)
+
+        assert second_message.answers == []
+
+    asyncio.run(scenario())
+
+
+def test_cancel_blocked_during_generation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "command_cancel")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=4321, bot=bot)
+        message.text = "/cancel"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.GENERATING.state)
+        await state.update_data(is_generating=True)
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.GENERATION_BUSY
+        assert state.state == TryOnStates.GENERATING.state
+
+    asyncio.run(scenario())
+
+
+def test_cancel_resets_session(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path)
+        handler = get_message_handler(router, "command_cancel")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=5432, bot=bot)
+        message.text = "/cancel"  # type: ignore[attr-defined]
+        state = DummyState()
+        await state.set_state(TryOnStates.RESULT.state)
+        await state.update_data(
+            upload="/tmp/upload.jpg",
+            upload_file_id="file123",
+            selected_model="model",
+            current_models=["model"],
+            is_generating=False,
+        )
+        repository.more_buttons[5432] = (321, "result", {"site_url": "https://example.com"})
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.CANCEL_CONFIRMATION
+        assert state.state is TryOnStates.START
+        data = await state.get_data()
+        assert data.get("upload") is None
+        assert data.get("upload_file_id") is None
+        assert data.get("selected_model") is None
+        assert data.get("current_models") == []
+        assert data.get("is_generating") is False
+        assert repository.more_buttons.get(5432) == (None, None, None)
 
     asyncio.run(scenario())
 

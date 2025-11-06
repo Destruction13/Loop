@@ -141,6 +141,60 @@ class Repository:
             await asyncio.to_thread(self._upsert_user, profile)
             return profile.gen_count
 
+    async def register_contact_generation(
+        self,
+        user_id: int,
+        *,
+        now: Optional[datetime] = None,
+        initial_trigger: int,
+        reminder_trigger: int,
+    ) -> tuple[int, Optional[str]]:
+        """Update per-day contact counters and return the active trigger."""
+
+        moment = now or datetime.now(timezone.utc)
+        lock = self._ensure_lock()
+        async with lock:
+            profile = await self.ensure_user(user_id)
+            started = profile.contact_generations_started_at
+            if not started or moment - started >= timedelta(hours=24):
+                profile.contact_generations_started_at = moment
+                profile.contact_generations_today = 0
+                profile.contact_prompt_second_sent = False
+                profile.contact_prompt_sixth_sent = False
+                profile.contact_skip_once = False
+            profile.contact_generations_today = max(
+                profile.contact_generations_today, 0
+            ) + 1
+            trigger: Optional[str] = None
+            if (
+                profile.contact_generations_today == initial_trigger
+                and not profile.contact_prompt_second_sent
+            ):
+                trigger = "second"
+            elif (
+                profile.contact_generations_today == reminder_trigger
+                and not profile.contact_prompt_sixth_sent
+            ):
+                trigger = "sixth"
+            await asyncio.to_thread(self._upsert_user, profile)
+            return profile.contact_generations_today, trigger
+
+    async def mark_contact_prompt_sent(
+        self, user_id: int, trigger: str
+    ) -> None:
+        """Persist the fact that the contact prompt was shown for a trigger."""
+
+        lock = self._ensure_lock()
+        async with lock:
+            profile = await self.ensure_user(user_id)
+            if trigger == "second":
+                profile.contact_prompt_second_sent = True
+            elif trigger == "sixth":
+                profile.contact_prompt_sixth_sent = True
+            else:
+                return
+            await asyncio.to_thread(self._upsert_user, profile)
+
     async def set_generation_count(self, user_id: int, value: int) -> None:
         lock = self._ensure_lock()
         async with lock:
@@ -170,6 +224,16 @@ class Repository:
 
     async def mark_contact_reward_granted(self, user_id: int) -> None:
         await asyncio.to_thread(self._mark_contact_reward_sync, user_id)
+
+    async def save_contact(
+        self,
+        user_id: int,
+        phone_number: str,
+        *,
+        saved_at: Optional[datetime] = None,
+    ) -> None:
+        moment = saved_at or datetime.now(timezone.utc)
+        await asyncio.to_thread(self._save_contact_sync, user_id, phone_number, moment)
 
     async def add_seen_models(
         self, user_id: int, model_ids: Iterable[str], *, context: str = "global"
@@ -201,6 +265,51 @@ class Repository:
         await asyncio.to_thread(
             self._record_seen_models_sync, user_id, ids, timestamp, context
         )
+
+    async def clear_seen_models(
+        self, user_id: int, *, context: str | None = None
+    ) -> None:
+        await asyncio.to_thread(self._clear_seen_models_sync, user_id, context)
+
+    async def reset_user_session(self, user_id: int) -> None:
+        lock = self._ensure_lock()
+        async with lock:
+            profile = await self.ensure_user(user_id)
+            if profile is None:
+                return
+            preserved_contact_never = profile.contact_never
+            new_profile = UserProfile(
+                user_id=user_id,
+                gender=None,
+                age_bucket=None,
+                style="normal",
+                daily_used=profile.daily_used,
+                tries_used=profile.tries_used,
+                daily_try_limit=profile.daily_try_limit,
+                cycle_started_at=profile.cycle_started_at,
+                cycle_index=profile.cycle_index,
+                locked_until=profile.locked_until,
+                nudge_sent_cycle=profile.nudge_sent_cycle,
+                last_reset_at=profile.last_reset_at,
+                seen_models=[],
+                remind_at=None,
+                referrer_id=profile.referrer_id,
+                gen_count=0,
+                contact_skip_once=False,
+                contact_never=preserved_contact_never,
+                last_activity_ts=profile.last_activity_ts,
+                idle_reminder_sent=profile.idle_reminder_sent,
+                social_ad_shown=profile.social_ad_shown,
+                last_more_message_id=None,
+                last_more_message_type=None,
+                last_more_message_payload=None,
+                contact_generations_today=0,
+                contact_generations_started_at=None,
+                contact_prompt_second_sent=False,
+                contact_prompt_sixth_sent=False,
+            )
+            await asyncio.to_thread(self._upsert_user, new_profile)
+            await asyncio.to_thread(self._clear_seen_models_sync, user_id, None)
 
     async def list_seen_models(self, user_id: int, *, context: str) -> set[str]:
         return await asyncio.to_thread(self._list_seen_models_sync, user_id, context)
@@ -271,7 +380,11 @@ class Repository:
                     social_ad_shown INTEGER NOT NULL DEFAULT 0,
                     last_more_message_id INTEGER,
                     last_more_message_type TEXT,
-                    last_more_message_payload TEXT
+                    last_more_message_payload TEXT,
+                    contact_generations_today INTEGER NOT NULL DEFAULT 0,
+                    contact_generations_started_at TEXT,
+                    contact_prompt_second_sent INTEGER NOT NULL DEFAULT 0,
+                    contact_prompt_sixth_sent INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -286,6 +399,16 @@ class Repository:
                 """
             )
             self._ensure_contact_table(conn)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS contact_shares (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    phone_number TEXT NOT NULL,
+                    saved_at TEXT NOT NULL
+                )
+                """
+            )
             conn.commit()
 
     def _row_to_profile(self, row: sqlite3.Row) -> UserProfile:
@@ -333,6 +456,13 @@ class Repository:
                 payload_dict = json.loads(payload_raw)
             except json.JSONDecodeError:
                 payload_dict = None
+        contact_gen_started_at = None
+        if _has("contact_generations_started_at") and row[
+            "contact_generations_started_at"
+        ]:
+            contact_gen_started_at = datetime.fromisoformat(
+                row["contact_generations_started_at"]
+            )
         return UserProfile(
             user_id=row["user_id"],
             gender=row["gender"],
@@ -362,6 +492,22 @@ class Repository:
                 row["last_more_message_type"] if _has("last_more_message_type") else None
             ),
             last_more_message_payload=payload_dict,
+            contact_generations_today=(
+                row["contact_generations_today"]
+                if _has("contact_generations_today") and row["contact_generations_today"]
+                else 0
+            ),
+            contact_generations_started_at=contact_gen_started_at,
+            contact_prompt_second_sent=bool(
+                row["contact_prompt_second_sent"] or 0
+            )
+            if _has("contact_prompt_second_sent")
+            else False,
+            contact_prompt_sixth_sent=bool(
+                row["contact_prompt_sixth_sent"] or 0
+            )
+            if _has("contact_prompt_sixth_sent")
+            else False,
         )
 
     def _get_user_sync(self, user_id: int) -> Optional[UserProfile]:
@@ -402,6 +548,9 @@ class Repository:
                 data["last_more_message_payload"] = json.dumps(payload_value)
             except TypeError:
                 data["last_more_message_payload"] = None
+        started_at = data.get("contact_generations_started_at")
+        if started_at and not isinstance(started_at, str):
+            data["contact_generations_started_at"] = started_at.isoformat()
         with self._connection() as conn:
             conn.execute(
                 """
@@ -429,7 +578,11 @@ class Repository:
                     social_ad_shown,
                     last_more_message_id,
                     last_more_message_type,
-                    last_more_message_payload
+                    last_more_message_payload,
+                    contact_generations_today,
+                    contact_generations_started_at,
+                    contact_prompt_second_sent,
+                    contact_prompt_sixth_sent
                 )
                 VALUES (
                     :user_id,
@@ -455,7 +608,11 @@ class Repository:
                     :social_ad_shown,
                     :last_more_message_id,
                     :last_more_message_type,
-                    :last_more_message_payload
+                    :last_more_message_payload,
+                    :contact_generations_today,
+                    :contact_generations_started_at,
+                    :contact_prompt_second_sent,
+                    :contact_prompt_sixth_sent
                 )
                 ON CONFLICT(user_id) DO UPDATE SET
                     gender=excluded.gender,
@@ -480,7 +637,11 @@ class Repository:
                     social_ad_shown=excluded.social_ad_shown,
                     last_more_message_id=excluded.last_more_message_id,
                     last_more_message_type=excluded.last_more_message_type,
-                    last_more_message_payload=excluded.last_more_message_payload
+                    last_more_message_payload=excluded.last_more_message_payload,
+                    contact_generations_today=excluded.contact_generations_today,
+                    contact_generations_started_at=excluded.contact_generations_started_at,
+                    contact_prompt_second_sent=excluded.contact_prompt_second_sent,
+                    contact_prompt_sixth_sent=excluded.contact_prompt_sixth_sent
                 """,
                 {
                     "user_id": data["user_id"],
@@ -517,6 +678,16 @@ class Repository:
                     "last_more_message_id": data["last_more_message_id"],
                     "last_more_message_type": data["last_more_message_type"],
                     "last_more_message_payload": data["last_more_message_payload"],
+                    "contact_generations_today": data["contact_generations_today"],
+                    "contact_generations_started_at": data[
+                        "contact_generations_started_at"
+                    ],
+                    "contact_prompt_second_sent": 1
+                    if data["contact_prompt_second_sent"]
+                    else 0,
+                    "contact_prompt_sixth_sent": 1
+                    if data["contact_prompt_sixth_sent"]
+                    else 0,
                 },
             )
             conn.commit()
@@ -609,6 +780,22 @@ class Repository:
             )
             conn.commit()
 
+    def _clear_seen_models_sync(
+        self, user_id: int, context: str | None
+    ) -> None:
+        with self._connection() as conn:
+            if context is None:
+                conn.execute(
+                    "DELETE FROM user_seen_models WHERE user_id = ?",
+                    (user_id,),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM user_seen_models WHERE user_id = ? AND context = ?",
+                    (user_id, context),
+                )
+            conn.commit()
+
     def _list_seen_models_sync(self, user_id: int, context: str) -> set[str]:
         with self._connection() as conn:
             cur = conn.execute(
@@ -677,6 +864,19 @@ class Repository:
             conn.execute(
                 "UPDATE user_contacts SET reward_granted = 1 WHERE tg_user_id = ?",
                 (user_id,),
+            )
+            conn.commit()
+
+    def _save_contact_sync(
+        self, user_id: int, phone_number: str, when: datetime
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO contact_shares (user_id, phone_number, saved_at)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, phone_number, when.isoformat()),
             )
             conn.commit()
 
@@ -799,6 +999,22 @@ class Repository:
         if "nudge_sent_cycle" not in columns:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN nudge_sent_cycle INTEGER NOT NULL DEFAULT 0"
+            )
+        if "contact_generations_today" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN contact_generations_today INTEGER NOT NULL DEFAULT 0"
+            )
+        if "contact_generations_started_at" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN contact_generations_started_at TEXT"
+            )
+        if "contact_prompt_second_sent" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN contact_prompt_second_sent INTEGER NOT NULL DEFAULT 0"
+            )
+        if "contact_prompt_sixth_sent" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN contact_prompt_sixth_sent INTEGER NOT NULL DEFAULT 0"
             )
 
     def _ensure_contact_table(self, conn: sqlite3.Connection) -> None:
