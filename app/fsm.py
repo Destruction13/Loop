@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from email import message
 import io
 import json
 import time
@@ -228,10 +229,13 @@ def setup_router(
         }
         await state.update_data(last_card_message=entry)
 
+    from app.keyboards import generation_result_keyboard  # добавь вверху, если ещё не импортировано
+
     async def _trim_last_card_message(
         message: Message | None,
         state: FSMContext,
         *,
+        site_url: str,  # <---- вот так пробрасываем
         title: str | None = None,
     ) -> None:
         if not message:
@@ -260,30 +264,26 @@ def setup_router(
         if mode == "text":
             return
         bot = message.bot
-        if message and int(message.message_id) != int(message_id):
-            return
+        
+
+        # Клавиатура только с кнопкой «Подробнее»
+        current_markup = generation_result_keyboard(site_url, remaining=0)
+
         try:
             if mode == "text":
                 await bot.edit_message_text(
-                    final_title,
+                    f"<b>{final_title}</b>",
                     chat_id=chat_id,
                     message_id=int(message_id),
+                    reply_markup=current_markup, parse_mode=ParseMode.HTML
                 )
             else:
-                edit_caption = getattr(bot, "edit_message_caption", None)
-                if callable(edit_caption):
-                    await edit_caption(
-                        chat_id=chat_id,
-                        message_id=int(message_id),
-                        caption=final_title,
-                    )
-                else:
-                    await bot.edit_message_text(
-                        final_title,
-                        chat_id=chat_id,
-                        message_id=int(message_id),
-                    )
-
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=int(message_id),
+                    caption=f"<b>{final_title}</b>",
+                    reply_markup=current_markup, parse_mode=ParseMode.HTML
+                )
         except (TelegramBadRequest, TelegramForbiddenError, AttributeError) as exc:
             logger.debug(
                 "Failed to trim card message %s: %s",
@@ -305,6 +305,7 @@ def setup_router(
             )
             await state.update_data(last_card_message=entry)
 
+
     async def _trim_message_card(
         message: Message | None,
         state: FSMContext,
@@ -317,10 +318,10 @@ def setup_router(
         if mode == "text":
             return
         try:
-            if mode == "text":            # ← это условие ТЕПЕРЬ НЕ ДОСТИГАЕТСЯ
-                await message.edit_text(title)
+            if mode == "text":
+                await message.edit_text(f"<b>{title}</b>", reply_markup=message.reply_markup, parse_mode=ParseMode.HTML)
             else:
-                await message.edit_caption(caption=title)
+                await message.edit_caption(caption=f"<b>{title}</b>", reply_markup=message.reply_markup, parse_mode=ParseMode.HTML)
         except TelegramBadRequest as exc:
             logger.debug(
                 "Failed to trim inline card %s: %s",
@@ -880,7 +881,7 @@ def setup_router(
         pending_state = data.get("contact_pending_result_state")
         if not pending_state and current_state == TryOnStates.RESULT.state:
             pending_state = "result"
-        await _trim_last_card_message(message, state)
+        await _trim_last_card_message(message, state, site_url=site_url)
         prompt_text = (
             f"<b>{msg.ASK_PHONE_TITLE}</b>\n\n"
             f"{msg.ASK_PHONE_BODY.format(rub=contact_reward_rub)}"
@@ -944,7 +945,7 @@ def setup_router(
         skip_contact_prompt: bool = False,
         exclude_ids: set[str] | None = None,
     ) -> bool:
-        await _trim_last_card_message(message, state)
+        await _trim_last_card_message(message, state, site_url=site_url)
         if not skip_contact_prompt:
             if await _maybe_request_contact(message, state, user_id):
                 return False
@@ -1074,7 +1075,7 @@ def setup_router(
         await _dismiss_reply_keyboard(message)
         await repository.set_contact_skip_once(user_id, True)
         await _reset_phone_attempts(message, state)
-        await state.update_data(contact_request_cooldown=4, contact_prompt_due=None)
+        await state.update_data(contact_request_cooldown=4, contact_prompt_due=None, allow_more_button_next=True)
         await _resume_after_contact(message, state, send_generation=False)
         current_state = await state.get_state()
         if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
@@ -1839,7 +1840,7 @@ def setup_router(
         await _reset_phone_attempts(callback.message, state)
         await repository.set_contact_never(user_id, True)
         await repository.set_contact_skip_once(user_id, False)
-        await state.update_data(contact_request_cooldown=0, contact_prompt_due=None)
+        await state.update_data(contact_request_cooldown=0, contact_prompt_due=None, allow_more_button_next=True)
         await _resume_after_contact(callback.message, state, send_generation=False)
         current_state = await state.get_state()
         if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
@@ -2265,13 +2266,18 @@ def setup_router(
             stored_results = dict(data.get("result_messages", {}))
             entry = stored_results.get(str(message.message_id))
             if entry:
+               # сохраняем «Подробнее»: даём в edit_caption ту же клавиатуру, но без «ещё»
+                target_markup = updated_markup if updated_markup is not None else current_markup
                 try:
-                    await message.edit_caption(caption=entry.get("model_title", ""))
+                    await message.edit_caption(
+                        caption=f"<b>{entry.get('model_title', '')}</b>",
+                        reply_markup=target_markup, parse_mode=ParseMode.HTML
+                    )
                 except TelegramBadRequest as exc:
                     logger.debug(
-                        "more->edit_caption failed for %s: %s",
-                        message.message_id, exc
-                    )
+                       "more->edit_caption failed for %s: %s",
+                       message.message_id, exc
+                   )
                 else:
                     entry["has_more"] = False
                     stored_results[str(message.message_id)] = entry
@@ -2410,7 +2416,6 @@ def setup_router(
             "selected_model": None,
             "current_models": [],
             "last_batch": [],
-            "suppress_more_button": True,
         }
         if active_file_id:
             reuse_updates["upload_file_id"] = active_file_id
@@ -2549,7 +2554,7 @@ def setup_router(
             reuse_offer_active=False,
             allow_more_button_next=False,
         )
-        await _trim_last_card_message(message, state)
+        await _trim_last_card_message(message, state, site_url=site_url)
         async def _deliver_instruction() -> None:
             if await _edit_last_aux_message(message, state, msg.PHOTO_INSTRUCTION):
                 return
