@@ -1450,6 +1450,8 @@ def setup_router(
             await _delete_phone_invalid_message(message, state, data=previous_data)
         await _delete_last_aux_message(message, state)
         await _clear_reuse_offer(state, message.bot, message.chat.id)
+        # Ensure legacy reply keyboards are hidden for returning users
+        await _dismiss_reply_keyboard(message)
         profile_before = await repository.ensure_user(user_id)
         ignored_phone = profile_before.contact_skip_once or contact_was_active
         await state.clear()
