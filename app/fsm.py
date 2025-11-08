@@ -587,6 +587,18 @@ def setup_router(
         finally:
             await state.update_data(last_aux_message_id=None)
 
+    async def _delete_busy_messages(state: FSMContext, bot: Bot, chat_id: int) -> None:
+        data = await state.get_data()
+        ids = list(data.get("busy_message_ids") or [])
+        if not ids:
+            return
+        for mid in ids:
+            try:
+                await bot.delete_message(chat_id, int(mid))
+            except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                logger.debug("Failed to delete busy message %s: %s", mid, exc)
+        await state.update_data(busy_message_ids=[])
+
     async def _edit_last_aux_message(
         message: Message,
         state: FSMContext,
@@ -1325,6 +1337,7 @@ def setup_router(
                 reply_markup=keyboard,
             )
             await state.update_data(models_message_id=sent.message_id)
+            await _delete_busy_messages(state, message.bot, message.chat.id)
 
         except Exception as exc:  # noqa: BLE001
             logger.exception(
@@ -1377,6 +1390,7 @@ def setup_router(
         # ← [ДОБАВЬ БЛОК НИЖЕ] — после цикла записываем id последнего сообщения с кнопками
         if last_sent:
             await state.update_data(models_message_id=last_sent.message_id)
+        await _delete_busy_messages(state, message.bot, message.chat.id)
 
 
     async def _delete_state_message(message: Message, state: FSMContext, key: str) -> None:
@@ -1579,12 +1593,7 @@ def setup_router(
                 msg.START_WELCOME,
                 reply_markup=start_keyboard(),
             )
-        await _send_delivery_message(
-            message,
-            state,
-            message.answer,
-            msg.MAIN_MENU_HINT,
-        )
+        
         info_domain(
             "bot.handlers",
             "👤 Пользователь открыл старт",
@@ -2132,6 +2141,7 @@ def setup_router(
             caption=caption_text,
             reply_markup=result_markup,
         )
+        await _delete_busy_messages(state, message.bot, message.chat.id)
         # === SAVE last_card_message for future trimming (/wear etc.) ===
         try:
             chat_id = result_message.chat.id
@@ -2499,7 +2509,11 @@ def setup_router(
     async def command_wear(message: Message, state: FSMContext) -> None:
         current_state = await state.get_state()
         if current_state == ContactRequest.waiting_for_phone.state:
-            await message.answer(msg.WEAR_BUSY_MESSAGE)
+            sent = await message.answer(msg.WEAR_BUSY_MESSAGE)
+            data = await state.get_data()
+            ids = list(data.get("busy_message_ids", []))
+            ids.append(sent.message_id)
+            await state.update_data(busy_message_ids=ids)
             return
         if await _reject_if_busy(
             message,
