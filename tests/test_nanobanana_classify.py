@@ -1,5 +1,9 @@
 """Tests for NanoBanana failure classification logic."""
 
+import asyncio
+
+from app.config import NanoBananaKeySlot
+from app.services import nanobanana
 from app.services.nanobanana import SafetySummary, classify_failure
 
 
@@ -145,3 +149,32 @@ def test_classify_failure_marks_transient_for_low_safety() -> None:
     assert summary.triggered is False
     assert summary.categories == ("image_violence",)
     assert summary.levels == {"image_violence": "LOW"}
+
+
+def test_nanobanana_round_robin_cycle() -> None:
+    slots = (
+        NanoBananaKeySlot(name="K_1", api_key="key-one"),
+        NanoBananaKeySlot(name="K_2", api_key="key-two"),
+        NanoBananaKeySlot(name="K_3", api_key="key-three"),
+    )
+    provider = nanobanana._RoundRobinKeyProvider()  # type: ignore[attr-defined]
+    provider.configure(slots)
+
+    async def collect(count: int) -> list[tuple[str, int]]:
+        sequence: list[tuple[str, int]] = []
+        for _ in range(count):
+            slot, index = await provider.next_slot()
+            sequence.append((slot.name, index))
+        return sequence
+
+    order = asyncio.run(collect(7))
+
+    assert order == [
+        ("K_1", 0),
+        ("K_2", 1),
+        ("K_3", 2),
+        ("K_1", 0),
+        ("K_2", 1),
+        ("K_3", 2),
+        ("K_1", 0),
+    ]
