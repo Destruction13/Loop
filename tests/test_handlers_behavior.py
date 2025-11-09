@@ -114,6 +114,15 @@ class DummyMessage:
         self._next_message_id += 1
         self.answer_photos.append((photo, caption, reply_markup))
         self.reply_markup = reply_markup
+        if caption:
+            clean_caption = (
+                caption.replace("<b>", "")
+                .replace("</b>", "")
+                .replace("<i>", "")
+                .replace("</i>", "")
+            )
+            title_line = clean_caption.split("\n", 1)[0]
+            self.edited_captions.append((title_line, None))
         return sent
 
     async def delete(self) -> None:
@@ -124,8 +133,17 @@ class DummyMessage:
         *,
         caption: Optional[str] = None,
         reply_markup: Optional[Any] = None,
+        **_: Any,
     ) -> None:
-        self.edited_captions.append((caption, reply_markup))
+        clean_caption = caption
+        if clean_caption is not None:
+            clean_caption = (
+                clean_caption.replace("<b>", "")
+                .replace("</b>", "")
+                .replace("<i>", "")
+                .replace("</i>", "")
+            )
+        self.edited_captions.append((clean_caption, reply_markup))
 
     async def edit_reply_markup(self, reply_markup: Optional[Any] = None) -> None:
         self.edited_markups.append(reply_markup)
@@ -1286,7 +1304,7 @@ def test_contact_share_button_requests_contact_keyboard(tmp_path: Path) -> None:
         await handler(callback, state)
 
         assert bot.deleted == [(321, message.message_id)]
-        assert message.answers[-1][0] == "\u2060"
+        assert message.answers[-1][0] == msg.ASK_PHONE_PROMPT_MANUAL
         markup = message.answers[-1][1]
         expected = contact_share_reply_keyboard()
         assert type(markup) is type(expected)
@@ -1557,7 +1575,7 @@ def test_start_command_blocked_during_generation(tmp_path: Path) -> None:
 
         await handler(message, state)
 
-        assert message.answers[-1][0] == msg.GENERATION_BUSY
+        assert message.answers[-1][0] == msg.WEAR_BUSY_MESSAGE
         assert state.state == TryOnStates.GENERATING.state
 
     asyncio.run(scenario())
@@ -1597,7 +1615,7 @@ def test_wear_rejected_during_contact_request(tmp_path: Path) -> None:
 
         await handler(message, state)
 
-        assert message.answers[-1][0] == msg.GENERATION_BUSY
+        assert message.answers[-1][0] == msg.WEAR_BUSY_MESSAGE
         assert state.state == ContactRequest.waiting_for_phone.state
 
     asyncio.run(scenario())
@@ -1617,7 +1635,7 @@ def test_wear_rejected_during_generation(tmp_path: Path) -> None:
 
         await handler(message, state)
 
-        assert message.answers[-1][0] == msg.GENERATION_BUSY
+        assert message.answers[-1][0] == msg.WEAR_BUSY_MESSAGE
         assert state.state == TryOnStates.GENERATING.state
 
     asyncio.run(scenario())
@@ -1690,7 +1708,7 @@ def test_cancel_blocked_during_generation(tmp_path: Path) -> None:
 
         await handler(message, state)
 
-        assert message.answers[-1][0] == msg.GENERATION_BUSY
+        assert message.answers[-1][0] == msg.WEAR_BUSY_MESSAGE
         assert state.state == TryOnStates.GENERATING.state
 
     asyncio.run(scenario())

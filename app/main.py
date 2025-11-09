@@ -115,7 +115,7 @@ async def main() -> None:
 
     asyncio.create_task(_cleanup_tmp())
 
-    nanobanana.configure(config.nanobanana_api_key)
+    nanobanana.configure(config.nanobanana_key_slots)
 
     bot = Bot(token=config.bot_token, parse_mode=ParseMode.HTML)
     await bot.set_my_commands(

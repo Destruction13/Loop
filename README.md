@@ -117,7 +117,7 @@ journalctl -u loov -f -n 200
 | `BOT_TOKEN` | Токен бота от @BotFather | `1234567890:ABCDEF...` |
 | `SHEET_CSV_URL` или `GOOGLE_SHEET_URL` | Источник каталога: CSV-публикация или URL Google Sheets | `https://docs.google.com/.../pub?output=csv` |
 | `SOCIAL_LINKS_JSON` | JSON с ссылками на соцсети (`[{"title":"VK","url":"https://vk.com/..."}]`) | `[{"title":"VK","url":"https://vk.com/loov"}]` |
-| `NANOBANANA_API_KEY` | Ключ NanoBanana для генерации примерок | `nb_live_xxx` |
+| `K_1…K_N` | Набор ключей NanoBanana (циклическое использование) | `nb_live_xxx` |
 | `PROMO_CODE` | Промокод, который получит пользователь | `LOOV2024` |
 | `DAILY_TRY_LIMIT` | Дневной лимит попыток для одного пользователя | `50` |
 | `CATALOG_ROW_LIMIT` | Максимум строк каталога (0 = без лимита) | `0` |
@@ -132,7 +132,8 @@ journalctl -u loov -f -n 200
 BOT_TOKEN=""
 SHEET_CSV_URL=""
 SOCIAL_LINKS_JSON="[{\"title\":\"VK\",\"url\":\"https://vk.com/loov\"}]"
-NANOBANANA_API_KEY=""
+K_1=""
+K_2=""
 PROMO_CODE=""
 DAILY_TRY_LIMIT=50
 CATALOG_ROW_LIMIT=0

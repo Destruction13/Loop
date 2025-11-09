@@ -85,6 +85,14 @@ class SocialLink:
     url: str
 
 
+@dataclass(frozen=True, slots=True)
+class NanoBananaKeySlot:
+    """Configured NanoBanana API key slot."""
+
+    name: str
+    api_key: str
+
+
 @dataclass(slots=True)
 class Config:
     """Top-level application configuration."""
@@ -105,7 +113,7 @@ class Config:
     uploads_root: Path
     results_root: Path
     button_title_max: int
-    nanobanana_api_key: str
+    nanobanana_key_slots: tuple[NanoBananaKeySlot, ...]
     collage: CollageConfig
     batch_size: int
     batch_layout_cols: int
@@ -203,6 +211,32 @@ def _parse_social_links(raw: Optional[str]) -> list[SocialLink]:
     return result
 
 
+_KEY_SLOT_PATTERN = re.compile(r"^K_(\d+)$")
+
+
+def _load_nanobanana_key_slots() -> tuple[NanoBananaKeySlot, ...]:
+    """Return configured NanoBanana key slots sorted by their numeric suffix."""
+
+    slots: list[tuple[int, NanoBananaKeySlot]] = []
+    for name, value in os.environ.items():
+        match = _KEY_SLOT_PATTERN.fullmatch(name)
+        if not match:
+            continue
+        sanitized = (value or "").strip()
+        if not sanitized:
+            continue
+        index = int(match.group(1))
+        slots.append((index, NanoBananaKeySlot(name=name, api_key=sanitized)))
+
+    slots.sort(key=lambda item: item[0])
+    ordered_slots = tuple(slot for _, slot in slots)
+    if not ordered_slots:
+        raise RuntimeError(
+            "At least one NanoBanana API key (K_1…K_N) must be provided via environment variables"
+        )
+    return ordered_slots
+
+
 def load_config(env_file: str | None = None) -> Config:
     """Load configuration from the provided .env file (or default location)."""
 
@@ -224,7 +258,7 @@ def load_config(env_file: str | None = None) -> Config:
     landing_url = landing_url_raw
     social_links_json = _optional_env("SOCIAL_LINKS_JSON", "[]") or "[]"
     social_links = _parse_social_links(social_links_json)
-    nanobanana_api_key = _require_env("NANOBANANA_API_KEY")
+    nanobanana_key_slots = _load_nanobanana_key_slots()
     promo_code = _optional_env("PROMO_CODE", "") or ""
     daily_try_limit = _parse_int_env("DAILY_TRY_LIMIT", 7, minimum=1)
     catalog_row_raw = _parse_int_env("CATALOG_ROW_LIMIT", 0, minimum=0)
@@ -272,7 +306,7 @@ def load_config(env_file: str | None = None) -> Config:
         uploads_root=Path("./uploads"),
         results_root=Path("./results"),
         button_title_max=28,
-        nanobanana_api_key=nanobanana_api_key,
+        nanobanana_key_slots=nanobanana_key_slots,
         collage=CollageConfig(
             slot_width=1080,
             slot_height=1440,

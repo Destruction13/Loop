@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app.config import SocialLink, load_config
+from app.config import NanoBananaKeySlot, SocialLink, load_config
 
 
 def test_load_config_reads_allowed_env(tmp_path, monkeypatch) -> None:
@@ -17,7 +17,10 @@ def test_load_config_reads_allowed_env(tmp_path, monkeypatch) -> None:
                 "CATALOG_ROW_LIMIT=15",
                 "PICK_SCHEME=GENDER_AND_GENDER_ONLY",
                 'SOCIAL_LINKS_JSON=[{"title":"One","url":"https://example.com/one"}]',
-                "NANOBANANA_API_KEY=super-secret",
+                "K_1=super-secret",
+                "K_2= second-secret  ",
+                "K_4=   ",
+                "K_3=third-secret",
                 "GOOGLE_SERVICE_ACCOUNT_JSON=custom_creds.json",
             ]
         ),
@@ -35,6 +38,10 @@ def test_load_config_reads_allowed_env(tmp_path, monkeypatch) -> None:
         "PICK_SCHEME",
         "GOOGLE_SHEET_URL",
         "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "K_1",
+        "K_2",
+        "K_3",
+        "K_4",
     ):
         monkeypatch.delenv(name, raising=False)
     config = load_config(str(env_file))
@@ -68,7 +75,11 @@ def test_load_config_reads_allowed_env(tmp_path, monkeypatch) -> None:
     assert config.collage.slot_width == 1080
     assert config.collage.output_format == "PNG"
     assert config.contact_reward_rub == 1000
-    assert config.nanobanana_api_key == "super-secret"
+    assert config.nanobanana_key_slots == (
+        NanoBananaKeySlot(name="K_1", api_key="super-secret"),
+        NanoBananaKeySlot(name="K_2", api_key="second-secret"),
+        NanoBananaKeySlot(name="K_3", api_key="third-secret"),
+    )
     assert config.enable_leads_export is True
     assert config.enable_social_ad is True
 
@@ -79,7 +90,7 @@ def test_load_config_defaults_without_optional_env(tmp_path, monkeypatch) -> Non
         "\n".join(
             [
                 "BOT_TOKEN=minimal",
-                "NANOBANANA_API_KEY=hidden",
+                "K_1=hidden",
                 "GOOGLE_SHEET_URL=https://docs.google.com/spreadsheets/d/EXAMPLE/edit?gid=0",
             ]
         ),
@@ -97,7 +108,10 @@ def test_load_config_defaults_without_optional_env(tmp_path, monkeypatch) -> Non
         "PICK_SCHEME",
         "GOOGLE_SHEET_URL",
         "GOOGLE_SERVICE_ACCOUNT_JSON",
-        "NANOBANANA_API_KEY",
+        "K_1",
+        "K_2",
+        "K_3",
+        "K_4",
     ):
         monkeypatch.delenv(name, raising=False)
     config = load_config(str(env_file))
@@ -120,4 +134,6 @@ def test_load_config_defaults_without_optional_env(tmp_path, monkeypatch) -> Non
         config.contacts_sheet_url
         == "https://docs.google.com/spreadsheets/d/EXAMPLE/edit?gid=0"
     )
-    assert config.nanobanana_api_key == "hidden"
+    assert config.nanobanana_key_slots == (
+        NanoBananaKeySlot(name="K_1", api_key="hidden"),
+    )

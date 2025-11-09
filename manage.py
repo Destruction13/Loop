@@ -79,7 +79,6 @@ def _command_check() -> int:
         "SHEET_CSV_URL": "Ссылка на CSV каталога",
         "LANDING_URL": "Ссылка на лендинг",
         "SOCIAL_LINKS_JSON": "JSON соцсетей",
-        "NANOBANANA_API_KEY": "Ключ NanoBanana",
         "PROMO_CODE": "Промокод",
         "DAILY_TRY_LIMIT": "Лимит примерок",
         "CATALOG_ROW_LIMIT": "Лимит строк каталога",
@@ -133,13 +132,53 @@ def _command_check() -> int:
             else:
                 env_values[name] = str(limit)
                 message = f"Лимит строк: {limit}" if limit else "Лимит строк: без ограничения"
-        elif name in {"PROMO_CODE", "PICK_SCHEME", "NANOBANANA_API_KEY"}:
+        elif name in {"PROMO_CODE", "PICK_SCHEME"}:
             env_values[name] = value
         elif name == "GOOGLE_SERVICE_ACCOUNT_JSON":
             env_values[name] = value
         else:
             env_values[name] = value
         add_result(name, status, message)
+
+    key_pattern = re.compile(r"^K_(\d+)$")
+    key_names = sorted(
+        (name for name in os.environ if key_pattern.fullmatch(name)),
+        key=lambda key: int(key_pattern.fullmatch(key).group(1)),
+    )
+    configured_keys: list[str] = []
+    empty_keys: list[str] = []
+    for key_name in key_names:
+        raw = os.getenv(key_name, "")
+        if raw and raw.strip():
+            configured_keys.append(key_name)
+        else:
+            empty_keys.append(key_name)
+
+    if configured_keys:
+        add_result(
+            "NanoBanana keys",
+            "ok",
+            f"Найдено {len(configured_keys)} ключей: {', '.join(configured_keys)}",
+        )
+    elif key_names:
+        add_result(
+            "NanoBanana keys",
+            "fail",
+            "Переменные K_1…K_N заданы, но значения пустые",
+        )
+    else:
+        add_result(
+            "NanoBanana keys",
+            "fail",
+            "Не найдено ни одной переменной K_i с ключом NanoBanana",
+        )
+
+    for empty_name in empty_keys:
+        add_result(
+            empty_name,
+            "warn",
+            "Переменная присутствует, но без значения — слот будет пропущен",
+        )
 
     # SOCIAL_LINKS_JSON parsing
     social_raw = env_values.get("SOCIAL_LINKS_JSON")

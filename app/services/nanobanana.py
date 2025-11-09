@@ -7,10 +7,11 @@ import base64
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import aiohttp
 
+from app.config import NanoBananaKeySlot
 from logger import get_logger
 
 
@@ -36,8 +37,40 @@ UNSUITABLE_CODE = "UNSUITABLE_PHOTO"
 TRANSIENT_CODE = "TRANSIENT"
 PARSER_MISS_CODE = "PARSER_MISS"
 
-_API_KEY: str | None = None
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=60)
+
+
+class _RoundRobinKeyProvider:
+    """Simple async-safe round-robin iterator over NanoBanana key slots."""
+
+    def __init__(self) -> None:
+        self._slots: tuple[NanoBananaKeySlot, ...] = ()
+        self._index = 0
+        self._lock = asyncio.Lock()
+
+    def configure(self, slots: Sequence[NanoBananaKeySlot]) -> None:
+        ordered = tuple(slots)
+        if not ordered:
+            raise RuntimeError("NanoBanana API keys are not configured")
+        self._slots = ordered
+        self._index = 0
+        self._lock = asyncio.Lock()
+
+    async def next_slot(self) -> tuple[NanoBananaKeySlot, int]:
+        if not self._slots:
+            raise RuntimeError("NanoBanana API keys are not configured")
+        async with self._lock:
+            slot = self._slots[self._index]
+            index = self._index
+            self._index = (self._index + 1) % len(self._slots)
+        return slot, index
+
+    @property
+    def slot_count(self) -> int:
+        return len(self._slots)
+
+
+_KEY_PROVIDER = _RoundRobinKeyProvider()
 @dataclass(slots=True)
 class GenerationSuccess:
     """Successful generation payload with metadata."""
@@ -117,22 +150,39 @@ class NanoBananaGenerationError(RuntimeError):
         self.safety_categories = tuple(safety_categories or ())
         self.safety_levels = dict(safety_levels or {})
 
-def configure(api_key: str) -> None:
-    """Configure the API key used for subsequent requests."""
+def configure(slots: Sequence[NanoBananaKeySlot]) -> None:
+    """Configure the key provider used for subsequent requests."""
 
-    global _API_KEY
-    sanitized = (api_key or "").strip()
-    if not sanitized:
-        raise RuntimeError("NANOBANANA_API_KEY is not configured")
-    _API_KEY = sanitized
-    LOGGER.info("API NanoBanana сконфигурирован", extra={"stage": "NANO_CONFIG"})
+    _KEY_PROVIDER.configure(slots)
+    LOGGER.info(
+        "API NanoBanana сконфигурирован (%d ключей)",
+        _KEY_PROVIDER.slot_count,
+        extra={
+            "stage": "NANO_CONFIG",
+            "slot_count": _KEY_PROVIDER.slot_count,
+            "slots": [slot.name for slot in slots],
+        },
+    )
 
 
 async def generate_glasses(face_path: str, glasses_path: str) -> GenerationSuccess:
     """Return generated data with metadata from Gemini; raise on failure."""
 
-    if not _API_KEY:
-        raise RuntimeError("NanoBanana API key is not set")
+    try:
+        slot, slot_index = await _KEY_PROVIDER.next_slot()
+    except RuntimeError as exc:
+        raise RuntimeError("NanoBanana API key is not set") from exc
+
+    LOGGER.debug(
+        "INFO using NanoBanana key slot=%s slot_index=%d",
+        slot.name,
+        slot_index,
+        extra={
+            "stage": "NANO_KEY_SELECT",
+            "slot": slot.name,
+            "slot_index": slot_index,
+        },
+    )
     face_payload = _encode_image(Path(face_path))
     glasses_payload = _encode_image(Path(glasses_path))
     payload = {
@@ -145,7 +195,7 @@ async def generate_glasses(face_path: str, glasses_path: str) -> GenerationSucce
         ],
     }
 
-    url = f"{API_ENDPOINT}?key={_API_KEY}"
+    url = f"{API_ENDPOINT}?key={slot.api_key}"
     data = await _request_generation(url, payload)
 
     scan = _scan_response(data)
