@@ -1,4 +1,4 @@
-"""Client for the NanoBanana (Google Gemini) image try-on API."""
+﻿"""Client for the NanoBanana (Google Gemini) image try-on API."""
 
 from __future__ import annotations
 
@@ -12,8 +12,7 @@ from typing import Any, Sequence
 import aiohttp
 
 from app.config import NanoBananaKeySlot
-from logger import get_logger
-
+from logger import get_logger, info_domain
 
 LOGGER = get_logger("generation.nanobanana")
 
@@ -21,7 +20,7 @@ SYSTEM_PROMPT = (
     "Take the first image as the base photo (it can be a human, animal, or any face).\n"
     "Take the second image as the glasses reference.\n"
     "Place the glasses from the second image naturally and convincingly on the face in the first image.\n"
-    "Make sure the glasses fit perfectly — keep correct proportions, perspective, and realistic positioning on the nose and ears (if visible).\n"
+    "Make sure the glasses fit perfectly РІР‚вЂќ keep correct proportions, perspective, and realistic positioning on the nose and ears (if visible).\n"
     "Do not distort or change the original face or its features, only add the glasses.\n"
     "Keep natural lighting, shadows, and reflections consistent with the base image.\n"
     "The final result should look like a real photo where the glasses are actually worn."
@@ -172,16 +171,22 @@ async def generate_glasses(face_path: str, glasses_path: str) -> GenerationSucce
         slot, slot_index = await _KEY_PROVIDER.next_slot()
     except RuntimeError as exc:
         raise RuntimeError("NanoBanana API key is not set") from exc
-
+    # Domain-visible milestone log about the selected NanoBanana key slot.
+    # This appears alongside GENERATION_STARTED/FINISHED logs and uses the
+    # same formatting (rid, user_id, stage, JSON payload). Only slot name/index
+    # are logged; the API key value is never logged.
+    info_domain(
+        "generation.nano",
+        f"NanoBanana slot selected: {slot.name}",
+        stage="NANO_KEY_SELECT",
+        slot=slot.name,
+        slot_index=slot_index,
+    )
+    # Keep a quieter internal record in files without polluting console output.
     LOGGER.debug(
-        "INFO using NanoBanana key slot=%s slot_index=%d",
+        "using NanoBanana key slot=%s slot_index=%d",
         slot.name,
         slot_index,
-        extra={
-            "stage": "NANO_KEY_SELECT",
-            "slot": slot.name,
-            "slot_index": slot_index,
-        },
     )
     face_payload = _encode_image(Path(face_path))
     glasses_payload = _encode_image(Path(glasses_path))
