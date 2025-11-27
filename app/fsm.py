@@ -412,6 +412,82 @@ def setup_router(
             )
         return False
 
+    # Try-on cycles:
+    # /start and /wear always bump current_cycle so a fresh flow can start while older generations finish in the background.
+    # Each generation remembers the cycle it was launched with; stale cycles are delivered without the "try more" button,
+    # while the active cycle keeps the full keyboard and state transitions.
+    async def _ensure_current_cycle_id(state: FSMContext, user_id: int) -> int:
+        """Return the active try-on cycle marker stored in FSM or repository."""
+
+        data = await state.get_data()
+        raw_cycle = data.get("current_cycle")
+        if raw_cycle is not None:
+            try:
+                return int(raw_cycle)
+            except (TypeError, ValueError):
+                pass
+        profile = await repository.ensure_user(user_id)
+        current_cycle = getattr(profile, "cycle_index", 0) or 0
+        await state.update_data(current_cycle=current_cycle)
+        return current_cycle
+
+    async def _start_new_cycle(state: FSMContext, user_id: int) -> int:
+        """Increment cycle index so older generations become stale."""
+
+        current_cycle = await repository.start_new_tryon_cycle(user_id)
+        await state.update_data(current_cycle=current_cycle)
+        return current_cycle
+
+    async def _is_cycle_current(state: FSMContext, cycle_id: int) -> bool:
+        data = await state.get_data()
+        try:
+            return int(data.get("current_cycle")) == int(cycle_id)
+        except (TypeError, ValueError):
+            return False
+
+    async def _cleanup_cycle_messages(
+        message: Message,
+        state: FSMContext,
+        *,
+        data: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Remove stored messages of the previous cycle without failing the flow."""
+
+        snapshot = dict(data or await state.get_data())
+        updates: dict[str, Any] = {}
+        message_keys = (
+            "preload_message_id",
+            "generation_progress_message_id",
+            "models_message_id",
+            "gender_prompt_message_id",
+        )
+        for key in message_keys:
+            mid = snapshot.get(key)
+            if not mid:
+                continue
+            try:
+                await message.bot.delete_message(message.chat.id, int(mid))
+            except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                logger.debug("Failed to delete %s %s: %s", key, mid, exc)
+            updates[key] = None
+        prompt_id = snapshot.get("contact_prompt_message_id")
+        if prompt_id:
+            try:
+                await message.bot.delete_message(message.chat.id, int(prompt_id))
+            except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                logger.debug("Failed to delete contact prompt %s: %s", prompt_id, exc)
+            updates["contact_prompt_message_id"] = None
+        busy_ids = list(snapshot.get("busy_message_ids") or [])
+        if busy_ids:
+            for mid in busy_ids:
+                try:
+                    await message.bot.delete_message(message.chat.id, int(mid))
+                except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                    logger.debug("Failed to delete busy message %s: %s", mid, exc)
+            updates["busy_message_ids"] = []
+        if updates:
+            await state.update_data(**updates)
+
 
     async def _reject_if_busy(
         message: Message,
@@ -422,7 +498,7 @@ def setup_router(
     ) -> bool:
         # если команда заблокирована — отвечаем busy и запоминаем id сообщения
         if await _is_command_locked(state, allow_show_recs=allow_show_recs):
-            text = busy_message or msg.WEAR_BUSY_MESSAGE
+            text = busy_message or msg.GENERATION_BUSY
             sent = await message.answer(text)
             data = await state.get_data()
             ids = list(data.get("busy_message_ids", []))
@@ -798,6 +874,7 @@ def setup_router(
             reuse_offer_message_id=None,
             reuse_offer_active=False,
             allow_more_button_next=False,
+            current_cycle=current_cycle,
         )
         await repository.set_last_more_message(message.chat.id, None, None, None)
         await _send_aux_message(
@@ -1437,8 +1514,6 @@ def setup_router(
 
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
-        if await _reject_if_busy(message, state):
-            return
         user_id = message.from_user.id
         previous_state = await state.get_state()
         previous_data = await state.get_data()
@@ -1447,6 +1522,7 @@ def setup_router(
             or bool(previous_data.get("contact_request_active"))
         )
         if previous_data:
+            await _cleanup_cycle_messages(message, state, data=previous_data)
             await _delete_phone_invalid_message(message, state, data=previous_data)
         await _delete_last_aux_message(message, state)
         await _clear_reuse_offer(state, message.bot, message.chat.id)
@@ -1456,6 +1532,7 @@ def setup_router(
         ignored_phone = profile_before.contact_skip_once or contact_was_active
         await state.clear()
         await repository.reset_user_session(user_id)
+        current_cycle = await _start_new_cycle(state, user_id)
         profile = await repository.ensure_user(user_id)
         if contact_was_active and not profile_before.contact_skip_once and not profile.contact_never:
             await repository.set_contact_skip_once(user_id, True)
@@ -1907,15 +1984,23 @@ def setup_router(
         await _handle_phone_invalid_attempt(message, state)
 
     async def _perform_generation(message: Message, state: FSMContext, model: GlassModel) -> None:
+        """Run generation and deliver result bound to the cycle active at launch."""
+
         user_id = message.chat.id
-        
-        await state.update_data(is_generating=True)
+        generation_cycle = await _ensure_current_cycle_id(state, user_id)
+
+        async def _update_if_current(**kwargs: Any) -> None:
+            if await _is_cycle_current(state, generation_cycle):
+                await state.update_data(**kwargs)
+
+        await _update_if_current(is_generating=True)
         data = await state.get_data()
         upload_value = data.get("upload")
         upload_file_id = data.get("upload_file_id")
         last_photo_file_id = data.get("last_photo_file_id")
 
         progress_message: Message | None = None
+        progress_message_id: int | None = None
         user_photo_path: Path | None = None
         result_bytes: bytes | None = None
         start_time = 0.0
@@ -1929,11 +2014,27 @@ def setup_router(
             except TelegramBadRequest as exc:
                 logger.debug(
                     "Failed to edit progress message %s for %s: %s",
-                    progress_message.message_id,
+                    getattr(progress_message, "message_id", None),
                     user_id,
                     exc,
                 )
                 progress_message = None
+
+        async def _delete_progress_message() -> None:
+            nonlocal progress_message, progress_message_id
+            if progress_message_id:
+                try:
+                    await message.bot.delete_message(message.chat.id, int(progress_message_id))
+                except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                    logger.debug(
+                        "Failed to delete progress message %s: %s",
+                        progress_message_id,
+                        exc,
+                    )
+                progress_message_id = None
+            progress_message = None
+            if await _is_cycle_current(state, generation_cycle):
+                await state.update_data(generation_progress_message_id=None)
 
         try:
             if upload_value and Path(upload_value).exists():
@@ -1942,13 +2043,13 @@ def setup_router(
                 downloaded = await redownload_user_photo(
                     message.bot, upload_file_id, user_id
                 )
-                await state.update_data(upload=downloaded)
+                await _update_if_current(upload=downloaded)
                 user_photo_path = Path(downloaded)
             elif last_photo_file_id:
                 downloaded = await redownload_user_photo(
                     message.bot, last_photo_file_id, user_id
                 )
-                await state.update_data(
+                await _update_if_current(
                     upload=downloaded,
                     upload_file_id=last_photo_file_id,
                 )
@@ -1962,9 +2063,11 @@ def setup_router(
                 message.answer,
                 msg.PROGRESS_DOWNLOADING_USER_PHOTO,
             )
-            await state.update_data(
-                generation_progress_message_id=progress_message.message_id
-            )
+            progress_message_id = getattr(progress_message, "message_id", None)
+            if progress_message_id:
+                await _update_if_current(
+                    generation_progress_message_id=int(progress_message_id)
+                )
 
             await asyncio.to_thread(resize_inplace, user_photo_path)
             await _edit_progress(msg.PROGRESS_DOWNLOADING_GLASSES)
@@ -2037,15 +2140,16 @@ def setup_router(
                     },
                 },
             )
-            await _delete_state_message(message, state, "generation_progress_message_id")
-            await state.update_data(
-                selected_model=None,
-                current_models=[],
-                upload=None,
-                upload_file_id=None,
-                last_photo_file_id=None,
-            )
-            await state.set_state(TryOnStates.AWAITING_PHOTO)
+            await _delete_progress_message()
+            if await _is_cycle_current(state, generation_cycle):
+                await _update_if_current(
+                    selected_model=None,
+                    current_models=[],
+                    upload=None,
+                    upload_file_id=None,
+                    last_photo_file_id=None,
+                )
+                await state.set_state(TryOnStates.AWAITING_PHOTO)
             await _send_aux_message(
                 message,
                 state,
@@ -2070,15 +2174,16 @@ def setup_router(
                     "payload": {"model_id": model.unique_id, "latency_ms": latency_ms},
                 },
             )
-            await _delete_state_message(message, state, "generation_progress_message_id")
-            await state.update_data(
-                selected_model=None,
-                current_models=[],
-                upload=None,
-                upload_file_id=None,
-                last_photo_file_id=None,
-            )
-            await state.set_state(TryOnStates.AWAITING_PHOTO)
+            await _delete_progress_message()
+            if await _is_cycle_current(state, generation_cycle):
+                await _update_if_current(
+                    selected_model=None,
+                    current_models=[],
+                    upload=None,
+                    upload_file_id=None,
+                    last_photo_file_id=None,
+                )
+                await state.set_state(TryOnStates.AWAITING_PHOTO)
             await _send_aux_message(
                 message,
                 state,
@@ -2096,10 +2201,37 @@ def setup_router(
                         "Не удалось удалить временный файл %s",
                         user_photo_path,
                     )
-            await state.update_data(upload=None, is_generating=False)
+            if await _is_cycle_current(state, generation_cycle):
+                await state.update_data(upload=None, is_generating=False)
 
         await repository.inc_used_on_success(user_id)
         remaining = await repository.remaining_tries(user_id)
+        is_current_cycle = await _is_cycle_current(state, generation_cycle)
+        await _delete_progress_message()
+        if not is_current_cycle:
+            # Deliver stale cycle in background: keep details button only.
+            stale_caption = _compose_result_caption(model, "")
+            stale_markup = generation_result_keyboard(
+                model.site_url,
+                0,
+                show_more=False,
+            )
+            await _send_delivery_message(
+                message,
+                state,
+                message.answer_photo,
+                BufferedInputFile(result_bytes, filename="result.png"),
+                caption=stale_caption,
+                reply_markup=stale_markup,
+            )
+            await repository.increment_generation_count(user_id)
+            await repository.register_contact_generation(
+                user_id,
+                initial_trigger=CONTACT_INITIAL_TRIGGER,
+                reminder_trigger=CONTACT_REMINDER_TRIGGER,
+            )
+            return
+
         cooldown = max(int(data.get("contact_request_cooldown") or 0), 0)
         if cooldown > 0:
             await state.update_data(contact_request_cooldown=cooldown - 1)
@@ -2133,7 +2265,6 @@ def setup_router(
             keyboard_remaining,
             show_more=result_has_more,
         )
-        await _delete_state_message(message, state, "generation_progress_message_id")
         await _deactivate_previous_more_button(message.bot, user_id)
         result_message = await _send_delivery_message(
             message,
@@ -2152,8 +2283,8 @@ def setup_router(
         await state.update_data(last_card_message={
             "message_id": int(result_message.message_id),
             "chat_id": int(chat_id),
-            "type": "caption",        # результат идёт с подписью
-            "title": model.title,     # фиксируем текущий тайтл модели
+            "type": "caption",
+            "title": model.title,
             "trimmed": False,
             "trim_failed": False,
         })
@@ -2509,28 +2640,31 @@ def setup_router(
 
     @router.message(Command("wear"))
     async def command_wear(message: Message, state: FSMContext) -> None:
-        current_state = await state.get_state()
-        if current_state == ContactRequest.waiting_for_phone.state:
-            sent = await message.answer(msg.WEAR_BUSY_MESSAGE)
-            data = await state.get_data()
-            ids = list(data.get("busy_message_ids", []))
-            ids.append(sent.message_id)
-            await state.update_data(busy_message_ids=ids)
-            return
-        if await _reject_if_busy(
-            message,
-            state,
-            busy_message=msg.WEAR_BUSY_MESSAGE,
-        ):
-            return
         user_id = message.from_user.id
         data = await state.get_data()
+        await _cleanup_cycle_messages(message, state, data=data)
+        await _delete_phone_invalid_message(message, state, data=data)
+        await _delete_last_aux_message(message, state)
+        await _delete_idle_nudge_message(state, message.bot, message.chat.id)
+        await _deactivate_previous_more_button(message.bot, user_id)
+        await repository.set_last_more_message(user_id, None, None, None)
+        await _clear_reuse_offer(state, message.bot, message.chat.id)
         profile = await repository.ensure_user(user_id)
         gender = data.get("gender") or profile.gender
         if not gender:
             gender = "male"
             await repository.update_filters(user_id, gender=gender)
-        await state.update_data(gender=gender)
+        current_cycle = await _start_new_cycle(state, user_id)
+        await state.update_data(
+            gender=gender,
+            current_cycle=current_cycle,
+            contact_request_active=False,
+            contact_prompt_message_id=None,
+            contact_pending_result_state=None,
+            contact_prompt_due=None,
+            phone_invalid_message_id=None,
+            phone_bad_attempts=0,
+        )
         remaining = await repository.remaining_tries(user_id)
         if remaining <= 0:
             await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
@@ -2568,9 +2702,12 @@ def setup_router(
             suppress_more_button=False,
             reuse_offer_message_id=None,
             reuse_offer_active=False,
+            is_generating=False,
             allow_more_button_next=False,
+            result_messages={},
         )
         await _trim_last_card_message(message, state, site_url=site_url)
+        await state.update_data(last_card_message=None)
         async def _deliver_instruction() -> None:
             if await _edit_last_aux_message(message, state, msg.PHOTO_INSTRUCTION):
                 return
@@ -2581,9 +2718,6 @@ def setup_router(
                 msg.PHOTO_INSTRUCTION,
             )
 
-        if current_state == TryOnStates.SHOW_RECS.state:
-            await _deliver_instruction()
-            return
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await _deliver_instruction()
 
@@ -2593,11 +2727,10 @@ def setup_router(
 
     @router.message(Command("cancel"))
     async def command_cancel(message: Message, state: FSMContext) -> None:
-        if await _reject_if_busy(message, state):
-            return
         user_id = message.from_user.id
         previous_data = await state.get_data()
         if previous_data:
+            await _cleanup_cycle_messages(message, state, data=previous_data)
             await _delete_phone_invalid_message(message, state, data=previous_data)
         await _delete_last_aux_message(message, state)
         await _clear_reuse_offer(state, message.bot, message.chat.id)
@@ -2606,6 +2739,7 @@ def setup_router(
         _cancel_idle_timer(user_id)
         await state.clear()
         await repository.reset_user_session(user_id)
+        current_cycle = await _start_new_cycle(state, user_id)
         await state.set_state(TryOnStates.START)
         await state.update_data(
             upload=None,
@@ -2619,6 +2753,7 @@ def setup_router(
             reuse_offer_message_id=None,
             reuse_offer_active=False,
             allow_more_button_next=False,
+            current_cycle=current_cycle,
         )
         await message.answer(msg.CANCEL_CONFIRMATION)
 

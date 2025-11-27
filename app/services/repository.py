@@ -55,6 +55,20 @@ class Repository:
             await asyncio.to_thread(self._upsert_user, profile)
         return profile
 
+    async def get_current_cycle(self, user_id: int) -> int:
+        profile = await self.ensure_user(user_id)
+        return profile.cycle_index or 0
+
+    async def start_new_tryon_cycle(self, user_id: int) -> int:
+        """Advance the per-user try-on cycle index."""
+
+        lock = self._ensure_lock()
+        async with lock:
+            profile = await self.ensure_user(user_id)
+            profile.cycle_index = (profile.cycle_index or 0) + 1
+            await asyncio.to_thread(self._upsert_user, profile)
+            return profile.cycle_index
+
     async def update_filters(self, user_id: int, *, gender: Optional[str] = None) -> None:
         await asyncio.to_thread(self._update_filters_sync, user_id, gender)
 

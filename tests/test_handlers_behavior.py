@@ -1,13 +1,15 @@
 import asyncio
 import io
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, Optional, Sequence
 
 from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardRemove
 from PIL import Image
+
+UTC = getattr(datetime, "UTC", timezone.utc)
 
 from app.config import CollageConfig
 from app.fsm import ContactRequest, TryOnStates, setup_router
@@ -262,6 +264,13 @@ class StubRepository:
             locked_until=self.locked_until,
             nudge_sent_cycle=self.nudge_sent,
         )
+
+    async def get_current_cycle(self, user_id: int) -> int:
+        return self.cycle_index
+
+    async def start_new_tryon_cycle(self, user_id: int) -> int:
+        self.cycle_index += 1
+        return self.cycle_index
 
     async def remaining_tries(self, user_id: int) -> int:
         if self.locked_until is not None:
@@ -1575,8 +1584,10 @@ def test_start_command_blocked_during_generation(tmp_path: Path) -> None:
 
         await handler(message, state)
 
-        assert message.answers[-1][0] == msg.WEAR_BUSY_MESSAGE
-        assert state.state == TryOnStates.GENERATING.state
+        assert state.state == TryOnStates.START
+        assert message.answers[-1][0] == msg.START_WELCOME
+        data = await state.get_data()
+        assert data.get("current_cycle") == 1
 
     asyncio.run(scenario())
 
@@ -1595,6 +1606,7 @@ def test_wear_sets_default_gender_when_missing(tmp_path: Path) -> None:
 
         assert state.state is TryOnStates.AWAITING_PHOTO
         data = await state.get_data()
+        assert data.get("current_cycle") == 1
         assert data.get("gender") == "male"
         assert repository.updated_filters == [(777, "male")]
         assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
@@ -1615,8 +1627,11 @@ def test_wear_rejected_during_contact_request(tmp_path: Path) -> None:
 
         await handler(message, state)
 
-        assert message.answers[-1][0] == msg.WEAR_BUSY_MESSAGE
-        assert state.state == ContactRequest.waiting_for_phone.state
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
+        data = await state.get_data()
+        assert data.get("current_cycle") == 1
+        assert data.get("contact_request_active") is False
 
     asyncio.run(scenario())
 
@@ -1635,8 +1650,10 @@ def test_wear_rejected_during_generation(tmp_path: Path) -> None:
 
         await handler(message, state)
 
-        assert message.answers[-1][0] == msg.WEAR_BUSY_MESSAGE
-        assert state.state == TryOnStates.GENERATING.state
+        assert state.state is TryOnStates.AWAITING_PHOTO
+        assert message.answers[-1][0] == msg.PHOTO_INSTRUCTION
+        data = await state.get_data()
+        assert data.get("current_cycle") == 1
 
     asyncio.run(scenario())
 
@@ -1708,8 +1725,10 @@ def test_cancel_blocked_during_generation(tmp_path: Path) -> None:
 
         await handler(message, state)
 
-        assert message.answers[-1][0] == msg.WEAR_BUSY_MESSAGE
-        assert state.state == TryOnStates.GENERATING.state
+        assert message.answers[-1][0] == msg.CANCEL_CONFIRMATION
+        assert state.state is TryOnStates.START
+        data = await state.get_data()
+        assert data.get("current_cycle") == 1
 
     asyncio.run(scenario())
 
@@ -1743,6 +1762,7 @@ def test_cancel_resets_session(tmp_path: Path) -> None:
         assert data.get("selected_model") is None
         assert data.get("current_models") == []
         assert data.get("is_generating") is False
+        assert data.get("current_cycle") == 1
         assert repository.more_buttons.get(5432) == (None, None, None)
 
     asyncio.run(scenario())
