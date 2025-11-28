@@ -1768,6 +1768,276 @@ def test_cancel_resets_session(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_two_photos_two_generations_run_independently(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        models = [
+            GlassModel(
+                unique_id="m1",
+                title="Model 1",
+                model_code="M1",
+                site_url="https://example.com/1",
+                img_user_url="https://example.com/1.jpg",
+                img_nano_url="https://example.com/1-nano.jpg",
+                gender="male",
+            )
+        ]
+        router, _, tryon, _, _ = build_router(tmp_path, models=models)
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        bot = DummyBot()
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        message1 = DummyMessage(user_id=4242, bot=bot)
+        message1.photo = [PhotoStub("p1")]  # type: ignore[attr-defined]
+        await handler_photo(message1, state)
+
+        message2 = DummyMessage(user_id=4242, bot=bot, message_id=999)
+        message2.photo = [PhotoStub("p2")]  # type: ignore[attr-defined]
+        await handler_photo(message2, state)
+
+        sessions = (await state.get_data()).get("collage_sessions", {})
+        assert len(sessions) == 2
+        first_id, second_id = list(map(int, sessions.keys()))
+
+        await handler_choose(
+            DummyCallback(f"pick:src=batch2:{models[0].unique_id}", DummyMessage(user_id=4242, bot=bot, message_id=first_id)),
+            state,
+        )
+        await handler_choose(
+            DummyCallback(f"pick:src=batch2:{models[0].unique_id}", DummyMessage(user_id=4242, bot=bot, message_id=second_id)),
+            state,
+        )
+
+        assert len(tryon.calls) == 2
+        assert len(bot.chat_actions) == 0  # no blocking replies
+        assert len(bot.deleted) >= 0
+        assert len(bot.edited_markups) >= 0
+
+    asyncio.run(scenario())
+
+
+def test_second_collage_callback_works_when_generation_running(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        models = [
+            GlassModel(
+                unique_id="m1",
+                title="Model 1",
+                model_code="M1",
+                site_url="https://example.com/1",
+                img_user_url="https://example.com/1.jpg",
+                img_nano_url="https://example.com/1-nano.jpg",
+                gender="male",
+            )
+        ]
+        router, _, tryon, _, _ = build_router(tmp_path, models=models)
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        bot = DummyBot()
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        message1 = DummyMessage(user_id=5151, bot=bot)
+        message1.photo = [PhotoStub("p1")]  # type: ignore[attr-defined]
+        await handler_photo(message1, state)
+        await state.update_data(is_generating=True)
+
+        message2 = DummyMessage(user_id=5151, bot=bot, message_id=200)
+        message2.photo = [PhotoStub("p2")]  # type: ignore[attr-defined]
+        await handler_photo(message2, state)
+        sessions = (await state.get_data()).get("collage_sessions", {})
+        collage_id = int(next(iter(sessions.keys())))
+
+        await handler_choose(
+            DummyCallback(f"pick:src=batch2:{models[0].unique_id}", DummyMessage(user_id=5151, bot=bot, message_id=collage_id)),
+            state,
+        )
+
+        assert len(tryon.calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_two_photos_make_first_collage_stale_but_clickable(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        models = [
+            GlassModel(
+                unique_id="m1",
+                title="Model 1",
+                model_code="M1",
+                site_url="https://example.com/1",
+                img_user_url="https://example.com/1.jpg",
+                img_nano_url="https://example.com/1-nano.jpg",
+                gender="male",
+            )
+        ]
+        router, _, tryon, _, _ = build_router(tmp_path, models=models)
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        bot = DummyBot()
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        message1 = DummyMessage(user_id=7070, bot=bot, message_id=50)
+        message1.photo = [PhotoStub("p1")]  # type: ignore[attr-defined]
+        await handler_photo(message1, state)
+
+        message2 = DummyMessage(user_id=7070, bot=bot, message_id=150)
+        message2.photo = [PhotoStub("p2")]  # type: ignore[attr-defined]
+        await handler_photo(message2, state)
+
+        sessions = (await state.get_data()).get("collage_sessions", {})
+        assert len(sessions) == 2
+        cycle_map: dict[int, list[int]] = {}
+        for mid, entry in sessions.items():
+            cycle_map.setdefault(int(entry["cycle"]), []).append(int(mid))
+
+        first_cycle = min(cycle_map)
+        second_cycle = max(cycle_map)
+        first_mid = cycle_map[first_cycle][0]
+        second_mid = cycle_map[second_cycle][0]
+
+        callback_first = DummyCallback(
+            f"pick:src=batch2:{models[0].unique_id}",
+            DummyMessage(user_id=7070, bot=bot, message_id=first_mid),
+        )
+        await handler_choose(callback_first, state)
+        stale_markup = callback_first.message.answer_photos[-1][2]
+        assert isinstance(stale_markup, InlineKeyboardMarkup)
+        assert len(stale_markup.inline_keyboard) == 1
+
+        callback_second = DummyCallback(
+            f"pick:src=batch2:{models[0].unique_id}",
+            DummyMessage(user_id=7070, bot=bot, message_id=second_mid),
+        )
+        await handler_choose(callback_second, state)
+        current_markup = callback_second.message.answer_photos[-1][2]
+        assert isinstance(current_markup, InlineKeyboardMarkup)
+        assert len(current_markup.inline_keyboard) > 1
+        assert len(tryon.calls) == 2
+
+    asyncio.run(scenario())
+
+
+def test_photo_during_generating_keeps_old_result_and_new_cycle(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        models = [
+            GlassModel(
+                unique_id="m1",
+                title="Model 1",
+                model_code="M1",
+                site_url="https://example.com/1",
+                img_user_url="https://example.com/1.jpg",
+                img_nano_url="https://example.com/1-nano.jpg",
+                gender="male",
+            )
+        ]
+        router, _, tryon, _, _ = build_router(tmp_path, models=models)
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        bot = DummyBot()
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        message1 = DummyMessage(user_id=8080, bot=bot, message_id=75)
+        message1.photo = [PhotoStub("p1")]  # type: ignore[attr-defined]
+        await handler_photo(message1, state)
+        await state.update_data(is_generating=True)
+
+        message2 = DummyMessage(user_id=8080, bot=bot, message_id=175)
+        message2.photo = [PhotoStub("p2")]  # type: ignore[attr-defined]
+        await handler_photo(message2, state)
+
+        sessions = (await state.get_data()).get("collage_sessions", {})
+        cycle_map: dict[int, list[int]] = {}
+        for mid, entry in sessions.items():
+            cycle_map.setdefault(int(entry["cycle"]), []).append(int(mid))
+
+        first_cycle = min(cycle_map)
+        second_cycle = max(cycle_map)
+        first_mid = cycle_map[first_cycle][0]
+        second_mid = cycle_map[second_cycle][0]
+
+        callback_first = DummyCallback(
+            f"pick:src=batch2:{models[0].unique_id}",
+            DummyMessage(user_id=8080, bot=bot, message_id=first_mid),
+        )
+        await handler_choose(callback_first, state)
+        stale_markup = callback_first.message.answer_photos[-1][2]
+        assert isinstance(stale_markup, InlineKeyboardMarkup)
+        assert len(stale_markup.inline_keyboard) == 1
+
+        callback_second = DummyCallback(
+            f"pick:src=batch2:{models[0].unique_id}",
+            DummyMessage(user_id=8080, bot=bot, message_id=second_mid),
+        )
+        await handler_choose(callback_second, state)
+        current_markup = callback_second.message.answer_photos[-1][2]
+        assert isinstance(current_markup, InlineKeyboardMarkup)
+        assert len(current_markup.inline_keyboard) > 1
+        assert len(tryon.calls) == 2
+
+    asyncio.run(scenario())
+
+
+def test_wear_makes_old_collage_inactive(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        models = [
+            GlassModel(
+                unique_id="m1",
+                title="Model 1",
+                model_code="M1",
+                site_url="https://example.com/1",
+                img_user_url="https://example.com/1.jpg",
+                img_nano_url="https://example.com/1-nano.jpg",
+                gender="male",
+            )
+        ]
+        router, _, tryon, _, _ = build_router(tmp_path, models=models)
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+        handler_wear = get_message_handler(router, "command_wear")
+
+        bot = DummyBot()
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        message1 = DummyMessage(user_id=6060, bot=bot)
+        message1.photo = [PhotoStub("p1")]  # type: ignore[attr-defined]
+        await handler_photo(message1, state)
+        sessions = (await state.get_data()).get("collage_sessions", {})
+        old_id = int(next(iter(sessions.keys())))
+
+        wear_message = DummyMessage(user_id=6060, bot=bot)
+        wear_message.text = "/wear"  # type: ignore[attr-defined]
+        await handler_wear(wear_message, state)
+
+        await handler_choose(
+            DummyCallback(f"pick:src=batch2:{models[0].unique_id}", DummyMessage(user_id=6060, bot=bot, message_id=old_id)),
+            state,
+        )
+        assert len(tryon.calls) == 0
+
+        message2 = DummyMessage(user_id=6060, bot=bot, message_id=300)
+        message2.photo = [PhotoStub("p2")]  # type: ignore[attr-defined]
+        await handler_photo(message2, state)
+        sessions_new = (await state.get_data()).get("collage_sessions", {})
+        new_id = int(next(iter(sessions_new.keys())))
+
+        await handler_choose(
+            DummyCallback(f"pick:src=batch2:{models[0].unique_id}", DummyMessage(user_id=6060, bot=bot, message_id=new_id)),
+            state,
+        )
+
+        assert len(tryon.calls) == 1
+
+    asyncio.run(scenario())
+
+
 def test_no_attach_photo_text_in_sources() -> None:
     project_root = Path("app")
     matches = [

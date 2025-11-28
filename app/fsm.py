@@ -416,6 +416,7 @@ def setup_router(
     # /start and /wear always bump current_cycle so a fresh flow can start while older generations finish in the background.
     # Each generation remembers the cycle it was launched with; stale cycles are delivered without the "try more" button,
     # while the active cycle keeps the full keyboard and state transitions.
+    # A fresh photo upload also spins up its own cycle so older collages remain clickable but their generations are treated as stale.
     async def _ensure_current_cycle_id(state: FSMContext, user_id: int) -> int:
         """Return the active try-on cycle marker stored in FSM or repository."""
 
@@ -856,10 +857,15 @@ def setup_router(
         message: Message,
         state: FSMContext,
         prompt_source: str | Sequence[str],
+        *,
+        cycle_id: int | None = None,
     ) -> None:
         prompt_text = _render_text(prompt_source)
         await _deactivate_previous_more_button(message.bot, message.chat.id)
         await _clear_reuse_offer(state, message.bot, message.chat.id)
+        resolved_cycle = cycle_id
+        if resolved_cycle is None:
+            resolved_cycle = await _ensure_current_cycle_id(state, message.from_user.id)
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await state.update_data(
             upload=None,
@@ -874,7 +880,7 @@ def setup_router(
             reuse_offer_message_id=None,
             reuse_offer_active=False,
             allow_more_button_next=False,
-            current_cycle=current_cycle,
+            current_cycle=resolved_cycle,
         )
         await repository.set_last_more_message(message.chat.id, None, None, None)
         await _send_aux_message(
@@ -1033,11 +1039,25 @@ def setup_router(
         *,
         skip_contact_prompt: bool = False,
         exclude_ids: set[str] | None = None,
+        cycle_id: int | None = None,
+        photo_context: dict[str, Any] | None = None,
     ) -> bool:
+        """Send model suggestions for a specific try-on cycle/photo context snapshot."""
+
         await _trim_last_card_message(message, state, site_url=site_url)
         if not skip_contact_prompt:
             if await _maybe_request_contact(message, state, user_id):
                 return False
+        if cycle_id is None:
+            cycle_id = await _ensure_current_cycle_id(state, user_id)
+        data = await state.get_data()
+        effective_photo_context = dict(photo_context or {})
+        if not effective_photo_context:
+            effective_photo_context = {
+                "upload": data.get("upload"),
+                "upload_file_id": data.get("upload_file_id"),
+                "last_photo_file_id": data.get("last_photo_file_id"),
+            }
         try:
             result = await recommender.recommend_for_user(
                 user_id,
@@ -1087,7 +1107,13 @@ def setup_router(
             last_batch=batch,
             presented_model_ids=presented,
         )
-        await _send_model_batches(message, state, batch)
+        await _send_model_batches(
+            message,
+            state,
+            batch,
+            cycle_id=cycle_id,
+            photo_context=effective_photo_context,
+        )
         await _delete_state_message(message, state, "preload_message_id")
         await state.update_data(is_generating=False)
         if result.exhausted:
@@ -1101,15 +1127,26 @@ def setup_router(
         return True
 
     async def _send_model_batches(
-        message: Message, state: FSMContext, batch: list[GlassModel]
+        message: Message,
+        state: FSMContext,
+        batch: list[GlassModel],
+        *,
+        cycle_id: int,
+        photo_context: dict[str, Any],
     ) -> None:
         groups = chunk_models(batch, batch_size)
         for group in groups:
             try:
-                await _send_batch_message(message, state, group)
+                await _send_batch_message(
+                    message,
+                    state,
+                    group,
+                    cycle_id=cycle_id,
+                    photo_context=photo_context,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.error(
-                    "Не удалось отправить подборку моделей %s: %s",
+                    "Unexpected collage error for models %s: %s",
                     [model.unique_id for model in group],
                     exc,
                     extra={"stage": "MODELS_SENT"},
@@ -1351,7 +1388,12 @@ def setup_router(
         await _store_contact(message, state, normalized, source=source)
 
     async def _send_batch_message(
-        message: Message, state: FSMContext, group: tuple[GlassModel, ...]
+        message: Message,
+        state: FSMContext,
+        group: tuple[GlassModel, ...],
+        *,
+        cycle_id: int,
+        photo_context: dict[str, Any],
     ) -> None:
         keyboard = batch_selection_keyboard(
             [(item.unique_id, item.title) for item in group],
@@ -1369,7 +1411,15 @@ def setup_router(
                 msg.COLLAGE_IMAGES_UNAVAILABLE,
                 reply_markup=keyboard,
             )
-            await state.update_data(models_message_id=m.message_id)
+            sessions = dict((await state.get_data()).get("collage_sessions", {}))
+            sessions[str(m.message_id)] = {
+                "models": list(group),
+                "cycle": cycle_id,
+                "upload": photo_context.get("upload"),
+                "upload_file_id": photo_context.get("upload_file_id"),
+                "last_photo_file_id": photo_context.get("last_photo_file_id"),
+            }
+            await state.update_data(models_message_id=m.message_id, collage_sessions=sessions)
             return
         except CollageProcessingError as exc:
             logger.warning(
@@ -1383,6 +1433,8 @@ def setup_router(
                 state,
                 group,
                 reply_markup=keyboard,
+                cycle_id=cycle_id,
+                photo_context=photo_context,
             )
             return
         except Exception as exc:  # noqa: BLE001
@@ -1398,6 +1450,8 @@ def setup_router(
                 state,
                 group,
                 reply_markup=keyboard,
+                cycle_id=cycle_id,
+                photo_context=photo_context,
             )
             return
 
@@ -1413,7 +1467,15 @@ def setup_router(
                 caption=None,
                 reply_markup=keyboard,
             )
-            await state.update_data(models_message_id=sent.message_id)
+            sessions = dict((await state.get_data()).get("collage_sessions", {}))
+            sessions[str(sent.message_id)] = {
+                "models": list(group),
+                "cycle": cycle_id,
+                "upload": photo_context.get("upload"),
+                "upload_file_id": photo_context.get("upload_file_id"),
+                "last_photo_file_id": photo_context.get("last_photo_file_id"),
+            }
+            await state.update_data(models_message_id=sent.message_id, collage_sessions=sessions)
             await _delete_busy_messages(state, message.bot, message.chat.id)
 
         except Exception as exc:  # noqa: BLE001
@@ -1428,6 +1490,8 @@ def setup_router(
                 state,
                 group,
                 reply_markup=keyboard,
+                cycle_id=cycle_id,
+                photo_context=photo_context,
             )
             return
         logger.debug(
@@ -1443,6 +1507,8 @@ def setup_router(
         group: tuple[GlassModel, ...],
         *,
         reply_markup: InlineKeyboardMarkup,
+        cycle_id: int,
+        photo_context: dict[str, Any],
     ) -> None:
         last_index = len(group) - 1
         last_sent = None  # ← [ДОБАВЬ ЭТО]
@@ -1466,7 +1532,15 @@ def setup_router(
 
         # ← [ДОБАВЬ БЛОК НИЖЕ] — после цикла записываем id последнего сообщения с кнопками
         if last_sent:
-            await state.update_data(models_message_id=last_sent.message_id)
+            sessions = dict((await state.get_data()).get("collage_sessions", {}))
+            sessions[str(last_sent.message_id)] = {
+                "models": list(group),
+                "cycle": cycle_id,
+                "upload": photo_context.get("upload"),
+                "upload_file_id": photo_context.get("upload_file_id"),
+                "last_photo_file_id": photo_context.get("last_photo_file_id"),
+            }
+            await state.update_data(models_message_id=last_sent.message_id, collage_sessions=sessions)
         await _delete_busy_messages(state, message.bot, message.chat.id)
 
 
@@ -1741,20 +1815,72 @@ def setup_router(
         )
 
     @router.message(
-        StateFilter(TryOnStates.AWAITING_PHOTO, TryOnStates.RESULT, TryOnStates.SHOW_RECS),
+        StateFilter(
+            TryOnStates.AWAITING_PHOTO,
+            TryOnStates.RESULT,
+            TryOnStates.SHOW_RECS,
+            TryOnStates.GENERATING,
+        ),
         F.photo,
     )
     async def accept_photo(message: Message, state: FSMContext) -> None:
+        """Accept a new user photo and spin a dedicated try-on cycle for it without cancelling older ones."""
         user_id = message.from_user.id
+        data_before = await state.get_data()
+        current_state = await state.get_state()
+        has_active_flow = any(
+            [
+                data_before.get("upload"),
+                data_before.get("upload_file_id"),
+                data_before.get("last_photo_file_id"),
+                data_before.get("current_models"),
+                data_before.get("selected_model"),
+                data_before.get("is_generating"),
+                data_before.get("generation_progress_message_id"),
+            ]
+        )
+        wants_new_cycle = current_state in {
+            TryOnStates.SHOW_RECS.state,
+            TryOnStates.GENERATING.state,
+            TryOnStates.RESULT.state,
+        } or has_active_flow
+        if wants_new_cycle:
+            current_cycle = await _start_new_cycle(state, user_id)
+            await state.update_data(
+                upload=None,
+                upload_file_id=None,
+                last_photo_file_id=None,
+                selected_model=None,
+                current_models=[],
+                last_batch=[],
+                presented_model_ids=[],
+                preload_message_id=None,
+                generation_progress_message_id=None,
+                models_message_id=None,
+                suppress_more_button=False,
+                reuse_offer_message_id=None,
+                reuse_offer_active=False,
+                allow_more_button_next=False,
+                is_generating=False,
+                current_cycle=current_cycle,
+            )
+        else:
+            current_cycle = await _ensure_current_cycle_id(state, user_id)
+            await state.update_data(current_cycle=current_cycle, is_generating=False)
         photo = message.photo[-1]
         await state.set_state(TryOnStates.SHOW_RECS)
-        await state.update_data(is_generating=True)
         path = await save_user_photo(message)
         await state.update_data(
             upload=path,
             upload_file_id=photo.file_id,
             last_photo_file_id=photo.file_id,
         )
+        photo_cycle_id = current_cycle
+        photo_context = {
+            "upload": path,
+            "upload_file_id": photo.file_id,
+            "last_photo_file_id": photo.file_id,
+        }
         await track_event(str(user_id), "photo_uploaded")
         profile = await repository.ensure_daily_reset(user_id)
         if profile.tries_used == 0:
@@ -1803,6 +1929,8 @@ def setup_router(
             state,
             skip_contact_prompt=True,
             exclude_ids=None,
+            cycle_id=photo_cycle_id,
+            photo_context=photo_context,
         )
         info_domain(
             "bot.handlers",
@@ -1814,11 +1942,17 @@ def setup_router(
 
     @router.callback_query(StateFilter(TryOnStates.AWAITING_PHOTO), F.data == "send_new_photo")
     async def request_new_photo(callback: CallbackQuery, state: FSMContext) -> None:
-        await _send_aux_message(
+        user_id = callback.from_user.id
+        data = await state.get_data()
+        await _cleanup_cycle_messages(callback.message, state, data=data)
+        await _delete_last_aux_message(callback.message, state)
+        new_cycle = await _start_new_cycle(state, user_id)
+        await state.update_data(collage_sessions={}, result_messages={})
+        await _prompt_for_next_photo(
             callback.message,
             state,
-            callback.message.answer,
             msg.PHOTO_INSTRUCTION,
+            cycle_id=new_cycle,
         )
         await callback.answer()
 
@@ -1827,6 +1961,7 @@ def setup_router(
         F.data.startswith("pick:"),
     )
     async def choose_model(callback: CallbackQuery, state: FSMContext) -> None:
+        """Launch generation using the model tied to the tapped collage, honoring its original cycle/photo context."""
         parts = callback.data.split(":", 2)
         if len(parts) == 3:
             _, batch_source_key, model_id = parts
@@ -1834,25 +1969,33 @@ def setup_router(
             batch_source_key = "unknown"
             model_id = callback.data.replace("pick:", "", 1)
         data = await state.get_data()
-        # Удаляем ленту с моделями (коллаж/фото-сет) по сохранённому message_id
+        # ???>???'?? ? ?????>??? (?>>/"??'?-?') ? ???:??'???? message_id
         models_msg_id = data.get("models_message_id")
-        if models_msg_id:
+        sessions = dict(data.get("collage_sessions", {}))
+        session_entry = sessions.get(str(callback.message.message_id))
+        current_cycle_value = await repository.get_current_cycle(callback.from_user.id)
+        if models_msg_id and models_msg_id == callback.message.message_id:
             try:
                 await callback.message.bot.delete_message(callback.message.chat.id, models_msg_id)
             except Exception:
                 pass
             await state.update_data(models_message_id=None)
 
-        # На всякий случай — если callback пришёл с самой ленты и id другой:
-        if callback.message and callback.message.message_id != models_msg_id:
-            try:
-                await callback.message.bot.delete_message(callback.message.chat.id, callback.message.message_id)
-            except Exception:
-                pass
-        if data.get("is_generating"):
-            await callback.answer(msg.GENERATION_BUSY, show_alert=True)
-            return
-        models_data: List[GlassModel] = data.get("current_models", [])
+        models_data: List[GlassModel] = []
+        generation_cycle = None
+        photo_context: dict[str, Any] | None = None
+        if session_entry:
+            models_data = list(session_entry.get("models", []))
+            generation_cycle = session_entry.get("cycle")
+            photo_context = {
+                "upload": session_entry.get("upload"),
+                "upload_file_id": session_entry.get("upload_file_id"),
+                "last_photo_file_id": session_entry.get("last_photo_file_id"),
+            }
+        else:
+            models_data = list(data.get("current_models", []))
+            generation_cycle = data.get("current_cycle") or current_cycle_value
+
         selected = next((model for model in models_data if model.unique_id == model_id), None)
         if not selected:
             await callback.answer(msg.MODEL_UNAVAILABLE_ALERT, show_alert=True)
@@ -1876,7 +2019,7 @@ def setup_router(
             )
             info_domain(
                 "bot.handlers",
-                "🔒 Достигнут дневной лимит",
+                "daily_limit_after_pick",
                 stage="DAILY_LIMIT",
                 user_id=callback.from_user.id,
                 context="model_pick",
@@ -1884,14 +2027,31 @@ def setup_router(
             await callback.answer()
             return
         await callback.answer()
-        updates: dict[str, Any] = {"selected_model": selected}
-        if data.get("allow_more_button_next"):
-            updates["suppress_more_button"] = False
-            updates["allow_more_button_next"] = False
-        await state.update_data(**updates)
-        await state.update_data(is_generating=True)
-        await state.set_state(TryOnStates.GENERATING)
-        await _perform_generation(callback.message, state, selected)
+        if session_entry:
+            sessions.pop(str(callback.message.message_id), None)
+            await state.update_data(collage_sessions=sessions)
+        if generation_cycle is None:
+            generation_cycle = await _ensure_current_cycle_id(state, callback.from_user.id)
+        # Tie generation to the cycle captured for this collage; stale cycles run without locking the current FSM state.
+        is_current_cycle = await _is_cycle_current(state, generation_cycle)
+        updates: dict[str, Any] = {}
+        if is_current_cycle:
+            updates["selected_model"] = selected
+            if data.get("allow_more_button_next"):
+                updates["suppress_more_button"] = False
+                updates["allow_more_button_next"] = False
+        if updates:
+            await state.update_data(**updates)
+        if is_current_cycle:
+            await state.update_data(is_generating=True)
+            await state.set_state(TryOnStates.GENERATING)
+        await _perform_generation(
+            callback.message,
+            state,
+            selected,
+            generation_cycle=generation_cycle,
+            photo_context=photo_context,
+        )
 
     @router.callback_query(
         StateFilter(ContactRequest.waiting_for_phone),
@@ -1983,11 +2143,19 @@ def setup_router(
     async def contact_fallback(message: Message, state: FSMContext) -> None:
         await _handle_phone_invalid_attempt(message, state)
 
-    async def _perform_generation(message: Message, state: FSMContext, model: GlassModel) -> None:
-        """Run generation and deliver result bound to the cycle active at launch."""
+    async def _perform_generation(
+        message: Message,
+        state: FSMContext,
+        model: GlassModel,
+        *,
+        generation_cycle: int | None = None,
+        photo_context: dict[str, Any] | None = None,
+    ) -> None:
+        """Run generation and deliver result bound to the provided try-on cycle (stale cycles drop the \"try more\" button)."""
 
         user_id = message.chat.id
-        generation_cycle = await _ensure_current_cycle_id(state, user_id)
+        if generation_cycle is None:
+            generation_cycle = await _ensure_current_cycle_id(state, user_id)
 
         async def _update_if_current(**kwargs: Any) -> None:
             if await _is_cycle_current(state, generation_cycle):
@@ -1995,9 +2163,19 @@ def setup_router(
 
         await _update_if_current(is_generating=True)
         data = await state.get_data()
-        upload_value = data.get("upload")
-        upload_file_id = data.get("upload_file_id")
-        last_photo_file_id = data.get("last_photo_file_id")
+        upload_value = None
+        upload_file_id = None
+        last_photo_file_id = None
+        if photo_context:
+            upload_value = photo_context.get("upload")
+            upload_file_id = photo_context.get("upload_file_id")
+            last_photo_file_id = photo_context.get("last_photo_file_id")
+        if upload_value is None:
+            upload_value = data.get("upload")
+        if upload_file_id is None:
+            upload_file_id = data.get("upload_file_id")
+        if last_photo_file_id is None:
+            last_photo_file_id = data.get("last_photo_file_id")
 
         progress_message: Message | None = None
         progress_message_id: int | None = None
@@ -2022,6 +2200,7 @@ def setup_router(
 
         async def _delete_progress_message() -> None:
             nonlocal progress_message, progress_message_id
+            removed_id = progress_message_id
             if progress_message_id:
                 try:
                     await message.bot.delete_message(message.chat.id, int(progress_message_id))
@@ -2034,7 +2213,11 @@ def setup_router(
                 progress_message_id = None
             progress_message = None
             if await _is_cycle_current(state, generation_cycle):
-                await state.update_data(generation_progress_message_id=None)
+                data_snapshot = await state.get_data()
+                updates: dict[str, Any] = {"generation_progress_message_id": None}
+                if removed_id and data_snapshot.get("last_aux_message_id") == removed_id:
+                    updates["last_aux_message_id"] = None
+                await state.update_data(**updates)
 
         try:
             if upload_value and Path(upload_value).exists():
@@ -2705,6 +2888,8 @@ def setup_router(
             is_generating=False,
             allow_more_button_next=False,
             result_messages={},
+            collage_sessions={},
+            models_message_id=None,
         )
         await _trim_last_card_message(message, state, site_url=site_url)
         await state.update_data(last_card_message=None)
