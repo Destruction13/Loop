@@ -1768,6 +1768,58 @@ def test_cancel_resets_session(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_collage_callback_allowed_in_start_state(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        models = [
+            GlassModel(
+                unique_id="m1",
+                title="Model 1",
+                model_code="M1",
+                site_url="https://example.com/1",
+                img_user_url="https://example.com/1.jpg",
+                img_nano_url="https://example.com/1-nano.jpg",
+                gender="male",
+            )
+        ]
+        router, repository, tryon, _, _ = build_router(tmp_path, models=models)
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        bot = DummyBot()
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        message = DummyMessage(user_id=4141, bot=bot, message_id=10)
+        message.photo = [PhotoStub("p1")]  # type: ignore[attr-defined]
+        await handler_photo(message, state)
+
+        data = await state.get_data()
+        sessions = data.get("collage_sessions", {})
+        collage_id = int(next(iter(sessions.keys())))
+        snapshot = sessions[str(collage_id)]
+        original_cycle = snapshot["cycle"]
+
+        bumped_cycle = await repository.start_new_tryon_cycle(message.from_user.id)
+        await state.update_data(current_cycle=bumped_cycle, collage_sessions=sessions)
+        await state.set_state(TryOnStates.START)
+
+        callback = DummyCallback(
+            f"pick:src=batch2:{models[0].unique_id}",
+            DummyMessage(user_id=4141, bot=bot, message_id=collage_id),
+        )
+        await handler_choose(callback, state)
+
+        assert callback._answers[-1] == (None, False)
+        assert len(tryon.calls) == 1
+        assert tryon.calls[0]["input_photo"] == Path(snapshot["upload"])
+        markup = callback.message.answer_photos[-1][2]
+        assert isinstance(markup, InlineKeyboardMarkup)
+        assert len(markup.inline_keyboard) == 1
+        assert original_cycle != (await state.get_data()).get("current_cycle")
+
+    asyncio.run(scenario())
+
+
 def test_two_photos_two_generations_run_independently(tmp_path: Path) -> None:
     async def scenario() -> None:
         models = [
@@ -1922,6 +1974,80 @@ def test_two_photos_make_first_collage_stale_but_clickable(tmp_path: Path) -> No
     asyncio.run(scenario())
 
 
+def test_collages_keep_separate_cycles_and_photos(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        models = [
+            GlassModel(
+                unique_id="m1",
+                title="Model 1",
+                model_code="M1",
+                site_url="https://example.com/1",
+                img_user_url="https://example.com/1.jpg",
+                img_nano_url="https://example.com/1-nano.jpg",
+                gender="male",
+            )
+        ]
+        router, _, tryon, _, _ = build_router(tmp_path, models=models)
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+
+        bot = DummyBot()
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        message1 = DummyMessage(user_id=9090, bot=bot, message_id=55)
+        message1.photo = [PhotoStub("p1")]  # type: ignore[attr-defined]
+        await handler_photo(message1, state)
+
+        message2 = DummyMessage(user_id=9090, bot=bot, message_id=155)
+        message2.photo = [PhotoStub("p2")]  # type: ignore[attr-defined]
+        await handler_photo(message2, state)
+
+        sessions = (await state.get_data()).get("collage_sessions", {})
+        cycle_map: dict[int, list[int]] = {}
+        for mid, entry in sessions.items():
+            cycle_map.setdefault(int(entry["cycle"]), []).append(int(mid))
+
+        first_cycle = min(cycle_map)
+        second_cycle = max(cycle_map)
+        first_mid = cycle_map[first_cycle][0]
+        second_mid = cycle_map[second_cycle][0]
+
+        first_photo_path = tmp_path / "first_photo_bound.jpg"
+        second_photo_path = tmp_path / "second_photo_bound.jpg"
+        first_photo_path.write_bytes(b"first")
+        second_photo_path.write_bytes(b"second")
+        sessions[str(first_mid)]["upload"] = str(first_photo_path)
+        sessions[str(second_mid)]["upload"] = str(second_photo_path)
+        await state.update_data(collage_sessions=sessions)
+
+        callback_first = DummyCallback(
+            f"pick:src=batch2:{models[0].unique_id}",
+            DummyMessage(user_id=9090, bot=bot, message_id=first_mid),
+        )
+        await handler_choose(callback_first, state)
+
+        callback_second = DummyCallback(
+            f"pick:src=batch2:{models[0].unique_id}",
+            DummyMessage(user_id=9090, bot=bot, message_id=second_mid),
+        )
+        await handler_choose(callback_second, state)
+
+        assert len(tryon.calls) == 2
+        assert tryon.calls[0]["input_photo"] == first_photo_path
+        assert tryon.calls[1]["input_photo"] == second_photo_path
+
+        stale_markup = callback_first.message.answer_photos[-1][2]
+        assert isinstance(stale_markup, InlineKeyboardMarkup)
+        assert len(stale_markup.inline_keyboard) == 1
+
+        current_markup = callback_second.message.answer_photos[-1][2]
+        assert isinstance(current_markup, InlineKeyboardMarkup)
+        assert len(current_markup.inline_keyboard) > 1
+
+    asyncio.run(scenario())
+
+
 def test_photo_during_generating_keeps_old_result_and_new_cycle(tmp_path: Path) -> None:
     async def scenario() -> None:
         models = [
@@ -1980,6 +2106,52 @@ def test_photo_during_generating_keeps_old_result_and_new_cycle(tmp_path: Path) 
         assert isinstance(current_markup, InlineKeyboardMarkup)
         assert len(current_markup.inline_keyboard) > 1
         assert len(tryon.calls) == 2
+
+    asyncio.run(scenario())
+
+
+def test_collage_click_after_send_new_photo_shows_alert(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        models = [
+            GlassModel(
+                unique_id="m1",
+                title="Model 1",
+                model_code="M1",
+                site_url="https://example.com/1",
+                img_user_url="https://example.com/1.jpg",
+                img_nano_url="https://example.com/1-nano.jpg",
+                gender="male",
+            )
+        ]
+        router, _, tryon, _, _ = build_router(tmp_path, models=models)
+        handler_photo = get_message_handler(router, "accept_photo")
+        handler_choose = get_callback_handler(router, "choose_model")
+        handler_new_photo = get_callback_handler(router, "request_new_photo")
+
+        bot = DummyBot()
+        state = DummyState()
+        await state.update_data(gender="male", first_generated_today=True)
+
+        message = DummyMessage(user_id=2121, bot=bot, message_id=300)
+        message.photo = [PhotoStub("p1")]  # type: ignore[attr-defined]
+        await handler_photo(message, state)
+
+        sessions = (await state.get_data()).get("collage_sessions", {})
+        collage_id = int(next(iter(sessions.keys())))
+
+        await state.set_state(TryOnStates.AWAITING_PHOTO.state)
+        await handler_new_photo(DummyCallback("send_new_photo", message), state)
+
+        assert (await state.get_data()).get("collage_sessions") == {}
+
+        callback = DummyCallback(
+            f"pick:src=batch2:{models[0].unique_id}",
+            DummyMessage(user_id=2121, bot=bot, message_id=collage_id),
+        )
+        await handler_choose(callback, state)
+
+        assert callback._answers[-1] == (msg.MODEL_UNAVAILABLE_ALERT, True)
+        assert len(tryon.calls) == 0
 
     asyncio.run(scenario())
 
