@@ -1418,6 +1418,7 @@ def setup_router(
                 "upload": photo_context.get("upload"),
                 "upload_file_id": photo_context.get("upload_file_id"),
                 "last_photo_file_id": photo_context.get("last_photo_file_id"),
+                "aliases": [str(message.message_id)],
             }
             await state.update_data(models_message_id=m.message_id, collage_sessions=sessions)
             return
@@ -1474,6 +1475,7 @@ def setup_router(
                 "upload": photo_context.get("upload"),
                 "upload_file_id": photo_context.get("upload_file_id"),
                 "last_photo_file_id": photo_context.get("last_photo_file_id"),
+                "aliases": [str(message.message_id)],
             }
             await state.update_data(models_message_id=sent.message_id, collage_sessions=sessions)
             await _delete_busy_messages(state, message.bot, message.chat.id)
@@ -1539,6 +1541,7 @@ def setup_router(
                 "upload": photo_context.get("upload"),
                 "upload_file_id": photo_context.get("upload_file_id"),
                 "last_photo_file_id": photo_context.get("last_photo_file_id"),
+                "aliases": [str(message.message_id)],
             }
             await state.update_data(models_message_id=last_sent.message_id, collage_sessions=sessions)
         await _delete_busy_messages(state, message.bot, message.chat.id)
@@ -1956,10 +1959,7 @@ def setup_router(
         )
         await callback.answer()
 
-    @router.callback_query(
-        StateFilter(TryOnStates.SHOW_RECS, TryOnStates.RESULT),
-        F.data.startswith("pick:"),
-    )
+    @router.callback_query(F.data.startswith("pick:"))
     async def choose_model(callback: CallbackQuery, state: FSMContext) -> None:
         """Launch generation using the model tied to the tapped collage, honoring its original cycle/photo context."""
         parts = callback.data.split(":", 2)
@@ -1969,17 +1969,65 @@ def setup_router(
             batch_source_key = "unknown"
             model_id = callback.data.replace("pick:", "", 1)
         data = await state.get_data()
-        # ???>???'?? ? ?????>??? (?>>/"??'?-?') ? ???:??'???? message_id
+        result_messages = dict(data.get("result_messages", {}))
+        used_message_ids = set(result_messages.keys())
+        message_id_str = str(callback.message.message_id)
+        pending_collage_ids = set(data.get("pending_collage_ids", []))
         models_msg_id = data.get("models_message_id")
         sessions = dict(data.get("collage_sessions", {}))
-        session_entry = sessions.get(str(callback.message.message_id))
-        current_cycle_value = await repository.get_current_cycle(callback.from_user.id)
+        user_id = callback.from_user.id if callback.from_user else None
+        info_domain(
+            "bot.handlers",
+            "🎯 choose_model: старт обработки клика по коллажу",
+            stage="CHOOSE_MODEL_START",
+            user_id=user_id,
+            message_id=callback.message.message_id,
+            callback_data=callback.data,
+            models_msg_id=models_msg_id,
+            has_session_entry=message_id_str in sessions,
+            collage_session_keys=list(sessions.keys()),
+            used_message_ids=list(used_message_ids),
+        )
+        if message_id_str in pending_collage_ids or message_id_str in used_message_ids:
+            info_domain(
+                "bot.handlers",
+                "♻️ choose_model: повторный клик по уже использованному коллажу",
+                stage="CHOOSE_MODEL_REPEATED_CLICK_IGNORED",
+                user_id=user_id,
+                message_id=callback.message.message_id,
+                reason="pending" if message_id_str in pending_collage_ids else "used",
+            )
+            await callback.answer()
+            return
+        session_key = message_id_str
+        session_entry = sessions.get(session_key)
+        if not session_entry:
+            for key, entry in sessions.items():
+                aliases = {str(alias) for alias in entry.get("aliases", [])}
+                if message_id_str in aliases:
+                    session_key = key
+                    session_entry = entry
+                    break
         if models_msg_id and models_msg_id == callback.message.message_id:
             try:
                 await callback.message.bot.delete_message(callback.message.chat.id, models_msg_id)
             except Exception:
                 pass
             await state.update_data(models_message_id=None)
+
+        if not session_entry and not (models_msg_id and callback.message.message_id == models_msg_id):
+            info_domain(
+                "bot.handlers",
+                "⚠️ choose_model: модель недоступна для этого коллажа",
+                stage="CHOOSE_MODEL_MODEL_UNAVAILABLE",
+                user_id=user_id,
+                message_id=callback.message.message_id,
+                callback_data=callback.data,
+                models_msg_id=models_msg_id,
+                has_session_entry=bool(session_entry),
+            )
+            await callback.answer(msg.MODEL_UNAVAILABLE_ALERT, show_alert=True)
+            return
 
         models_data: List[GlassModel] = []
         generation_cycle = None
@@ -1992,12 +2040,40 @@ def setup_router(
                 "upload_file_id": session_entry.get("upload_file_id"),
                 "last_photo_file_id": session_entry.get("last_photo_file_id"),
             }
-        else:
+        elif models_msg_id and callback.message.message_id == models_msg_id:
             models_data = list(data.get("current_models", []))
-            generation_cycle = data.get("current_cycle") or current_cycle_value
+            generation_cycle = data.get("current_cycle")
+            photo_context = {
+                "upload": data.get("upload"),
+                "upload_file_id": data.get("upload_file_id"),
+                "last_photo_file_id": data.get("last_photo_file_id"),
+            }
+        else:
+            info_domain(
+                "bot.handlers",
+                "⚠️ choose_model: модель недоступна для этого коллажа",
+                stage="CHOOSE_MODEL_MODEL_UNAVAILABLE",
+                user_id=user_id,
+                message_id=callback.message.message_id,
+                callback_data=callback.data,
+                models_msg_id=models_msg_id,
+                has_session_entry=bool(session_entry),
+            )
+            await callback.answer(msg.MODEL_UNAVAILABLE_ALERT, show_alert=True)
+            return
 
         selected = next((model for model in models_data if model.unique_id == model_id), None)
         if not selected:
+            info_domain(
+                "bot.handlers",
+                "⚠️ choose_model: модель недоступна для этого коллажа",
+                stage="CHOOSE_MODEL_MODEL_UNAVAILABLE",
+                user_id=user_id,
+                message_id=callback.message.message_id,
+                callback_data=callback.data,
+                models_msg_id=models_msg_id,
+                has_session_entry=bool(session_entry),
+            )
             await callback.answer(msg.MODEL_UNAVAILABLE_ALERT, show_alert=True)
             return
         logger.debug(
@@ -2027,9 +2103,6 @@ def setup_router(
             await callback.answer()
             return
         await callback.answer()
-        if session_entry:
-            sessions.pop(str(callback.message.message_id), None)
-            await state.update_data(collage_sessions=sessions)
         if generation_cycle is None:
             generation_cycle = await _ensure_current_cycle_id(state, callback.from_user.id)
         # Tie generation to the cycle captured for this collage; stale cycles run without locking the current FSM state.
@@ -2045,12 +2118,45 @@ def setup_router(
         if is_current_cycle:
             await state.update_data(is_generating=True)
             await state.set_state(TryOnStates.GENERATING)
-        await _perform_generation(
-            callback.message,
-            state,
-            selected,
+        pending_collage_ids.add(message_id_str)
+        await state.update_data(pending_collage_ids=list(pending_collage_ids))
+        info_domain(
+            "bot.handlers",
+            "🚀 choose_model: запускаем _perform_generation по коллажу",
+            stage="CHOOSE_MODEL_LAUNCH_GENERATION",
+            user_id=user_id,
+            message_id=callback.message.message_id,
+            model_id=model_id,
             generation_cycle=generation_cycle,
-            photo_context=photo_context,
+            session_key=session_key,
+            has_session_entry=bool(session_entry),
+        )
+        try:
+            await _perform_generation(
+                callback.message,
+                state,
+                selected,
+                generation_cycle=generation_cycle,
+                photo_context=photo_context,
+            )
+        finally:
+            data_after = await state.get_data()
+            pending_after = set(data_after.get("pending_collage_ids", []))
+            pending_after.discard(message_id_str)
+            await state.update_data(pending_collage_ids=list(pending_after))
+        sessions.pop(session_key, None)
+        await state.update_data(
+            collage_sessions=sessions,
+            models_message_id=None,
+        )
+        info_domain(
+            "bot.handlers",
+            "🧹 choose_model: очистили запись о коллаже из collage_sessions",
+            stage="CHOOSE_MODEL_COLLAGE_SESSION_CLEARED",
+            user_id=user_id,
+            message_id=callback.message.message_id,
+            cleared_session_key=session_key,
+            remaining_collage_keys=list(sessions.keys()),
         )
 
     @router.callback_query(
@@ -2156,6 +2262,15 @@ def setup_router(
         user_id = message.chat.id
         if generation_cycle is None:
             generation_cycle = await _ensure_current_cycle_id(state, user_id)
+        info_domain(
+            "bot.handlers",
+            "🎬 _perform_generation: старт генерации",
+            stage="GEN_START",
+            user_id=user_id,
+            generation_cycle=generation_cycle,
+            message_id=message.message_id,
+            model_id=model.unique_id,
+        )
 
         async def _update_if_current(**kwargs: Any) -> None:
             if await _is_cycle_current(state, generation_cycle):
@@ -2391,6 +2506,14 @@ def setup_router(
         remaining = await repository.remaining_tries(user_id)
         is_current_cycle = await _is_cycle_current(state, generation_cycle)
         await _delete_progress_message()
+        info_domain(
+            "bot.handlers",
+            "🔍 _perform_generation: статус цикла перед доставкой результата",
+            stage="GEN_CYCLE_STATUS",
+            user_id=user_id,
+            generation_cycle=generation_cycle,
+            is_current_cycle=is_current_cycle,
+        )
         if not is_current_cycle:
             # Deliver stale cycle in background: keep details button only.
             stale_caption = _compose_result_caption(model, "")
@@ -2398,6 +2521,14 @@ def setup_router(
                 model.site_url,
                 0,
                 show_more=False,
+            )
+            info_domain(
+                "bot.handlers",
+                "📦 _perform_generation: отправляем stale-результат",
+                stage="GEN_DELIVER_STALE",
+                user_id=user_id,
+                generation_cycle=generation_cycle,
+                model_id=model.unique_id,
             )
             await _send_delivery_message(
                 message,
@@ -2449,6 +2580,14 @@ def setup_router(
             show_more=result_has_more,
         )
         await _deactivate_previous_more_button(message.bot, user_id)
+        info_domain(
+            "bot.handlers",
+            "📦 _perform_generation: отправляем актуальный результат",
+            stage="GEN_DELIVER_CURRENT",
+            user_id=user_id,
+            generation_cycle=generation_cycle,
+            model_id=model.unique_id,
+        )
         result_message = await _send_delivery_message(
             message,
             state,
@@ -2473,6 +2612,16 @@ def setup_router(
         })
         # === /SAVE last_card_message ===
 
+        info_domain(
+            "bot.handlers",
+            "📝 _perform_generation: регистрируем результат и alias по source_message_id",
+            stage="GEN_REGISTER_RESULT",
+            user_id=user_id,
+            generation_cycle=generation_cycle,
+            source_message_id=message.message_id,
+            result_message_id=result_message.message_id,
+            has_more=result_has_more,
+        )
         await _register_result_message(
             state,
             result_message,
