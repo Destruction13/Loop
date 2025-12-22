@@ -172,6 +172,15 @@ def setup_router(
     idle_delay = max(int(idle_nudge_seconds), 0)
     idle_enabled = enable_idle_nudge and idle_delay > 0
     idle_tasks: dict[int, asyncio.Task] = {}
+    collage_locks: dict[int, asyncio.Lock] = {}
+    deleted_collage_ids_limit = 200
+
+    def _get_collage_lock(user_id: int) -> asyncio.Lock:
+        lock = collage_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            collage_locks[user_id] = lock
+        return lock
 
     policy_url = (privacy_policy_url or "").strip()
     policy_button_url = (
@@ -1547,6 +1556,297 @@ def setup_router(
         await _delete_busy_messages(state, message.bot, message.chat.id)
 
 
+    async def _disable_inline_keyboard(
+        message: Message | None,
+        *,
+        reason: str,
+        user_id: int | None = None,
+        session_key: str | None = None,
+        fsm_state: str | None = None,
+        allow_delete: bool = True,
+    ) -> None:
+        if message is None:
+            return
+        message_id = message.message_id
+        edit_exc: Exception | None = None
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+            info_domain(
+                "bot.handlers",
+                "inline keyboard cleared",
+                stage="INLINE_KEYBOARD_CLEARED",
+                user_id=user_id,
+                message_id=message_id,
+                session_key=session_key,
+                reason=reason,
+                fsm_state=fsm_state,
+            )
+            return
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                info_domain(
+                    "bot.handlers",
+                    "inline keyboard already clear",
+                    stage="INLINE_KEYBOARD_ALREADY_CLEAR",
+                    user_id=user_id,
+                    message_id=message_id,
+                    session_key=session_key,
+                    reason=reason,
+                    fsm_state=fsm_state,
+                )
+                return
+            edit_exc = exc
+        except TelegramForbiddenError as exc:
+            edit_exc = exc
+        except Exception as exc:  # noqa: BLE001
+            edit_exc = exc
+        if not allow_delete:
+            info_domain(
+                "bot.handlers",
+                "inline keyboard clear failed",
+                stage="INLINE_KEYBOARD_CLEAR_FAILED",
+                user_id=user_id,
+                message_id=message_id,
+                session_key=session_key,
+                reason=reason,
+                fsm_state=fsm_state,
+                error=str(edit_exc),
+            )
+            return
+        try:
+            await message.delete()
+            info_domain(
+                "bot.handlers",
+                "inline keyboard deleted",
+                stage="INLINE_KEYBOARD_DELETED",
+                user_id=user_id,
+                message_id=message_id,
+                session_key=session_key,
+                reason=reason,
+                fsm_state=fsm_state,
+            )
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            info_domain(
+                "bot.handlers",
+                "inline keyboard clear failed",
+                stage="INLINE_KEYBOARD_CLEAR_FAILED",
+                user_id=user_id,
+                message_id=message_id,
+                session_key=session_key,
+                reason=reason,
+                fsm_state=fsm_state,
+                error=str(exc),
+            )
+
+
+    def _append_recent_id(ids: list[str], new_id: str) -> list[str]:
+        if new_id in ids:
+            ids = [item for item in ids if item != new_id]
+        ids.append(new_id)
+        if len(ids) > deleted_collage_ids_limit:
+            ids = ids[-deleted_collage_ids_limit:]
+        return ids
+
+
+    async def _remember_deleted_collage_id(
+        state: FSMContext, lock: asyncio.Lock | None, message_id_str: str
+    ) -> None:
+        if lock is None:
+            data = await state.get_data()
+            existing = [str(item) for item in data.get("deleted_collage_ids", [])]
+            updated = _append_recent_id(existing, message_id_str)
+            await state.update_data(deleted_collage_ids=updated)
+            return
+        async with lock:
+            data = await state.get_data()
+            existing = [str(item) for item in data.get("deleted_collage_ids", [])]
+            updated = _append_recent_id(existing, message_id_str)
+            await state.update_data(deleted_collage_ids=updated)
+
+
+    async def _remove_collage_message(
+        *,
+        bot: Bot,
+        chat_id: int,
+        message_id: int,
+        state: FSMContext | None,
+        lock: asyncio.Lock | None,
+        user_id: int | None,
+        session_key: str | None,
+        reason: str,
+        fsm_state: str | None,
+    ) -> None:
+        message_id_str = str(message_id)
+        if state is not None:
+            if lock is None:
+                data = await state.get_data()
+            else:
+                async with lock:
+                    data = await state.get_data()
+            deleted_ids = {str(item) for item in data.get("deleted_collage_ids", [])}
+            if message_id_str in deleted_ids:
+                info_domain(
+                    "bot.handlers",
+                    "collage delete skipped: already deleted",
+                    stage="COLLAGE_DELETE_SKIPPED_ALREADY_DELETED",
+                    user_id=user_id,
+                    message_id=message_id,
+                    session_key=session_key,
+                    reason=reason,
+                    fsm_state=fsm_state,
+                )
+                return
+        info_domain(
+            "bot.handlers",
+            "collage delete attempt",
+            stage="COLLAGE_DELETE_ATTEMPT",
+            user_id=user_id,
+            message_id=message_id,
+            session_key=session_key,
+            reason=reason,
+            fsm_state=fsm_state,
+        )
+        try:
+            await bot.delete_message(chat_id, message_id)
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            exc_text = str(exc).lower()
+            not_found = "message to delete not found" in exc_text
+            cannot_delete = "message can't be deleted" in exc_text or "message cannot be deleted" in exc_text
+            if not_found:
+                info_domain(
+                    "bot.handlers",
+                    "collage delete not found",
+                    stage="COLLAGE_DELETE_NOT_FOUND",
+                    user_id=user_id,
+                    message_id=message_id,
+                    session_key=session_key,
+                    reason=reason,
+                    fsm_state=fsm_state,
+                    error=str(exc),
+                )
+                if state is not None:
+                    await _remember_deleted_collage_id(state, lock, message_id_str)
+                return
+            if cannot_delete:
+                info_domain(
+                    "bot.handlers",
+                    "collage delete not found",
+                    stage="COLLAGE_DELETE_NOT_FOUND",
+                    user_id=user_id,
+                    message_id=message_id,
+                    session_key=session_key,
+                    reason=reason,
+                    fsm_state=fsm_state,
+                    error=str(exc),
+                )
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id, message_id=message_id, reply_markup=None
+                )
+            except TelegramBadRequest as edit_exc:
+                if "message is not modified" in str(edit_exc).lower():
+                    info_domain(
+                        "bot.handlers",
+                        "collage delete fallback edit ok",
+                        stage="COLLAGE_DELETE_FALLBACK_EDIT_OK",
+                        user_id=user_id,
+                        message_id=message_id,
+                        session_key=session_key,
+                        reason=reason,
+                        fsm_state=fsm_state,
+                    )
+                else:
+                    info_domain(
+                        "bot.handlers",
+                        "collage delete fallback edit failed",
+                        stage="COLLAGE_DELETE_FALLBACK_EDIT_FAILED",
+                        user_id=user_id,
+                        message_id=message_id,
+                        session_key=session_key,
+                        reason=reason,
+                        fsm_state=fsm_state,
+                        error=str(edit_exc),
+                    )
+            else:
+                info_domain(
+                    "bot.handlers",
+                    "collage delete fallback edit ok",
+                    stage="COLLAGE_DELETE_FALLBACK_EDIT_OK",
+                    user_id=user_id,
+                    message_id=message_id,
+                    session_key=session_key,
+                    reason=reason,
+                    fsm_state=fsm_state,
+                )
+            if cannot_delete and state is not None:
+                await _remember_deleted_collage_id(state, lock, message_id_str)
+            return
+        except Exception as exc:  # noqa: BLE001
+            info_domain(
+                "bot.handlers",
+                "collage delete failed",
+                stage="COLLAGE_DELETE_FAILED",
+                user_id=user_id,
+                message_id=message_id,
+                session_key=session_key,
+                reason=reason,
+                fsm_state=fsm_state,
+                error=str(exc),
+            )
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id, message_id=message_id, reply_markup=None
+                )
+            except TelegramBadRequest as edit_exc:
+                if "message is not modified" in str(edit_exc).lower():
+                    info_domain(
+                        "bot.handlers",
+                        "collage delete fallback edit ok",
+                        stage="COLLAGE_DELETE_FALLBACK_EDIT_OK",
+                        user_id=user_id,
+                        message_id=message_id,
+                        session_key=session_key,
+                        reason=reason,
+                        fsm_state=fsm_state,
+                    )
+                    return
+                info_domain(
+                    "bot.handlers",
+                    "collage delete fallback edit failed",
+                    stage="COLLAGE_DELETE_FALLBACK_EDIT_FAILED",
+                    user_id=user_id,
+                    message_id=message_id,
+                    session_key=session_key,
+                    reason=reason,
+                    fsm_state=fsm_state,
+                    error=str(edit_exc),
+                )
+                return
+            info_domain(
+                "bot.handlers",
+                "collage delete fallback edit ok",
+                stage="COLLAGE_DELETE_FALLBACK_EDIT_OK",
+                user_id=user_id,
+                message_id=message_id,
+                session_key=session_key,
+                reason=reason,
+                fsm_state=fsm_state,
+            )
+            return
+        info_domain(
+            "bot.handlers",
+            "collage delete ok",
+            stage="COLLAGE_DELETE_OK",
+            user_id=user_id,
+            message_id=message_id,
+            session_key=session_key,
+            reason=reason,
+            fsm_state=fsm_state,
+        )
+        if state is not None:
+            await _remember_deleted_collage_id(state, lock, message_id_str)
+
+
     async def _delete_state_message(message: Message, state: FSMContext, key: str) -> None:
         data = await state.get_data()
         message_id = data.get(key)
@@ -1775,8 +2075,12 @@ def setup_router(
     async def start_info(callback: CallbackQuery) -> None:
         await callback.answer(msg.START_MAGIC_INFO, show_alert=True)
 
-    @router.callback_query(StateFilter(TryOnStates.FOR_WHO))
+    @router.callback_query(StateFilter(TryOnStates.FOR_WHO), F.data.startswith("gender_"))
     async def select_gender(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.data or not callback.data.startswith("gender_"):
+            await callback.answer()
+            return
+        fsm_state = await state.get_state()
         gender = callback.data.replace("gender_", "")
         await repository.update_filters(callback.from_user.id, gender=gender)
         await state.update_data(
@@ -1786,6 +2090,13 @@ def setup_router(
         )
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await track_event(str(callback.from_user.id), "gender_selected", value=gender)
+        await _disable_inline_keyboard(
+            callback.message,
+            reason="gender_selected",
+            user_id=callback.from_user.id,
+            fsm_state=fsm_state,
+            allow_delete=False,
+        )
         await _delete_state_message(callback.message, state, "gender_prompt_message_id")
         await _send_aux_message(
             callback.message,
@@ -1968,37 +2279,36 @@ def setup_router(
         else:  # fallback for legacy format
             batch_source_key = "unknown"
             model_id = callback.data.replace("pick:", "", 1)
-        data = await state.get_data()
-        result_messages = dict(data.get("result_messages", {}))
-        used_message_ids = set(result_messages.keys())
-        message_id_str = str(callback.message.message_id)
-        pending_collage_ids = set(data.get("pending_collage_ids", []))
-        models_msg_id = data.get("models_message_id")
-        sessions = dict(data.get("collage_sessions", {}))
-        user_id = callback.from_user.id if callback.from_user else None
-        info_domain(
-            "bot.handlers",
-            "🎯 choose_model: старт обработки клика по коллажу",
-            stage="CHOOSE_MODEL_START",
-            user_id=user_id,
-            message_id=callback.message.message_id,
-            callback_data=callback.data,
-            models_msg_id=models_msg_id,
-            has_session_entry=message_id_str in sessions,
-            collage_session_keys=list(sessions.keys()),
-            used_message_ids=list(used_message_ids),
-        )
-        if message_id_str in pending_collage_ids or message_id_str in used_message_ids:
-            info_domain(
-                "bot.handlers",
-                "♻️ choose_model: повторный клик по уже использованному коллажу",
-                stage="CHOOSE_MODEL_REPEATED_CLICK_IGNORED",
-                user_id=user_id,
-                message_id=callback.message.message_id,
-                reason="pending" if message_id_str in pending_collage_ids else "used",
-            )
+        message = callback.message
+        if message is None:
             await callback.answer()
             return
+        message_id_str = str(message.message_id)
+        user_id = callback.from_user.id if callback.from_user else message.chat.id
+        collage_lock = _get_collage_lock(user_id)
+        claimed = False
+        repeat_reason = None
+        data: dict[str, Any] = {}
+        used_message_ids: set[str] = set()
+        pending_collage_ids: set[str] = set()
+        fsm_state = None
+        async with collage_lock:
+            data = await state.get_data()
+            fsm_state = await state.get_state()
+            result_messages = dict(data.get("result_messages", {}))
+            used_message_ids = {str(key) for key in data.get("used_message_ids", [])}
+            used_message_ids.update(result_messages.keys())
+            pending_collage_ids = {str(key) for key in data.get("pending_collage_ids", [])}
+            if message_id_str in pending_collage_ids:
+                repeat_reason = "pending"
+            elif message_id_str in used_message_ids:
+                repeat_reason = "used"
+            else:
+                pending_collage_ids.add(message_id_str)
+                await state.update_data(pending_collage_ids=list(pending_collage_ids))
+                claimed = True
+        models_msg_id = data.get("models_message_id")
+        sessions = dict(data.get("collage_sessions", {}))
         session_key = message_id_str
         session_entry = sessions.get(session_key)
         if not session_entry:
@@ -2008,156 +2318,246 @@ def setup_router(
                     session_key = key
                     session_entry = entry
                     break
-        if models_msg_id and models_msg_id == callback.message.message_id:
-            try:
-                await callback.message.bot.delete_message(callback.message.chat.id, models_msg_id)
-            except Exception:
-                pass
-            await state.update_data(models_message_id=None)
-
-        if not session_entry and not (models_msg_id and callback.message.message_id == models_msg_id):
-            info_domain(
-                "bot.handlers",
-                "⚠️ choose_model: модель недоступна для этого коллажа",
-                stage="CHOOSE_MODEL_MODEL_UNAVAILABLE",
-                user_id=user_id,
-                message_id=callback.message.message_id,
-                callback_data=callback.data,
-                models_msg_id=models_msg_id,
-                has_session_entry=bool(session_entry),
-            )
-            await callback.answer(msg.MODEL_UNAVAILABLE_ALERT, show_alert=True)
-            return
-
-        models_data: List[GlassModel] = []
-        generation_cycle = None
-        photo_context: dict[str, Any] | None = None
-        if session_entry:
-            models_data = list(session_entry.get("models", []))
-            generation_cycle = session_entry.get("cycle")
-            photo_context = {
-                "upload": session_entry.get("upload"),
-                "upload_file_id": session_entry.get("upload_file_id"),
-                "last_photo_file_id": session_entry.get("last_photo_file_id"),
-            }
-        elif models_msg_id and callback.message.message_id == models_msg_id:
-            models_data = list(data.get("current_models", []))
-            generation_cycle = data.get("current_cycle")
-            photo_context = {
-                "upload": data.get("upload"),
-                "upload_file_id": data.get("upload_file_id"),
-                "last_photo_file_id": data.get("last_photo_file_id"),
-            }
-        else:
-            info_domain(
-                "bot.handlers",
-                "⚠️ choose_model: модель недоступна для этого коллажа",
-                stage="CHOOSE_MODEL_MODEL_UNAVAILABLE",
-                user_id=user_id,
-                message_id=callback.message.message_id,
-                callback_data=callback.data,
-                models_msg_id=models_msg_id,
-                has_session_entry=bool(session_entry),
-            )
-            await callback.answer(msg.MODEL_UNAVAILABLE_ALERT, show_alert=True)
-            return
-
-        selected = next((model for model in models_data if model.unique_id == model_id), None)
-        if not selected:
-            info_domain(
-                "bot.handlers",
-                "⚠️ choose_model: модель недоступна для этого коллажа",
-                stage="CHOOSE_MODEL_MODEL_UNAVAILABLE",
-                user_id=user_id,
-                message_id=callback.message.message_id,
-                callback_data=callback.data,
-                models_msg_id=models_msg_id,
-                has_session_entry=bool(session_entry),
-            )
-            await callback.answer(msg.MODEL_UNAVAILABLE_ALERT, show_alert=True)
-            return
-        logger.debug(
-            "User %s selected model %s from %s",
-            callback.from_user.id,
-            model_id,
-            batch_source_key,
+        info_domain(
+            "bot.handlers",
+            "choose_model: callback received",
+            stage="CHOOSE_MODEL_START",
+            user_id=user_id,
+            message_id=message.message_id,
+            callback_data=callback.data,
+            models_msg_id=models_msg_id,
+            session_key=session_key,
+            has_session_entry=bool(session_entry),
+            collage_session_keys=list(sessions.keys()),
+            used_message_ids=list(used_message_ids),
+            pending_collage_ids=list(pending_collage_ids),
+            fsm_state=fsm_state,
         )
-        remaining = await repository.remaining_tries(callback.from_user.id)
-        if remaining <= 0:
-            await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
-            await track_event(str(callback.from_user.id), "daily_limit_hit")
-            await _send_aux_message(
-                callback.message,
-                state,
-                callback.message.answer,
-                _render_text(msg.DAILY_LIMIT_MESSAGE),
-                reply_markup=limit_reached_keyboard(site_url),
-            )
+        if repeat_reason:
             info_domain(
                 "bot.handlers",
-                "daily_limit_after_pick",
-                stage="DAILY_LIMIT",
-                user_id=callback.from_user.id,
-                context="model_pick",
+                "choose_model: repeated click ignored",
+                stage="CHOOSE_MODEL_REPEATED_CLICK_IGNORED",
+                user_id=user_id,
+                message_id=message.message_id,
+                session_key=session_key,
+                reason=repeat_reason,
+                fsm_state=fsm_state,
+            )
+            await _remove_collage_message(
+                bot=message.bot,
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                user_id=user_id,
+                session_key=session_key,
+                reason=f"repeat_{repeat_reason}",
+                fsm_state=fsm_state,
+                state=state,
+                lock=collage_lock,
             )
             await callback.answer()
             return
-        await callback.answer()
-        if generation_cycle is None:
-            generation_cycle = await _ensure_current_cycle_id(state, callback.from_user.id)
-        # Tie generation to the cycle captured for this collage; stale cycles run without locking the current FSM state.
-        is_current_cycle = await _is_cycle_current(state, generation_cycle)
-        updates: dict[str, Any] = {}
-        if is_current_cycle:
-            updates["selected_model"] = selected
-            if data.get("allow_more_button_next"):
-                updates["suppress_more_button"] = False
-                updates["allow_more_button_next"] = False
-        if updates:
-            await state.update_data(**updates)
-        if is_current_cycle:
-            await state.update_data(is_generating=True)
-            await state.set_state(TryOnStates.GENERATING)
-        pending_collage_ids.add(message_id_str)
-        await state.update_data(pending_collage_ids=list(pending_collage_ids))
         info_domain(
             "bot.handlers",
-            "🚀 choose_model: запускаем _perform_generation по коллажу",
-            stage="CHOOSE_MODEL_LAUNCH_GENERATION",
+            "choose_model: collage claimed",
+            stage="CHOOSE_MODEL_CLAIMED",
             user_id=user_id,
-            message_id=callback.message.message_id,
-            model_id=model_id,
-            generation_cycle=generation_cycle,
+            message_id=message.message_id,
             session_key=session_key,
-            has_session_entry=bool(session_entry),
+            fsm_state=fsm_state,
         )
+        await _remove_collage_message(
+            bot=message.bot,
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            user_id=user_id,
+            session_key=session_key,
+            reason="claimed",
+            fsm_state=fsm_state,
+            state=state,
+            lock=collage_lock,
+        )
+        sessions_after: dict[str, Any] = {}
+        final_state = None
         try:
+            if models_msg_id and models_msg_id == message.message_id:
+                try:
+                    await message.bot.delete_message(message.chat.id, models_msg_id)
+                except Exception:
+                    pass
+                await state.update_data(models_message_id=None)
+
+            if not session_entry and not (models_msg_id and message.message_id == models_msg_id):
+                info_domain(
+                    "bot.handlers",
+                    "choose_model: model unavailable",
+                    stage="CHOOSE_MODEL_MODEL_UNAVAILABLE",
+                    user_id=user_id,
+                    message_id=message.message_id,
+                    callback_data=callback.data,
+                    models_msg_id=models_msg_id,
+                    has_session_entry=bool(session_entry),
+                )
+                await callback.answer(msg.MODEL_UNAVAILABLE_ALERT, show_alert=True)
+                return
+
+            models_data: List[GlassModel] = []
+            generation_cycle = None
+            photo_context: dict[str, Any] | None = None
+            if session_entry:
+                models_data = list(session_entry.get("models", []))
+                generation_cycle = session_entry.get("cycle")
+                photo_context = {
+                    "upload": session_entry.get("upload"),
+                    "upload_file_id": session_entry.get("upload_file_id"),
+                    "last_photo_file_id": session_entry.get("last_photo_file_id"),
+                }
+            elif models_msg_id and message.message_id == models_msg_id:
+                models_data = list(data.get("current_models", []))
+                generation_cycle = data.get("current_cycle")
+                photo_context = {
+                    "upload": data.get("upload"),
+                    "upload_file_id": data.get("upload_file_id"),
+                    "last_photo_file_id": data.get("last_photo_file_id"),
+                }
+            else:
+                info_domain(
+                    "bot.handlers",
+                    "choose_model: model unavailable",
+                    stage="CHOOSE_MODEL_MODEL_UNAVAILABLE",
+                    user_id=user_id,
+                    message_id=message.message_id,
+                    callback_data=callback.data,
+                    models_msg_id=models_msg_id,
+                    has_session_entry=bool(session_entry),
+                )
+                await callback.answer(msg.MODEL_UNAVAILABLE_ALERT, show_alert=True)
+                return
+
+            selected = next((model for model in models_data if model.unique_id == model_id), None)
+            if not selected:
+                info_domain(
+                    "bot.handlers",
+                    "choose_model: model unavailable",
+                    stage="CHOOSE_MODEL_MODEL_UNAVAILABLE",
+                    user_id=user_id,
+                    message_id=message.message_id,
+                    callback_data=callback.data,
+                    models_msg_id=models_msg_id,
+                    has_session_entry=bool(session_entry),
+                )
+                await callback.answer(msg.MODEL_UNAVAILABLE_ALERT, show_alert=True)
+                return
+            logger.debug(
+                "User %s selected model %s from %s",
+                user_id,
+                model_id,
+                batch_source_key,
+            )
+            remaining = await repository.remaining_tries(user_id)
+            if remaining <= 0:
+                await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
+                await track_event(str(user_id), "daily_limit_hit")
+                await _send_aux_message(
+                    message,
+                    state,
+                    message.answer,
+                    _render_text(msg.DAILY_LIMIT_MESSAGE),
+                    reply_markup=limit_reached_keyboard(site_url),
+                )
+                info_domain(
+                    "bot.handlers",
+                    "daily_limit_after_pick",
+                    stage="DAILY_LIMIT",
+                    user_id=user_id,
+                    context="model_pick",
+                )
+                await callback.answer()
+                return
+            await callback.answer()
+            if generation_cycle is None:
+                generation_cycle = await _ensure_current_cycle_id(state, user_id)
+            # Tie generation to the cycle captured for this collage; stale cycles run without locking the current FSM state.
+            is_current_cycle = await _is_cycle_current(state, generation_cycle)
+            updates: dict[str, Any] = {}
+            if is_current_cycle:
+                updates["selected_model"] = selected
+                if data.get("allow_more_button_next"):
+                    updates["suppress_more_button"] = False
+                    updates["allow_more_button_next"] = False
+            if updates:
+                await state.update_data(**updates)
+            if is_current_cycle:
+                await state.update_data(is_generating=True)
+                await state.set_state(TryOnStates.GENERATING)
+            info_domain(
+                "bot.handlers",
+                "choose_model: launch generation",
+                stage="CHOOSE_MODEL_LAUNCH_GENERATION",
+                user_id=user_id,
+                message_id=message.message_id,
+                model_id=model_id,
+                generation_cycle=generation_cycle,
+                session_key=session_key,
+                has_session_entry=bool(session_entry),
+            )
             await _perform_generation(
-                callback.message,
+                message,
                 state,
                 selected,
                 generation_cycle=generation_cycle,
                 photo_context=photo_context,
             )
         finally:
-            data_after = await state.get_data()
-            pending_after = set(data_after.get("pending_collage_ids", []))
-            pending_after.discard(message_id_str)
-            await state.update_data(pending_collage_ids=list(pending_after))
-        sessions.pop(session_key, None)
-        await state.update_data(
-            collage_sessions=sessions,
-            models_message_id=None,
-        )
-        info_domain(
-            "bot.handlers",
-            "🧹 choose_model: очистили запись о коллаже из collage_sessions",
-            stage="CHOOSE_MODEL_COLLAGE_SESSION_CLEARED",
-            user_id=user_id,
-            message_id=callback.message.message_id,
-            cleared_session_key=session_key,
-            remaining_collage_keys=list(sessions.keys()),
-        )
+            if claimed:
+                async with collage_lock:
+                    data_after = await state.get_data()
+                    final_state = await state.get_state()
+                    pending_after = {str(key) for key in data_after.get("pending_collage_ids", [])}
+                    pending_after.discard(message_id_str)
+                    used_after = {str(key) for key in data_after.get("used_message_ids", [])}
+                    used_after.add(message_id_str)
+                    sessions_after = dict(data_after.get("collage_sessions", {}))
+                    sessions_after.pop(session_key, None)
+                    await state.update_data(
+                        pending_collage_ids=list(pending_after),
+                        used_message_ids=list(used_after),
+                        collage_sessions=sessions_after,
+                        models_message_id=None,
+                    )
+                    info_domain(
+                        "bot.handlers",
+                        "choose_model: pending/used updated",
+                        stage="CHOOSE_MODEL_PENDING_USED_UPDATED",
+                        user_id=user_id,
+                        message_id=message.message_id,
+                        session_key=session_key,
+                        fsm_state=final_state,
+                        pending_count=len(pending_after),
+                        used_count=len(used_after),
+                    )
+                await _remove_collage_message(
+                    bot=message.bot,
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    user_id=user_id,
+                    session_key=session_key,
+                    reason="finalize",
+                    fsm_state=final_state,
+                    state=state,
+                    lock=collage_lock,
+                )
+                info_domain(
+                    "bot.handlers",
+                    "choose_model: collage session cleared",
+                    stage="CHOOSE_MODEL_COLLAGE_SESSION_CLEARED",
+                    user_id=user_id,
+                    message_id=message.message_id,
+                    cleared_session_key=session_key,
+                    remaining_collage_keys=list(sessions_after.keys()),
+                    fsm_state=final_state,
+                )
+
 
     @router.callback_query(
         StateFilter(ContactRequest.waiting_for_phone),
