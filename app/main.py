@@ -33,6 +33,7 @@ from app.texts import messages as msg
 from app.utils.paths import ensure_dir
 from app.recommender import StyleRecommender
 from app.infrastructure.logging_middleware import LoggingMiddleware
+from app.infrastructure.identity_middleware import UserIdentityMiddleware
 from logger import get_logger, info_domain, log_event, setup_logging
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -127,12 +128,13 @@ async def main() -> None:
         ]
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-    dp = Dispatcher()
-    dp.update.middleware(LoggingMiddleware())
-
     repository_path = (PROJECT_ROOT / "loop.db").resolve()
     repository = Repository(repository_path, config.daily_try_limit)
     await repository.init()
+
+    dp = Dispatcher()
+    dp.update.middleware(LoggingMiddleware())
+    dp.update.middleware(UserIdentityMiddleware(repository))
 
     await analytics_init(repository_path)
 
@@ -193,6 +195,7 @@ async def main() -> None:
         selection_button_title_max=config.button_title_max,
         show_model_style_tag=config.show_model_style_tag,
         site_url=str(config.site_url),
+        admin_webapp_url=config.admin_webapp_url,
         promo_code=config.promo_code,
         no_more_message_key=config.reco_no_more_key,
         clear_on_catalog_change=config.reco_clear_on_catalog_change,

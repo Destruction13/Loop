@@ -10,6 +10,7 @@ from typing import Optional, Sequence
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
+from app.analytics import track_event
 from app.keyboards import more_buttonless_markup, social_ad_keyboard
 from app.services.repository import Repository
 from app.texts import messages as msg
@@ -104,6 +105,10 @@ class SocialAdService:
         finally:
             await self._repository.mark_social_ad_shown(user_id)
             if message is not None:
+                try:
+                    await track_event(str(user_id), "social_ad_shown")
+                except Exception:  # pragma: no cover - analytics not initialized
+                    self._logger.debug("Analytics not available for social_ad_shown")
                 await self._repository.set_last_more_message(
                     user_id,
                     message.message_id,

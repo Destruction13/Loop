@@ -645,6 +645,7 @@ def build_router(
         selection_button_title_max=28,
         show_model_style_tag=False,
         site_url="https://example.com",
+        admin_webapp_url=None,
         promo_code="PROMO",
         no_more_message_key="all_seen",
         clear_on_catalog_change=False,

@@ -26,10 +26,12 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
     ReplyKeyboardRemove,
+    WebAppInfo,
 )
 from aiogram.types.input_file import BufferedInputFile, FSInputFile, URLInputFile
 
 from app.analytics import track_event
+from app.admin.security import is_admin
 from app.keyboards import (
     CONTACT_NEVER_CALLBACK,
     CONTACT_SHARE_CALLBACK,
@@ -154,6 +156,7 @@ def setup_router(
     selection_button_title_max: int,
     show_model_style_tag: bool,
     site_url: str,
+    admin_webapp_url: str | None,
     promo_code: str,
     no_more_message_key: str,
     clear_on_catalog_change: bool,
@@ -3660,6 +3663,27 @@ def setup_router(
 
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await _deliver_instruction()
+
+    @router.message(Command("admin"))
+    async def command_admin(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        if not is_admin(user_id):
+            return
+        url = (admin_webapp_url or "").strip()
+        if not url:
+            await message.answer("Admin panel is not configured.")
+            return
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Open admin",
+                        web_app=WebAppInfo(url=url),
+                    )
+                ]
+            ]
+        )
+        await message.answer("Open admin panel.", reply_markup=markup)
 
     @router.message(Command("help"))
     async def command_help(message: Message, state: FSMContext) -> None:
