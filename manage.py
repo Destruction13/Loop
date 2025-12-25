@@ -64,6 +64,13 @@ def _command_run() -> int:
     return 0
 
 
+def _command_admin_api() -> int:
+    from app.admin.api import main as admin_main  # Local import to avoid heavy deps for other cmds
+
+    admin_main()
+    return 0
+
+
 def _command_check() -> int:
     _load_env()
 
@@ -414,6 +421,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     run_parser = subparsers.add_parser("run", help="Запустить бота")
     run_parser.set_defaults(func=lambda _args: _command_run())
+
+    admin_parser = subparsers.add_parser("admin-api", help="Run admin Mini App API server")
+    admin_parser.set_defaults(func=lambda _args: _command_admin_api())
 
     check_parser = subparsers.add_parser("check", help="Выполнить самопроверку окружения")
     check_parser.set_defaults(func=lambda _args: _command_check())

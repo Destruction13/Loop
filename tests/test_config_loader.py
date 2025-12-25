@@ -22,6 +22,8 @@ def test_load_config_reads_allowed_env(tmp_path, monkeypatch) -> None:
                 "K_4=   ",
                 "K_3=third-secret",
                 "GOOGLE_SERVICE_ACCOUNT_JSON=custom_creds.json",
+                "ADMIN_WEBAPP_URL=https://admin.example.pages.dev",
+                "ADMIN_API_BASE_URL=https://api.example.com",
             ]
         ),
         encoding="utf-8",
@@ -38,6 +40,8 @@ def test_load_config_reads_allowed_env(tmp_path, monkeypatch) -> None:
         "PICK_SCHEME",
         "GOOGLE_SHEET_URL",
         "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "ADMIN_WEBAPP_URL",
+        "ADMIN_API_BASE_URL",
         "K_1",
         "K_2",
         "K_3",
@@ -65,6 +69,8 @@ def test_load_config_reads_allowed_env(tmp_path, monkeypatch) -> None:
         config.contacts_sheet_url
         == "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890/edit?gid=42"
     )
+    assert config.admin_webapp_url == "https://admin.example.pages.dev"
+    assert config.admin_api_base_url == "https://api.example.com"
 
     # Fixed defaults remain unchanged
     assert config.reminder_hours == 24
@@ -108,6 +114,8 @@ def test_load_config_defaults_without_optional_env(tmp_path, monkeypatch) -> Non
         "PICK_SCHEME",
         "GOOGLE_SHEET_URL",
         "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "ADMIN_WEBAPP_URL",
+        "ADMIN_API_BASE_URL",
         "K_1",
         "K_2",
         "K_3",
@@ -137,3 +145,5 @@ def test_load_config_defaults_without_optional_env(tmp_path, monkeypatch) -> Non
     assert config.nanobanana_key_slots == (
         NanoBananaKeySlot(name="K_1", api_key="hidden"),
     )
+    assert config.admin_webapp_url is None
+    assert config.admin_api_base_url is None

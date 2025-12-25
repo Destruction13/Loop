@@ -140,6 +140,8 @@ class Config:
     analytics_dashboard_sheet_name: str
     analytics_flush_interval_sec: int
     analytics_spreadsheet_id: str | None
+    admin_webapp_url: str | None
+    admin_api_base_url: str | None
 
 
 def _require_env(name: str) -> str:
@@ -166,6 +168,16 @@ def _optional_env(name: str, default: Optional[str] = None) -> Optional[str]:
 
 def _require_url(name: str) -> str:
     value = _require_env(name)
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(f"{name} must be a valid HTTP(S) URL")
+    return value
+
+
+def _optional_url(name: str) -> Optional[str]:
+    value = _optional_env(name)
+    if value is None:
+        return None
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise RuntimeError(f"{name} must be a valid HTTP(S) URL")
@@ -302,6 +314,8 @@ def load_config(env_file: str | None = None) -> Config:
         "ANALYTICS_FLUSH_INTERVAL_SEC", 30, minimum=5
     )
     analytics_spreadsheet_id = (_optional_env("LOG_SHEET_ID") or "").strip() or None
+    admin_webapp_url = _optional_url("ADMIN_WEBAPP_URL")
+    admin_api_base_url = _optional_url("ADMIN_API_BASE_URL")
 
     return Config(
         bot_token=bot_token,
@@ -356,6 +370,8 @@ def load_config(env_file: str | None = None) -> Config:
         analytics_dashboard_sheet_name=analytics_dashboard_sheet_name,
         analytics_flush_interval_sec=analytics_flush_interval_sec,
         analytics_spreadsheet_id=analytics_spreadsheet_id,
+        admin_webapp_url=admin_webapp_url,
+        admin_api_base_url=admin_api_base_url,
     )
 
 

@@ -410,6 +410,24 @@ class Repository:
         profile.referrer_id = referrer_id
         await asyncio.to_thread(self._upsert_user, profile)
 
+    async def upsert_user_identity(
+        self,
+        user_id: int,
+        *,
+        username: str | None,
+        first_name: str | None,
+        last_name: str | None,
+        full_name: str | None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._upsert_user_identity_sync,
+            int(user_id),
+            (username or "").strip() or None,
+            (first_name or "").strip() or None,
+            (last_name or "").strip() or None,
+            (full_name or "").strip() or None,
+        )
+
     async def set_reminder(self, user_id: int, when: Optional[datetime]) -> None:
         profile = await self.ensure_user(user_id)
         profile.remind_at = when
@@ -438,6 +456,10 @@ class Repository:
                 f"""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    full_name TEXT,
                     gender TEXT,
                     age_bucket TEXT,
                     style TEXT,
@@ -806,6 +828,29 @@ class Repository:
             )
             conn.commit()
 
+    def _upsert_user_identity_sync(
+        self,
+        user_id: int,
+        username: str | None,
+        first_name: str | None,
+        last_name: str | None,
+        full_name: str | None,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (user_id, username, first_name, last_name, full_name)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=excluded.username,
+                    first_name=excluded.first_name,
+                    last_name=excluded.last_name,
+                    full_name=excluded.full_name
+                """,
+                (user_id, username, first_name, last_name, full_name),
+            )
+            conn.commit()
+
     def _mark_idle_reminder_sent_sync(self, user_id: int) -> None:
         with self._connection() as conn:
             conn.execute(
@@ -1171,6 +1216,14 @@ class Repository:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN gen_count INTEGER NOT NULL DEFAULT 0"
             )
+        if "username" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN username TEXT")
+        if "first_name" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
+        if "last_name" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN last_name TEXT")
+        if "full_name" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
         if "contact_skip_once" not in columns:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN contact_skip_once INTEGER NOT NULL DEFAULT 0"

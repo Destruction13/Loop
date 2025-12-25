@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>LOOV Admin</title>
+    <meta name="color-scheme" content="light" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">LOOV</div>
+          <h1>Admin Dashboard</h1>
+        </div>
+        <div class="status">
+          <span id="statusDot" class="status-dot idle"></span>
+          <span id="statusText">Waiting for data</span>
+        </div>
+      </header>
+
+      <section class="controls">
+        <div class="control">
+          <label for="sort">Sort</label>
+          <select id="sort">
+            <option value="generations">Generations</option>
+            <option value="site_clicks">Site clicks</option>
+            <option value="social_clicks">Social clicks</option>
+            <option value="user_id">User ID</option>
+          </select>
+        </div>
+        <button id="orderToggle" class="ghost" type="button" aria-pressed="true">
+          Descending
+        </button>
+        <div class="control">
+          <label for="limit">Rows</label>
+          <select id="limit">
+            <option value="25">25</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+          </select>
+        </div>
+        <button id="refresh" class="primary" type="button">Refresh</button>
+      </section>
+
+      <section class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Telegram username / name</th>
+              <th>Profile link</th>
+              <th class="num">Generations</th>
+              <th class="num">Site clicks</th>
+              <th class="num">Social clicks</th>
+              <th>Phone</th>
+            </tr>
+          </thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+      </section>
+
+      <section id="state" class="state hidden">
+        <div class="state-title" id="stateTitle">Loading...</div>
+        <div class="state-body" id="stateBody">
+          Fetching data from the API.
+        </div>
+      </section>
+
+      <footer class="footer">
+        <div class="footer-meta" id="count">0 users</div>
+        <button id="loadMore" class="ghost" type="button">Load more</button>
+      </footer>
+    </div>
+
+    <script src="config.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
