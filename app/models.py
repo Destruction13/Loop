@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+STYLE_UNKNOWN = "UNKNOWN"
+
 
 @dataclass(slots=True)
 class FilterOptions:
@@ -25,6 +27,7 @@ class GlassModel:
     img_user_url: str
     img_nano_url: str
     gender: str
+    style: str = STYLE_UNKNOWN
 
 
 @dataclass(slots=True)

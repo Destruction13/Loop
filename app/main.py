@@ -31,7 +31,7 @@ from app.services.social_ad import SocialAdService
 from app.services.scheduler import ReminderScheduler
 from app.texts import messages as msg
 from app.utils.paths import ensure_dir
-from app.services.recommendation import PickScheme, RecommendationService, RecommendationSettings
+from app.recommender import StyleRecommender
 from app.infrastructure.logging_middleware import LoggingMiddleware
 from logger import get_logger, info_domain, log_event, setup_logging
 
@@ -87,7 +87,7 @@ async def main() -> None:
 
     info_domain(
         "bot.start",
-        "🧩 Конфиг загружен",
+        "Конфиг загружен",
         stage="CONFIG_OK",
         leads_export=config.enable_leads_export,
         idle_reminder=config.enable_idle_reminder,
@@ -165,16 +165,7 @@ async def main() -> None:
     )
     catalog_service = GoogleSheetCatalog(catalog_config)
 
-    recommendation_settings = RecommendationSettings(
-        batch_size=config.batch_size,
-        pick_scheme=PickScheme.from_string(config.pick_scheme),
-        clear_on_catalog_change=config.reco_clear_on_catalog_change,
-    )
-    recommender = RecommendationService(
-        catalog=catalog_service,
-        repository=repository,
-        settings=recommendation_settings,
-    )
+    style_recommender = StyleRecommender(repository)
 
     leads_exporter = LeadsExporter(
         enabled=config.enable_leads_export,
@@ -193,15 +184,18 @@ async def main() -> None:
 
     router = setup_router(
         repository=repository,
-        recommender=recommender,
+        catalog=catalog_service,
+        style_recommender=style_recommender,
         collage_config=config.collage,
         collage_builder=build_three_tile_collage,
         batch_size=config.batch_size,
         reminder_hours=config.reminder_hours,
         selection_button_title_max=config.button_title_max,
+        show_model_style_tag=config.show_model_style_tag,
         site_url=str(config.site_url),
         promo_code=config.promo_code,
         no_more_message_key=config.reco_no_more_key,
+        clear_on_catalog_change=config.reco_clear_on_catalog_change,
         contact_reward_rub=config.contact_reward_rub,
         promo_contact_code=config.promo_contact_code,
         leads_exporter=leads_exporter,
@@ -256,7 +250,7 @@ async def main() -> None:
         )
         social_ad.start()
 
-    info_domain("bot.start", "✅ Бот запущен", stage="BOT_STARTED")
+    info_domain("bot.start", "Бот запущен", stage="BOT_STARTED")
     try:
         await _run_polling(dp, bot, logger)
     finally:
@@ -277,7 +271,7 @@ if __name__ == "__main__":
         log_event(
             "CRITICAL",
             "bot.runtime",
-            f"💥 Необработанное исключение: {exc}",
+            f"Необработанное исключение: {exc}",
             stage="UNHANDLED_EXCEPTION",
             extra={"exception": repr(exc)},
         )

@@ -50,8 +50,8 @@ from app.keyboards import (
     send_new_photo_keyboard,
     start_keyboard,
 )
-from app.models import FilterOptions, GlassModel, UserContact
-from app.services.catalog_base import CatalogError
+from app.models import FilterOptions, GlassModel, UserContact, UserProfile, STYLE_UNKNOWN
+from app.services.catalog_base import CatalogError, CatalogService
 from app.config import CollageConfig
 from app.media import probe_video_size
 from app.services.collage import (
@@ -73,7 +73,7 @@ from app.services.nanobanana import (
     NanoBananaGenerationError,
     generate_glasses,
 )
-from app.services.recommendation import RecommendationService
+from app.recommender import StyleRecommender, VOTE_DUPLICATE, VOTE_INVALID, VOTE_OK
 from app.utils.phone import normalize_phone
 from app.texts import messages as msg
 from logger import get_logger, info_domain
@@ -145,15 +145,18 @@ def chunk_models(
 def setup_router(
     *,
     repository: Repository,
-    recommender: RecommendationService,
+    catalog: CatalogService,
+    style_recommender: StyleRecommender,
     collage_config: CollageConfig,
     collage_builder: Callable[[Sequence[str | None], CollageConfig], Awaitable[io.BytesIO]] = build_three_tile_collage,
     batch_size: int,
     reminder_hours: int,
     selection_button_title_max: int,
+    show_model_style_tag: bool,
     site_url: str,
     promo_code: str,
     no_more_message_key: str,
+    clear_on_catalog_change: bool,
     contact_reward_rub: int,
     promo_contact_code: str,
     leads_exporter: LeadsExporter,
@@ -189,6 +192,13 @@ def setup_router(
     BUSY_STATES = {TryOnStates.GENERATING.state, TryOnStates.SHOW_RECS.state}
     INVISIBLE_PROMPT = "\u2060"
 
+    def _format_model_button_label(model: GlassModel) -> str:
+        title = (model.title or "").strip()
+        if not show_model_style_tag:
+            return title
+        style = (getattr(model, "style", None) or STYLE_UNKNOWN).strip() or STYLE_UNKNOWN
+        return f"{title} [{style}]"
+
     def _detect_card_mode(message: Message) -> str:
         content_type = getattr(message, "content_type", "")
         return "text" if content_type == "text" else "caption"
@@ -222,6 +232,7 @@ def setup_router(
         *,
         title: str | None,
         trimmed: bool = False,
+        vote_payload: Mapping[str, str] | None = None,
     ) -> None:
         if not message:
             return
@@ -236,6 +247,8 @@ def setup_router(
             "trimmed": trimmed,
             "trim_failed": False,
         }
+        if vote_payload:
+            entry["vote_payload"] = dict(vote_payload)
         await state.update_data(last_card_message=entry)
 
     from app.keyboards import generation_result_keyboard  # добавь вверху, если ещё не импортировано
@@ -276,7 +289,12 @@ def setup_router(
         
 
         # Клавиатура только с кнопкой «Подробнее»
-        current_markup = generation_result_keyboard(site_url, remaining=0)
+        vote_payload = entry.get("vote_payload")
+        if vote_payload is not None and not isinstance(vote_payload, Mapping):
+            vote_payload = None
+        current_markup = generation_result_keyboard(
+            site_url, remaining=0, vote_payload=vote_payload
+        )
 
         try:
             if mode == "text":
@@ -927,6 +945,7 @@ def setup_router(
         *,
         has_more: bool,
         source_message_id: int | None = None,
+        vote_payload: Mapping[str, str] | None = None,
     ) -> None:
         data = await state.get_data()
         stored = dict(data.get("result_messages", {}))
@@ -942,7 +961,13 @@ def setup_router(
             stored[str(source_message_id)] = dict(entry)
 
         await state.update_data(result_messages=stored)
-        await _remember_card_message(state, message, title=model.title, trimmed=False)
+        await _remember_card_message(
+            state,
+            message,
+            title=model.title,
+            trimmed=False,
+            vote_payload=vote_payload,
+        )
 
 
     async def _maybe_request_contact(
@@ -1033,7 +1058,7 @@ def setup_router(
         logger.debug("Contact request issued for user %s", user_id)
         info_domain(
             "bot.handlers",
-            "⛔ Генерация пропущена — причина=contact_request",
+            "Генерация пропущена — причина=contact_request",
             stage="GENERATION_SKIPPED",
             user_id=user_id,
             pending_state=pending_state or current_state,
@@ -1068,14 +1093,22 @@ def setup_router(
                 "last_photo_file_id": data.get("last_photo_file_id"),
             }
         try:
-            result = await recommender.recommend_for_user(
-                user_id,
-                filters.gender,
-                exclude_ids=exclude_ids or set(),
+            snapshot = await catalog.snapshot()
+            changed, cleared = await repository.sync_catalog_version(
+                snapshot.version_hash,
+                clear_on_change=clear_on_catalog_change,
             )
+            if changed:
+                action = "cleared" if cleared else "preserved"
+                logger.info(
+                    "Catalog version updated to %s, history %s",
+                    snapshot.version_hash,
+                    action,
+                )
+            candidates = await catalog.list_by_gender(filters.gender)
         except CatalogError as exc:
             logger.error(
-                "Ошибка при получении каталога: %s",
+                "Ошибка при парсинге каталога: %s",
                 exc,
                 extra={"stage": "SHEET_PARSE_ERROR"},
             )
@@ -1088,7 +1121,11 @@ def setup_router(
             await state.update_data(current_models=[])
             await _delete_state_message(message, state, "preload_message_id")
             return False
-        if not result.models:
+        exclude = set(exclude_ids or set())
+        available = [
+            model for model in candidates if model.unique_id not in exclude
+        ]
+        if not available:
             await _send_aux_message(
                 message,
                 state,
@@ -1099,13 +1136,80 @@ def setup_router(
             await _delete_state_message(message, state, "preload_message_id")
             info_domain(
                 "bot.handlers",
-                "⛔ Генерация пропущена — причина=no_models",
+                f"Нет доступных моделей — reason=no_models",
                 stage="GENERATION_SKIPPED",
                 user_id=user_id,
                 gender=filters.gender,
             )
             return False
-        batch = list(result.models)
+        await style_recommender.ensure_user_styles(
+            user_id, (model.style for model in snapshot.models)
+        )
+        available_styles = [model.style for model in available]
+        if batch_size == 2:
+            selected_pair = await style_recommender.select_style_pair_for_collage(
+                user_id,
+                available_styles,
+                allow_duplicates=True,
+            )
+            selected_styles = list(selected_pair)
+        else:
+            selected_styles = await style_recommender.select_styles_for_collage(
+                user_id,
+                available_styles,
+                n=batch_size,
+            )
+        fallback_styles = await style_recommender.rank_styles_for_collage(
+            user_id, available_styles
+        )
+        batch = style_recommender.select_models_for_collage(
+            available,
+            selected_styles,
+            n=batch_size,
+            fallback_styles=fallback_styles,
+        )
+        if not batch:
+            await _send_aux_message(
+                message,
+                state,
+                message.answer,
+                msg.CATALOG_TEMPORARILY_UNAVAILABLE,
+            )
+            await state.update_data(current_models=[], last_batch=[])
+            await _delete_state_message(message, state, "preload_message_id")
+            info_domain(
+                "bot.handlers",
+                "Нет доступных моделей — reason=no_models",
+                stage="GENERATION_SKIPPED",
+                user_id=user_id,
+                gender=filters.gender,
+            )
+            return False
+        candidate_ids = {model.unique_id for model in available}
+        batch_ids = {model.unique_id for model in batch}
+        remaining_after_batch = max(len(candidate_ids) - len(batch_ids), 0)
+        exhausted = remaining_after_batch <= 0
+        if len(selected_styles) == 2:
+            canonical_pair = tuple(sorted(selected_styles))
+            logger.debug(
+                "Selected style pair for user %s: %s (display=%s)",
+                user_id,
+                canonical_pair,
+                selected_styles,
+            )
+        else:
+            logger.debug("Selected styles for user %s: %s", user_id, selected_styles)
+        logger.debug(
+            "Selected models for user %s: %s",
+            user_id,
+            [
+                (
+                    model.unique_id,
+                    (model.style or STYLE_UNKNOWN).strip() or STYLE_UNKNOWN,
+                )
+                for model in batch
+            ],
+        )
         data = await state.get_data()
         presented = list(dict.fromkeys(data.get("presented_model_ids", [])))
         for model in batch:
@@ -1125,7 +1229,7 @@ def setup_router(
         )
         await _delete_state_message(message, state, "preload_message_id")
         await state.update_data(is_generating=False)
-        if result.exhausted:
+        if exhausted:
             # Карточка «Ты просмотрел все модели» отключена продуктовой командой.
             await _send_aux_message(
                 message,
@@ -1405,7 +1509,7 @@ def setup_router(
         photo_context: dict[str, Any],
     ) -> None:
         keyboard = batch_selection_keyboard(
-            [(item.unique_id, item.title) for item in group],
+            [(item.unique_id, _format_model_button_label(item)) for item in group],
             source=batch_source,
             max_title_length=selection_button_title_max,
         )
@@ -1554,6 +1658,26 @@ def setup_router(
             }
             await state.update_data(models_message_id=last_sent.message_id, collage_sessions=sessions)
         await _delete_busy_messages(state, message.bot, message.chat.id)
+
+
+    def _strip_vote_buttons(
+        markup: InlineKeyboardMarkup | None,
+    ) -> InlineKeyboardMarkup | None:
+        if not markup or not markup.inline_keyboard:
+            return None
+        new_rows = []
+        removed = False
+        for row in markup.inline_keyboard:
+            if any(
+                (getattr(button, "callback_data", None) or "").startswith("vote|")
+                for button in row
+            ):
+                removed = True
+                continue
+            new_rows.append(row)
+        if not removed:
+            return None
+        return InlineKeyboardMarkup(inline_keyboard=new_rows)
 
 
     async def _disable_inline_keyboard(
@@ -2052,7 +2176,7 @@ def setup_router(
         
         info_domain(
             "bot.handlers",
-            "👤 Пользователь открыл старт",
+            "Пользователь открыл старт",
             stage="USER_START",
             user_id=message.from_user.id,
         )
@@ -2107,7 +2231,7 @@ def setup_router(
         await callback.answer()
         info_domain(
             "bot.handlers",
-            f"⚙️ Выбор: пол={gender}",
+            f"Выбор: пол={gender}",
             stage="FILTER_SELECTED",
             user_id=callback.from_user.id,
         )
@@ -2212,7 +2336,7 @@ def setup_router(
             )
             info_domain(
                 "bot.handlers",
-                "🔒 Достигнут дневной лимит",
+                "Достигнут дневной лимит",
                 stage="DAILY_LIMIT",
                 user_id=user_id,
             )
@@ -2248,7 +2372,7 @@ def setup_router(
         )
         info_domain(
             "bot.handlers",
-            "🖼️ Фото получено",
+            "Фото получено",
             stage="USER_SENT_PHOTO",
             user_id=user_id,
             remaining=remaining,
@@ -2269,6 +2393,75 @@ def setup_router(
             cycle_id=new_cycle,
         )
         await callback.answer()
+
+    @router.callback_query(F.data.startswith("vote|"))
+    async def vote_on_style(callback: CallbackQuery, state: FSMContext) -> None:
+        message = callback.message
+        payload = callback.data or ""
+        user_id = (
+            callback.from_user.id
+            if callback.from_user
+            else message.chat.id
+            if message
+            else None
+        )
+        if message is None or not payload or user_id is None:
+            await callback.answer()
+            return
+        parts = payload.split("|", 4)
+        if len(parts) < 4:
+            await callback.answer(msg.VOTE_ACK_INVALID)
+            return
+        _, vote, generation_id, style, *_ = parts
+        status = await style_recommender.update_from_vote(
+            user_id, generation_id, style, vote
+        )
+        if status in {VOTE_OK, VOTE_DUPLICATE}:
+            stripped = _strip_vote_buttons(message.reply_markup)
+            if stripped is not None:
+                try:
+                    if stripped.inline_keyboard:
+                        await message.edit_reply_markup(reply_markup=stripped)
+                    else:
+                        await message.edit_reply_markup(reply_markup=None)
+                except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                    logger.debug(
+                        "Failed to update vote markup %s: %s",
+                        message.message_id,
+                        exc,
+                    )
+            state_data = await state.get_data()
+            last_card = state_data.get("last_card_message")
+            if (
+                isinstance(last_card, Mapping)
+                and last_card.get("message_id") == message.message_id
+                and last_card.get("vote_payload") is not None
+            ):
+                updated_card = dict(last_card)
+                updated_card.pop("vote_payload", None)
+                await state.update_data(last_card_message=updated_card)
+            profile = await repository.ensure_user(user_id)
+            if (
+                profile.last_more_message_id == message.message_id
+                and profile.last_more_message_type == "result"
+                and profile.last_more_message_payload
+            ):
+                payload_data = dict(profile.last_more_message_payload)
+                if payload_data.get("vote_payload") is not None:
+                    payload_data["vote_payload"] = None
+                    await repository.set_last_more_message(
+                        user_id,
+                        profile.last_more_message_id,
+                        profile.last_more_message_type,
+                        payload_data,
+                    )
+        if status == VOTE_OK:
+            response_text = msg.VOTE_ACK_OK
+        elif status == VOTE_DUPLICATE:
+            response_text = msg.VOTE_ACK_DUPLICATE
+        else:
+            response_text = msg.VOTE_ACK_INVALID
+        await callback.answer(response_text)
 
     @router.callback_query(F.data.startswith("pick:"))
     async def choose_model(callback: CallbackQuery, state: FSMContext) -> None:
@@ -2664,7 +2857,7 @@ def setup_router(
             generation_cycle = await _ensure_current_cycle_id(state, user_id)
         info_domain(
             "bot.handlers",
-            "🎬 _perform_generation: старт генерации",
+            "_perform_generation: старт генерации",
             stage="GEN_START",
             user_id=user_id,
             generation_cycle=generation_cycle,
@@ -2781,7 +2974,7 @@ def setup_router(
             await track_event(str(user_id), "generation_started", value=model.unique_id)
             info_domain(
                 "generation.nano",
-                f"🛠️ Генерация запущена — frame={model.unique_id}",
+                f"Генерация запущена — frame={model.unique_id}",
                 stage="GENERATION_STARTED",
                 user_id=user_id,
             )
@@ -2799,7 +2992,7 @@ def setup_router(
             await track_event(str(user_id), "generation_finished", value=str(latency_ms))
             info_domain(
                 "generation.nano",
-                f"✅ Генерация готова — {latency_ms} ms",
+                f"Генерация готова — {latency_ms} ms",
                 stage="GENERATION_FINISHED",
                 user_id=user_id,
                 model_id=model.unique_id,
@@ -2905,10 +3098,19 @@ def setup_router(
         await repository.inc_used_on_success(user_id)
         remaining = await repository.remaining_tries(user_id)
         is_current_cycle = await _is_cycle_current(state, generation_cycle)
+        clean_style = (
+            (getattr(model, "style", None) or STYLE_UNKNOWN).strip() or STYLE_UNKNOWN
+        )
+        generation_id = f"{generation_cycle}:{model.unique_id}"
+        vote_payload = {
+            "generation_id": generation_id,
+            "style": clean_style,
+            "model_id": model.unique_id,
+        }
         await _delete_progress_message()
         info_domain(
             "bot.handlers",
-            "🔍 _perform_generation: статус цикла перед доставкой результата",
+            "_perform_generation: статус цикла перед доставкой результата",
             stage="GEN_CYCLE_STATUS",
             user_id=user_id,
             generation_cycle=generation_cycle,
@@ -2921,10 +3123,11 @@ def setup_router(
                 model.site_url,
                 0,
                 show_more=False,
+                vote_payload=vote_payload,
             )
             info_domain(
                 "bot.handlers",
-                "📦 _perform_generation: отправляем stale-результат",
+                "_perform_generation: отправляем stale-результат",
                 stage="GEN_DELIVER_STALE",
                 user_id=user_id,
                 generation_cycle=generation_cycle,
@@ -2978,11 +3181,12 @@ def setup_router(
             model.site_url,
             keyboard_remaining,
             show_more=result_has_more,
+            vote_payload=vote_payload,
         )
         await _deactivate_previous_more_button(message.bot, user_id)
         info_domain(
             "bot.handlers",
-            "📦 _perform_generation: отправляем актуальный результат",
+            "_perform_generation: отправляем актуальный результат",
             stage="GEN_DELIVER_CURRENT",
             user_id=user_id,
             generation_cycle=generation_cycle,
@@ -3009,12 +3213,13 @@ def setup_router(
             "title": model.title,
             "trimmed": False,
             "trim_failed": False,
+            "vote_payload": vote_payload,
         })
         # === /SAVE last_card_message ===
 
         info_domain(
             "bot.handlers",
-            "📝 _perform_generation: регистрируем результат и alias по source_message_id",
+            "_perform_generation: регистрируем результат и alias по source_message_id",
             stage="GEN_REGISTER_RESULT",
             user_id=user_id,
             generation_cycle=generation_cycle,
@@ -3028,6 +3233,7 @@ def setup_router(
             model,
             has_more=result_has_more,
             source_message_id=message.message_id,
+            vote_payload=vote_payload,
         )
         new_gen_count = await repository.increment_generation_count(user_id)
         daily_gen_count, contact_trigger = await repository.register_contact_generation(
@@ -3053,7 +3259,7 @@ def setup_router(
                 user_id,
                 result_message.message_id,
                 "result",
-                {"site_url": model.site_url},
+                {"site_url": model.site_url, "vote_payload": vote_payload},
             )
         else:
             await repository.set_last_more_message(user_id, None, None, None)
@@ -3075,7 +3281,7 @@ def setup_router(
                 await state.set_state(TryOnStates.DAILY_LIMIT_REACHED)
             info_domain(
                 "bot.handlers",
-                "🔒 Достигнут дневной лимит",
+                "Достигнут дневной лимит",
                 stage="DAILY_LIMIT",
                 user_id=user_id,
                 context="post_generation",
@@ -3173,7 +3379,7 @@ def setup_router(
             )
             info_domain(
                 "bot.handlers",
-                "🔒 Достигнут дневной лимит",
+                "Достигнут дневной лимит",
                 stage="DAILY_LIMIT",
                 user_id=user_id,
                 context="more_button",
@@ -3267,7 +3473,7 @@ def setup_router(
             )
             info_domain(
                 "bot.handlers",
-                "🔒 Достигнут дневной лимит",
+                "Достигнут дневной лимит",
                 stage="DAILY_LIMIT",
                 user_id=user_id,
                 context="reuse_photo",
@@ -3361,7 +3567,7 @@ def setup_router(
             )
             info_domain(
                 "bot.handlers",
-                "🔒 Достигнут дневной лимит",
+                "Достигнут дневной лимит",
                 stage="DAILY_LIMIT",
                 user_id=user_id,
                 context=context,
@@ -3410,7 +3616,7 @@ def setup_router(
             )
             info_domain(
                 "bot.handlers",
-                "🔒 Достигнут дневной лимит",
+                "Достигнут дневной лимит",
                 stage="DAILY_LIMIT",
                 user_id=user_id,
                 context="wear_command",

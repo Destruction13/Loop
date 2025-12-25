@@ -328,6 +328,72 @@ class Repository:
     async def list_seen_models(self, user_id: int, *, context: str) -> set[str]:
         return await asyncio.to_thread(self._list_seen_models_sync, user_id, context)
 
+    async def has_style_feedback(self, user_id: int) -> bool:
+        return await asyncio.to_thread(self._has_style_feedback_sync, user_id)
+
+    async def ensure_style_preferences(
+        self, user_id: int, styles: Iterable[str], *, when: datetime | None = None
+    ) -> None:
+        unique = [style for style in dict.fromkeys(styles or []) if style]
+        if not unique:
+            return
+        timestamp = (when or datetime.now(timezone.utc)).isoformat()
+        await asyncio.to_thread(
+            self._ensure_style_preferences_sync, user_id, unique, timestamp
+        )
+
+    async def list_style_preferences(
+        self, user_id: int, *, styles: Iterable[str] | None = None
+    ) -> dict[str, tuple[int, int]]:
+        style_list = (
+            [style for style in dict.fromkeys(styles) if style]
+            if styles is not None
+            else None
+        )
+        if style_list is not None and not style_list:
+            return {}
+        return await asyncio.to_thread(
+            self._list_style_preferences_sync, user_id, style_list
+        )
+
+    async def insert_style_vote(
+        self,
+        user_id: int,
+        generation_id: str,
+        style: str,
+        vote: str,
+        *,
+        created_at: datetime | None = None,
+    ) -> bool:
+        timestamp = (created_at or datetime.now(timezone.utc)).isoformat()
+        return await asyncio.to_thread(
+            self._insert_style_vote_sync,
+            user_id,
+            generation_id,
+            style,
+            vote,
+            timestamp,
+        )
+
+    async def increment_style_preference(
+        self,
+        user_id: int,
+        style: str,
+        *,
+        alpha_inc: int = 0,
+        beta_inc: int = 0,
+        updated_at: datetime | None = None,
+    ) -> None:
+        timestamp = (updated_at or datetime.now(timezone.utc)).isoformat()
+        await asyncio.to_thread(
+            self._increment_style_preference_sync,
+            user_id,
+            style,
+            alpha_inc,
+            beta_inc,
+            timestamp,
+        )
+
     async def sync_catalog_version(
         self, version_hash: str, *, clear_on_change: bool
     ) -> Tuple[bool, bool]:
@@ -404,6 +470,7 @@ class Repository:
             )
             self._ensure_user_columns(conn)
             self._ensure_seen_table(conn)
+            self._ensure_style_tables(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS catalog_meta (
@@ -819,6 +886,116 @@ class Repository:
             rows = cur.fetchall()
         return {row[0] for row in rows}
 
+    def _has_style_feedback_sync(self, user_id: int) -> bool:
+        with self._connection() as conn:
+            cur = conn.execute(
+                "SELECT 1 FROM user_style_votes WHERE user_id = ? LIMIT 1",
+                (user_id,),
+            )
+            return cur.fetchone() is not None
+
+    def _ensure_style_preferences_sync(
+        self, user_id: int, styles: list[str], timestamp: str
+    ) -> None:
+        if not styles:
+            return
+        with self._connection() as conn:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO user_style_pref (
+                    user_id,
+                    style,
+                    alpha,
+                    beta,
+                    updated_at
+                )
+                VALUES (?, ?, 1, 1, ?)
+                """,
+                [(user_id, style, timestamp) for style in styles],
+            )
+            conn.commit()
+
+    def _list_style_preferences_sync(
+        self, user_id: int, styles: list[str] | None
+    ) -> dict[str, tuple[int, int]]:
+        with self._connection() as conn:
+            if styles is None:
+                cur = conn.execute(
+                    "SELECT style, alpha, beta FROM user_style_pref WHERE user_id = ?",
+                    (user_id,),
+                )
+            else:
+                placeholders = ",".join("?" for _ in styles)
+                query = (
+                    "SELECT style, alpha, beta FROM user_style_pref "
+                    f"WHERE user_id = ? AND style IN ({placeholders})"
+                )
+                cur = conn.execute(query, (user_id, *styles))
+            rows = cur.fetchall()
+        return {row[0]: (int(row[1]), int(row[2])) for row in rows}
+
+    def _insert_style_vote_sync(
+        self,
+        user_id: int,
+        generation_id: str,
+        style: str,
+        vote: str,
+        timestamp: str,
+    ) -> bool:
+        with self._connection() as conn:
+            before = conn.total_changes
+            conn.execute(
+                """
+                INSERT INTO user_style_votes (
+                    user_id,
+                    generation_id,
+                    style,
+                    vote,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, generation_id) DO NOTHING
+                """,
+                (user_id, generation_id, style, vote, timestamp),
+            )
+            inserted = conn.total_changes > before
+            conn.commit()
+            return inserted
+
+    def _increment_style_preference_sync(
+        self,
+        user_id: int,
+        style: str,
+        alpha_inc: int,
+        beta_inc: int,
+        timestamp: str,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO user_style_pref (
+                    user_id,
+                    style,
+                    alpha,
+                    beta,
+                    updated_at
+                )
+                VALUES (?, ?, 1, 1, ?)
+                """,
+                (user_id, style, timestamp),
+            )
+            conn.execute(
+                """
+                UPDATE user_style_pref
+                SET alpha = alpha + ?,
+                    beta = beta + ?,
+                    updated_at = ?
+                WHERE user_id = ? AND style = ?
+                """,
+                (alpha_inc, beta_inc, timestamp, user_id, style),
+            )
+            conn.commit()
+
     def _get_user_contact_sync(self, user_id: int) -> Optional[UserContact]:
         with self._connection() as conn:
             conn.row_factory = sqlite3.Row
@@ -958,6 +1135,32 @@ class Repository:
                 """,
             )
             conn.execute("DROP TABLE user_seen_models_legacy")
+
+    def _ensure_style_tables(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_style_pref (
+                user_id INTEGER NOT NULL,
+                style TEXT NOT NULL,
+                alpha INTEGER NOT NULL DEFAULT 1,
+                beta INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, style)
+            )
+            """,
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_style_votes (
+                user_id INTEGER NOT NULL,
+                generation_id TEXT NOT NULL,
+                style TEXT NOT NULL,
+                vote TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, generation_id)
+            )
+            """,
+        )
 
     def _ensure_user_columns(self, conn: sqlite3.Connection) -> None:
         columns = {

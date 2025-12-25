@@ -23,7 +23,7 @@ from app.keyboards import (
 )
 from app.models import GlassModel
 from app.services.collage import CollageProcessingError, CollageSourceUnavailable
-from app.services.recommendation import RecommendationResult
+from app.services.catalog_base import CatalogSnapshot
 from app.texts import messages as msg
 
 
@@ -401,30 +401,88 @@ class StubRepository:
         return None
 
 
-class StubRecommendationService:
+class StubCatalog:
     def __init__(self, models: list[GlassModel]) -> None:
         self.default = list(models)
-        self.queue: list[RecommendationResult] = []
-        self.calls: list[tuple[int, str]] = []
+        self.queue: list[list[GlassModel]] = []
+        self.version_hash = "v1"
 
-    async def recommend_for_user(
+    async def snapshot(self) -> CatalogSnapshot:
+        models = self.queue[0] if self.queue else self.default
+        return CatalogSnapshot(models=list(models), version_hash=self.version_hash)
+
+    async def list_by_gender(self, gender: str) -> list[GlassModel]:
+        models = self.queue.pop(0) if self.queue else self.default
+        normalized = (gender or "").strip().lower()
+        if normalized == "unisex":
+            allowed = {"unisex"}
+        elif normalized in {"male", "female"}:
+            allowed = {normalized, "unisex"}
+        else:
+            allowed = {normalized, "unisex"}
+        return [model for model in models if model.gender in allowed]
+
+
+class StubStyleRecommender:
+    def __init__(self) -> None:
+        self.ensure_calls: list[tuple[int, list[str]]] = []
+        self.vote_calls: list[tuple[int, str, str, str]] = []
+
+    async def ensure_user_styles(
+        self, user_id: int, styles_from_catalog: Iterable[str]
+    ) -> None:
+        self.ensure_calls.append((user_id, list(styles_from_catalog)))
+
+    async def select_styles_for_collage(
         self,
         user_id: int,
-        gender: str,
+        available_styles: Iterable[str],
         *,
-        exclude_ids: set[str] | None = None,
-    ) -> RecommendationResult:
-        self.calls.append((user_id, gender))
-        exclude = set(exclude_ids or set())
-        if self.queue:
-            result = self.queue.pop(0)
-        else:
-            result = RecommendationResult(models=list(self.default), exhausted=False)
-        filtered_models = [
-            model for model in result.models if model.unique_id not in exclude
-        ]
-        exhausted = result.exhausted or not filtered_models
-        return RecommendationResult(models=filtered_models, exhausted=exhausted)
+        n: int = 2,
+        exploration_rate: float | None = None,
+    ) -> list[str]:
+        styles = [style for style in dict.fromkeys(available_styles) if style]
+        return styles[:n]
+
+    async def select_style_pair_for_collage(
+        self,
+        user_id: int,
+        available_styles: Iterable[str],
+        *,
+        exploration_rate: float | None = None,
+        allow_duplicates: bool = True,
+    ) -> tuple[str, str]:
+        styles = [style for style in dict.fromkeys(available_styles) if style]
+        if not styles:
+            return tuple()
+        if len(styles) == 1:
+            return (styles[0], styles[0])
+        return (styles[0], styles[1])
+
+    async def rank_styles_for_collage(
+        self, user_id: int, available_styles: Iterable[str]
+    ) -> list[str]:
+        return [style for style in dict.fromkeys(available_styles) if style]
+
+    def select_models_for_collage(
+        self,
+        candidates: Sequence[GlassModel],
+        styles: Sequence[str],
+        *,
+        n: int = 2,
+        fallback_styles: Sequence[str] | None = None,
+    ) -> list[GlassModel]:
+        return list(candidates)[:n]
+
+    async def update_from_vote(
+        self,
+        user_id: int,
+        generation_id: str,
+        style: str,
+        vote: str,
+    ) -> str:
+        self.vote_calls.append((user_id, generation_id, style, vote))
+        return "ok"
 
 
 class StubTryOn:
@@ -489,9 +547,10 @@ def build_router(
     models: Optional[list[GlassModel]] = None,
     *,
     collage_builder: Optional[StubCollageBuilder] = None,
-) -> tuple[Any, StubRepository, StubTryOn, StubCollageBuilder, StubRecommendationService]:
+) -> tuple[Any, StubRepository, StubTryOn, StubCollageBuilder, StubCatalog]:
     repository = StubRepository()
-    recommender = StubRecommendationService(models or [])
+    catalog = StubCatalog(models or [])
+    style_recommender = StubStyleRecommender()
     result_path = tmp_path / "result.png"
     result_path.write_bytes(b"fake-image")
     tryon = StubTryOn(result_path=result_path)
@@ -577,15 +636,18 @@ def build_router(
 
     router = setup_router(
         repository=repository,
-        recommender=recommender,
+        catalog=catalog,
+        style_recommender=style_recommender,
         collage_config=collage_config,
         collage_builder=builder,
         batch_size=2,
         reminder_hours=24,
         selection_button_title_max=28,
+        show_model_style_tag=False,
         site_url="https://example.com",
         promo_code="PROMO",
         no_more_message_key="all_seen",
+        clear_on_catalog_change=False,
         contact_reward_rub=1000,
         promo_contact_code="PROMO1000",
         leads_exporter=leads_exporter,
@@ -598,7 +660,7 @@ def build_router(
         promo_video_width=None,
         promo_video_height=None,
     )
-    return router, repository, tryon, builder, recommender
+    return router, repository, tryon, builder, catalog
 
 
 def get_callback_handler(router: Any, name: str):
@@ -741,8 +803,8 @@ def test_small_catalog_keeps_showing_models(tmp_path: Path) -> None:
 
 def test_exhausted_message_flow(tmp_path: Path) -> None:
     async def scenario() -> None:
-        router, _, _, _, recommender = build_router(tmp_path)
-        recommender.queue.append(RecommendationResult(models=[], exhausted=True))
+        router, _, _, _, catalog = build_router(tmp_path)
+        catalog.queue.append([])
         handler = get_message_handler(router, "accept_photo")
 
         bot = DummyBot()
@@ -882,7 +944,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
             img_nano_url="https://example.com/2-nano.jpg",
             gender="male",
         )
-        router, repository, tryon, _, recommender = build_router(
+        router, repository, tryon, _, catalog = build_router(
             tmp_path, models=[model]
         )
         handler_photo = get_message_handler(router, "accept_photo")
@@ -920,9 +982,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
 
         callback_follow = DummyCallback("more|1", upload_message)
         handler_more = get_callback_handler(router, "result_more")
-        recommender.queue.append(
-            RecommendationResult(models=[alt_model], exhausted=False)
-        )
+        catalog.queue.append([alt_model])
         previous_photo_messages = len(upload_message.answer_photos)
         await handler_more(callback_follow, state)
         assert state.state is TryOnStates.SHOW_RECS
@@ -935,7 +995,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         assert last_caption_edit[0] == model.title
         assert isinstance(last_caption_edit[1], InlineKeyboardMarkup)
         assert [
-            button.text for button in last_caption_edit[1].inline_keyboard[0]
+            button.text for button in last_caption_edit[1].inline_keyboard[1]
         ] == [msg.DETAILS_BUTTON_TEXT]
 
         callback_second = DummyCallback(
@@ -947,7 +1007,7 @@ def test_generation_message_deleted_and_caption_changes(tmp_path: Path) -> None:
         assert second_result[1] == f"<b>{alt_model.title}</b>\n\n{expected_second}"
         assert isinstance(second_result[2], InlineKeyboardMarkup)
         assert [
-            button.text for button in second_result[2].inline_keyboard[0]
+            button.text for button in second_result[2].inline_keyboard[1]
         ] == [msg.DETAILS_BUTTON_TEXT]
         assert state.state is ContactRequest.waiting_for_phone
         assert upload_message.answers[-1][0].startswith(
@@ -1150,7 +1210,7 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
             img_nano_url="https://example.com/3-nano.jpg",
             gender="male",
         )
-        router, repository, _, _, recommender = build_router(
+        router, repository, _, _, catalog = build_router(
             tmp_path, models=models
         )
         handler_photo = get_message_handler(router, "accept_photo")
@@ -1171,9 +1231,7 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
         assert not any(msg.ASK_PHONE_TITLE in text for text, _ in message.answers)
 
         more_callback = DummyCallback("more|1", message)
-        recommender.queue.append(
-            RecommendationResult(models=[extra_model], exhausted=False)
-        )
+        catalog.queue.append([extra_model])
         previous_photos = list(message.answer_photos)
         await handler_more(more_callback, state)
         assert state.state is TryOnStates.SHOW_RECS
@@ -1191,7 +1249,7 @@ def test_contact_prompt_after_second_generation(tmp_path: Path) -> None:
         assert second_result[1] == f"<b>{extra_model.title}</b>\n\n{expected_second}"
         assert isinstance(second_result[2], InlineKeyboardMarkup)
         assert [
-            button.text for button in second_result[2].inline_keyboard[0]
+            button.text for button in second_result[2].inline_keyboard[1]
         ] == [msg.DETAILS_BUTTON_TEXT]
         assert state.state is ContactRequest.waiting_for_phone
         assert message.answers[-1][0].startswith(f"<b>{msg.ASK_PHONE_TITLE}")
@@ -1237,7 +1295,7 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
             img_nano_url="https://example.com/3-nano.jpg",
             gender="male",
         )
-        router, repository, _, _, recommender = build_router(
+        router, repository, _, _, catalog = build_router(
             tmp_path, models=models
         )
         handler_photo = get_message_handler(router, "accept_photo")
@@ -1253,9 +1311,7 @@ def test_contact_share_sends_followup_without_new_selection(tmp_path: Path) -> N
 
         await handler_photo(message, state)
         await handler_choose(DummyCallback("pick:src=batch2:m1", message), state)
-        recommender.queue.append(
-            RecommendationResult(models=[extra_model], exhausted=False)
-        )
+        catalog.queue.append([extra_model])
         await handler_more(DummyCallback("more|1", message), state)
         assert state.state is TryOnStates.SHOW_RECS
 
@@ -1344,7 +1400,7 @@ def test_reuse_same_photo_suppresses_more_button(tmp_path: Path) -> None:
     )
 
     async def scenario() -> None:
-        router, repository, tryon, _, recommender = build_router(
+        router, repository, tryon, _, catalog = build_router(
             tmp_path, models=[model]
         )
         handler_photo = get_message_handler(router, "accept_photo")
@@ -1363,9 +1419,7 @@ def test_reuse_same_photo_suppresses_more_button(tmp_path: Path) -> None:
         assert repository.gen_counts[654] == 1
         assert state.state is TryOnStates.RESULT
 
-        recommender.queue.append(
-            RecommendationResult(models=[new_model], exhausted=False)
-        )
+        catalog.queue.append([new_model])
         await state.update_data(suppress_more_button=True)
 
         previous_photos = list(message.answer_photos)
@@ -1391,8 +1445,8 @@ def test_reuse_same_photo_suppresses_more_button(tmp_path: Path) -> None:
         assert result_photo[1] == f"<b>{new_model.title}</b>\n\n{expected_caption}"
         result_markup = result_photo[2]
         assert isinstance(result_markup, InlineKeyboardMarkup)
-        assert len(result_markup.inline_keyboard) == 1
-        assert [button.text for button in result_markup.inline_keyboard[0]] == [
+        assert len(result_markup.inline_keyboard) == 2
+        assert [button.text for button in result_markup.inline_keyboard[1]] == [
             msg.DETAILS_BUTTON_TEXT
         ]
         assert repository.gen_counts[654] == 2
@@ -1507,7 +1561,7 @@ def test_limit_result_sends_card_and_summary_message(tmp_path: Path) -> None:
         assert result_photo[1] == f"<b>{model.title}</b>"
         assert isinstance(result_photo[2], InlineKeyboardMarkup)
         assert [
-            button.text for button in result_photo[2].inline_keyboard[0]
+            button.text for button in result_photo[2].inline_keyboard[1]
         ] == [msg.DETAILS_BUTTON_TEXT]
 
         limit_message = message.answers[-1]
@@ -1814,7 +1868,7 @@ def test_collage_callback_allowed_in_start_state(tmp_path: Path) -> None:
         assert tryon.calls[0]["input_photo"] == Path(snapshot["upload"])
         markup = callback.message.answer_photos[-1][2]
         assert isinstance(markup, InlineKeyboardMarkup)
-        assert len(markup.inline_keyboard) == 1
+        assert len(markup.inline_keyboard) == 2
         assert original_cycle != (await state.get_data()).get("current_cycle")
 
     asyncio.run(scenario())
@@ -1959,7 +2013,7 @@ def test_two_photos_make_first_collage_stale_but_clickable(tmp_path: Path) -> No
         await handler_choose(callback_first, state)
         stale_markup = callback_first.message.answer_photos[-1][2]
         assert isinstance(stale_markup, InlineKeyboardMarkup)
-        assert len(stale_markup.inline_keyboard) == 1
+        assert len(stale_markup.inline_keyboard) == 2
 
         callback_second = DummyCallback(
             f"pick:src=batch2:{models[0].unique_id}",
@@ -2039,7 +2093,7 @@ def test_collages_keep_separate_cycles_and_photos(tmp_path: Path) -> None:
 
         stale_markup = callback_first.message.answer_photos[-1][2]
         assert isinstance(stale_markup, InlineKeyboardMarkup)
-        assert len(stale_markup.inline_keyboard) == 1
+        assert len(stale_markup.inline_keyboard) == 2
 
         current_markup = callback_second.message.answer_photos[-1][2]
         assert isinstance(current_markup, InlineKeyboardMarkup)
@@ -2095,7 +2149,7 @@ def test_photo_during_generating_keeps_old_result_and_new_cycle(tmp_path: Path) 
         await handler_choose(callback_first, state)
         stale_markup = callback_first.message.answer_photos[-1][2]
         assert isinstance(stale_markup, InlineKeyboardMarkup)
-        assert len(stale_markup.inline_keyboard) == 1
+        assert len(stale_markup.inline_keyboard) == 2
 
         callback_second = DummyCallback(
             f"pick:src=batch2:{models[0].unique_id}",

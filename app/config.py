@@ -113,6 +113,7 @@ class Config:
     uploads_root: Path
     results_root: Path
     button_title_max: int
+    show_model_style_tag: bool
     nanobanana_key_slots: tuple[NanoBananaKeySlot, ...]
     collage: CollageConfig
     batch_size: int
@@ -182,6 +183,18 @@ def _parse_int_env(name: str, default: int, *, minimum: Optional[int] = None) ->
     if minimum is not None and value < minimum:
         raise RuntimeError(f"{name} must be greater than or equal to {minimum}")
     return value
+
+
+def _parse_toggle_env(name: str, default: bool = False) -> bool:
+    raw = _optional_env(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be ON or OFF")
 
 
 def _parse_social_links(raw: Optional[str]) -> list[SocialLink]:
@@ -265,6 +278,7 @@ def load_config(env_file: str | None = None) -> Config:
     catalog_row_limit = catalog_row_raw or None
     pick_scheme_raw = _optional_env("PICK_SCHEME", "UNIVERSAL") or "UNIVERSAL"
     pick_scheme = pick_scheme_raw.strip() or "UNIVERSAL"
+    show_model_style_tag = _parse_toggle_env("SHOW_MODEL_STYLE_TAG", default=False)
     google_credentials_raw = _optional_env("GOOGLE_SERVICE_ACCOUNT_JSON")
     google_credentials_path = Path(google_credentials_raw) if google_credentials_raw else None
 
@@ -306,6 +320,7 @@ def load_config(env_file: str | None = None) -> Config:
         uploads_root=Path("./uploads"),
         results_root=Path("./results"),
         button_title_max=28,
+        show_model_style_tag=show_model_style_tag,
         nanobanana_key_slots=nanobanana_key_slots,
         collage=CollageConfig(
             slot_width=1080,

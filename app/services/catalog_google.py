@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+from collections import Counter
 import hashlib
 import io
 import random
@@ -14,7 +15,7 @@ from urllib.parse import parse_qs, urlparse, urlsplit
 
 import httpx
 
-from app.models import GlassModel
+from app.models import GlassModel, STYLE_UNKNOWN
 from app.services.catalog_base import (
     CatalogBatch,
     CatalogError,
@@ -80,6 +81,8 @@ HEADER_SYNONYMS: dict[str, frozenset[str]] = {
 REQUIRED_HEADERS = frozenset(
     ("unique_id", "title", "model", "site", "img_nb", "img_user", "gender")
 )
+
+STYLE_HEADER_TOKEN = _normalize_header("Стили")
 
 
 @dataclass(slots=True)
@@ -228,14 +231,14 @@ class GoogleSheetCatalog(CatalogService):
             )
             info_domain(
                 "sheets.load",
-                f"🗂️ Таблица подгружена — {len(models)} строк",
+                f"Таблица подгружена — {len(models)} строк",
                 stage="SHEET_LOADED",
                 rows=len(models),
                 hash=version_hash,
             )
             info_domain(
                 "sheets.load",
-                f"✅ Парсинг каталога ok — {len(models)} строк",
+                f"Парсинг каталога ok — {len(models)} строк",
                 stage="SHEET_PARSE_OK",
                 rows=len(models),
             )
@@ -248,7 +251,7 @@ class GoogleSheetCatalog(CatalogService):
             source_label = _SOURCE_LABELS.get(source, source)
             info_domain(
                 "sheets.load",
-                f"📥 Источник каталога: {source_label}",
+                f"Источник каталога: {source_label}",
                 stage="SHEET_SOURCE",
                 source=source,
             )
@@ -352,10 +355,16 @@ class GoogleSheetCatalog(CatalogService):
             raise CatalogError("Catalog CSV has no header row")
 
         header_map = _resolve_header_map(reader.fieldnames)
+        style_header = header_map.get("style")
         missing_headers = REQUIRED_HEADERS - set(header_map)
         if missing_headers:
             missing = ", ".join(sorted(missing_headers))
             raise CatalogError(f"Catalog CSV missing required columns: {missing}")
+        if style_header is None:
+            LOGGER.warning(
+                "Catalog CSV missing style column 'Стили'; defaulting styles to %s",
+                STYLE_UNKNOWN,
+            )
 
         models: list[GlassModel] = []
         total_rows = 0
@@ -383,6 +392,8 @@ class GoogleSheetCatalog(CatalogService):
             img_nb_value = _clean_drive_url(normalized_row["img_nb"])
             img_user_value = _clean_drive_url(normalized_row["img_user"])
             gender_raw = normalized_row["gender"]
+            style_raw = normalized_row.get("style", "")
+            style = style_raw or STYLE_UNKNOWN
 
             required_values = {
                 "unique_id": unique_id,
@@ -460,6 +471,7 @@ class GoogleSheetCatalog(CatalogService):
                 img_user_url=img_user_url,
                 img_nano_url=img_nb_value,
                 gender=gender,
+                style=style,
             )
             models.append(model)
 
@@ -479,17 +491,38 @@ class GoogleSheetCatalog(CatalogService):
             skipped_folder,
             skipped_invalid,
         )
+        if models:
+            style_counts = Counter(model.style for model in models)
+            known_count = sum(
+                count for style, count in style_counts.items() if style != STYLE_UNKNOWN
+            )
+            top_styles = [
+                f"{style}:{count}"
+                for style, count in style_counts.most_common(5)
+                if style != STYLE_UNKNOWN
+            ]
+            LOGGER.info(
+                "Catalog styles: total=%s known=%s top=%s",
+                len(models),
+                known_count,
+                ", ".join(top_styles) if top_styles else "none",
+            )
         return models
 
 
 def _resolve_header_map(fieldnames: Iterable[str]) -> dict[str, str]:
     mapping: dict[str, str] = {}
+    style_header = None
     for name in fieldnames:
         normalized = _normalize_header(name)
+        if normalized == STYLE_HEADER_TOKEN and style_header is None:
+            style_header = name
         for canonical, synonyms in HEADER_SYNONYMS.items():
             if normalized in synonyms and canonical not in mapping:
                 mapping[canonical] = name
                 break
+    if style_header is not None:
+        mapping["style"] = style_header
     return mapping
 
 

@@ -74,7 +74,7 @@ class LeadsExporter:
             )
             info_domain(
                 "leads.export",
-                "📤 Экспорт лида — пропуск",
+                "Экспорт лида — пропуск",
                 stage="LEAD_EXPORT",
                 user_id=payload.tg_user_id,
                 reason="disabled",
@@ -90,7 +90,7 @@ class LeadsExporter:
             )
             info_domain(
                 "leads.export",
-                "📤 Экспорт лида — пропуск",
+                "Экспорт лида — пропуск",
                 stage="LEAD_EXPORT",
                 user_id=payload.tg_user_id,
                 reason="no_phone",
@@ -106,7 +106,7 @@ class LeadsExporter:
             )
             info_domain(
                 "leads.export",
-                "📤 Экспорт лида — пропуск",
+                "Экспорт лида — пропуск",
                 stage="LEAD_EXPORT",
                 user_id=payload.tg_user_id,
                 reason="config_missing",
@@ -136,7 +136,7 @@ class LeadsExporter:
             return False
         info_domain(
             "leads.export",
-            "📤 Экспорт лида — ok",
+            "Экспорт лида — ok",
             stage="LEAD_EXPORT",
             user_id=payload.tg_user_id,
             sheet=self._sheet_name,

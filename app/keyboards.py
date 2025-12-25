@@ -24,6 +24,18 @@ def _booking_button(site_url: str, *, as_callback: bool) -> InlineKeyboardButton
     return InlineKeyboardButton(text=msg.BOOKING_BUTTON_TEXT, url=sanitized)
 
 
+def _vote_callback_data(
+    vote: str,
+    generation_id: str,
+    style: str,
+    model_id: str | None = None,
+) -> str:
+    parts = ["vote", vote, generation_id, style]
+    if model_id:
+        parts.append(model_id)
+    return "|".join(parts)
+
+
 def start_keyboard() -> InlineKeyboardMarkup:
     """Keyboard for the start menu."""
 
@@ -111,11 +123,43 @@ def _truncate_title(title: str, max_length: int) -> str:
 
 
 def generation_result_keyboard(
-    site_url: str, remaining: int, *, show_more: bool = True
+    site_url: str,
+    remaining: int,
+    *,
+    show_more: bool = True,
+    vote_payload: Mapping[str, str] | None = None,
 ) -> InlineKeyboardMarkup:
     """Keyboard attached to the generation result message."""
 
-    rows = [[InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, url=site_url)]]
+    rows: list[list[InlineKeyboardButton]] = []
+    if vote_payload:
+        generation_id = str(vote_payload.get("generation_id") or "").strip()
+        style = str(vote_payload.get("style") or "").strip()
+        model_id = str(vote_payload.get("model_id") or "").strip() or None
+        if generation_id and style:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=msg.VOTE_LIKE_BUTTON_TEXT,
+                        callback_data=_vote_callback_data(
+                            "like",
+                            generation_id,
+                            style,
+                            model_id,
+                        ),
+                    ),
+                    InlineKeyboardButton(
+                        text=msg.VOTE_DISLIKE_BUTTON_TEXT,
+                        callback_data=_vote_callback_data(
+                            "dislike",
+                            generation_id,
+                            style,
+                            model_id,
+                        ),
+                    ),
+                ]
+            )
+    rows.append([InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, url=site_url)])
     if show_more and remaining > 0:
         rows.append(
             [
@@ -278,7 +322,12 @@ def more_buttonless_markup(
         site_url = payload_data.get("site_url")
         if not site_url:
             return None
-        return generation_result_keyboard(str(site_url), 0)
+        vote_payload = payload_data.get("vote_payload")
+        if vote_payload is not None and not isinstance(vote_payload, Mapping):
+            vote_payload = None
+        return generation_result_keyboard(
+            str(site_url), 0, vote_payload=vote_payload
+        )
     if message_type == "idle":
         site_url = payload_data.get("site_url")
         if not site_url:
