@@ -187,3 +187,6 @@ cython_debug/
 *.webp
 uploads/
 results/
+.env.example
+loop.db
+video/promo_start.meta.json
