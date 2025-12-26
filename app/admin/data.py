@@ -25,8 +25,8 @@ class AdminUserRow:
 
 
 def _open_readonly(db_path: Path) -> sqlite3.Connection:
-    db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
-    conn = sqlite3.connect(db_uri, uri=True, timeout=3)
+    db_uri = f"{db_path.resolve().as_posix()}"
+    conn = sqlite3.connect(f"file:{db_uri}?mode=ro", uri=True, timeout=3)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 3000")
     return conn
