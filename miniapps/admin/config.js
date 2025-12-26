@@ -1,3 +1,3 @@
 window.ADMIN_CONFIG = {
-  apiBaseUrl: "https://your-api-host",
+  apiBaseUrl: "https://flights-adoption-historic-cast.trycloudflare.com",
 };
