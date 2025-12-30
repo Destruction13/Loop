@@ -249,6 +249,65 @@ class Repository:
         moment = saved_at or datetime.now(timezone.utc)
         await asyncio.to_thread(self._save_contact_sync, user_id, phone_number, moment)
 
+    async def has_event_trigger_shown(self, user_id: int, event_id: str) -> bool:
+        return await asyncio.to_thread(
+            self._has_event_trigger_shown_sync, user_id, event_id
+        )
+
+    async def mark_event_trigger_shown(
+        self, user_id: int, event_id: str, *, shown_at: Optional[datetime] = None
+    ) -> bool:
+        moment = shown_at or datetime.now(timezone.utc)
+        lock = self._ensure_lock()
+        async with lock:
+            return await asyncio.to_thread(
+                self._mark_event_trigger_shown_sync, user_id, event_id, moment
+            )
+
+    async def unlock_event_free_attempt(self, user_id: int, event_id: str) -> None:
+        moment = datetime.now(timezone.utc)
+        lock = self._ensure_lock()
+        async with lock:
+            await asyncio.to_thread(
+                self._unlock_event_free_attempt_sync, user_id, event_id, moment
+            )
+
+    async def get_event_attempts(
+        self, user_id: int, event_id: str
+    ) -> tuple[bool, int, int]:
+        return await asyncio.to_thread(
+            self._get_event_attempts_sync, user_id, event_id
+        )
+
+    async def list_event_seen_scene_ids(
+        self, user_id: int, event_id: str
+    ) -> set[int]:
+        rows = await asyncio.to_thread(
+            self._list_event_seen_scene_ids_sync, user_id, event_id
+        )
+        return set(rows)
+
+    async def commit_event_success(
+        self,
+        user_id: int,
+        event_id: str,
+        scene_id: int,
+        *,
+        use_free: bool,
+        committed_at: Optional[datetime] = None,
+    ) -> tuple[bool, int, int]:
+        moment = committed_at or datetime.now(timezone.utc)
+        lock = self._ensure_lock()
+        async with lock:
+            return await asyncio.to_thread(
+                self._commit_event_success_sync,
+                user_id,
+                event_id,
+                scene_id,
+                use_free,
+                moment,
+            )
+
     async def add_seen_models(
         self, user_id: int, model_ids: Iterable[str], *, context: str = "global"
     ) -> None:
@@ -512,6 +571,7 @@ class Repository:
                 )
                 """
             )
+            self._ensure_event_tables(conn)
             conn.commit()
 
     def _row_to_profile(self, row: sqlite3.Row) -> UserProfile:
@@ -1297,9 +1357,173 @@ class Repository:
                 consent INTEGER NOT NULL,
                 consent_ts INTEGER NOT NULL,
                 reward_granted INTEGER NOT NULL DEFAULT 0
+                )
+            """
+        )
+
+    def _ensure_event_tables(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_triggers (
+                user_id INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                shown_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, event_id)
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_attempts (
+                user_id INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                free_unlocked INTEGER NOT NULL DEFAULT 0,
+                free_used INTEGER NOT NULL DEFAULT 0,
+                paid_used INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, event_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_seen (
+                user_id INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                scene_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, event_id, scene_id)
+            )
+            """
+        )
+
+    def _has_event_trigger_shown_sync(self, user_id: int, event_id: str) -> bool:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM event_triggers WHERE user_id = ? AND event_id = ?",
+                (user_id, event_id),
+            ).fetchone()
+            return row is not None
+
+    def _mark_event_trigger_shown_sync(
+        self, user_id: int, event_id: str, moment: datetime
+    ) -> bool:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO event_triggers (user_id, event_id, shown_at)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, event_id, moment.isoformat()),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def _unlock_event_free_attempt_sync(
+        self, user_id: int, event_id: str, moment: datetime
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO event_attempts (
+                    user_id, event_id, free_unlocked, free_used, paid_used, updated_at
+                )
+                VALUES (?, ?, 1, 0, 0, ?)
+                ON CONFLICT(user_id, event_id) DO UPDATE SET
+                    free_unlocked = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, event_id, moment.isoformat()),
+            )
+            conn.commit()
+
+    def _get_event_attempts_sync(
+        self, user_id: int, event_id: str
+    ) -> tuple[bool, int, int]:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT free_unlocked, free_used, paid_used
+                FROM event_attempts
+                WHERE user_id = ? AND event_id = ?
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            if not row:
+                return False, 0, 0
+            return bool(row[0]), int(row[1] or 0), int(row[2] or 0)
+
+    def _list_event_seen_scene_ids_sync(
+        self, user_id: int, event_id: str
+    ) -> list[int]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT scene_id FROM event_seen WHERE user_id = ? AND event_id = ?
+                """,
+                (user_id, event_id),
+            ).fetchall()
+            return [int(row[0]) for row in rows if row and row[0] is not None]
+
+    def _commit_event_success_sync(
+        self,
+        user_id: int,
+        event_id: str,
+        scene_id: int,
+        use_free: bool,
+        moment: datetime,
+    ) -> tuple[bool, int, int]:
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                """
+                SELECT free_unlocked, free_used, paid_used
+                FROM event_attempts
+                WHERE user_id = ? AND event_id = ?
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            free_unlocked = bool(row[0]) if row else False
+            free_used = int(row[1] or 0) if row else 0
+            paid_used = int(row[2] or 0) if row else 0
+            if use_free:
+                if not free_unlocked or free_used >= 1:
+                    raise RuntimeError("Free event attempt is not available")
+                free_used += 1
+            else:
+                if paid_used >= 10:
+                    raise RuntimeError("Paid event attempts are exhausted")
+                paid_used += 1
+            conn.execute(
+                """
+                INSERT INTO event_attempts (
+                    user_id, event_id, free_unlocked, free_used, paid_used, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, event_id) DO UPDATE SET
+                    free_unlocked = excluded.free_unlocked,
+                    free_used = excluded.free_used,
+                    paid_used = excluded.paid_used,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    user_id,
+                    event_id,
+                    1 if free_unlocked else 0,
+                    free_used,
+                    paid_used,
+                    moment.isoformat(),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO event_seen (user_id, event_id, scene_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, event_id, scene_id, moment.isoformat()),
+            )
+            conn.commit()
+            return free_unlocked, free_used, paid_used
 
     def _start_new_cycle(self, profile: UserProfile, now: datetime) -> None:
         profile.cycle_index = (profile.cycle_index or 0) + 1

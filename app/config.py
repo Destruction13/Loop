@@ -49,6 +49,7 @@ def _extract_sheet_id_and_gid(url_or_id: Optional[str]) -> tuple[Optional[str], 
         return None, None
 DEFAULT_PRIVACY_POLICY_URL = "https://telegra.ph/Politika-konfidencialnosti-LOOV-10-29"
 DEFAULT_LANDING_URL = "https://loov.ru/"
+DEFAULT_EVENT_MODEL_NAME = "gemini-3-pro-image-preview"
 
 
 @dataclass(slots=True)
@@ -142,6 +143,12 @@ class Config:
     analytics_spreadsheet_id: str | None
     admin_webapp_url: str | None
     admin_api_base_url: str | None
+    event_enabled: bool
+    event_id: str
+    event_scenes_sheet: str | None
+    event_prompt_json: str
+    event_debug_bundle: bool
+    event_model_name: str
 
 
 def _require_env(name: str) -> str:
@@ -316,6 +323,21 @@ def load_config(env_file: str | None = None) -> Config:
     analytics_spreadsheet_id = (_optional_env("LOG_SHEET_ID") or "").strip() or None
     admin_webapp_url = _optional_url("ADMIN_WEBAPP_URL")
     admin_api_base_url = _optional_url("ADMIN_API_BASE_URL")
+    event_enabled = _parse_toggle_env("EVENT_ENABLED", default=False)
+    event_id = (_optional_env("EVENT_ID") or "").strip()
+    event_scenes_sheet = (_optional_env("EVENT_SCENES_SHEET") or "").strip() or None
+    event_prompt_json = (_optional_env("EVENT_PROMPT_JSON") or "").strip()
+    event_debug_bundle = _parse_toggle_env("EVENT_DEBUG_BUNDLE", default=False)
+    event_model_name = (_optional_env("EVENT_MODEL_NAME") or "").strip()
+    if not event_model_name:
+        event_model_name = DEFAULT_EVENT_MODEL_NAME
+    if event_model_name.startswith("models/"):
+        event_model_name = event_model_name.replace("models/", "", 1)
+    if event_enabled:
+        if not event_id:
+            raise RuntimeError("EVENT_ID must be set when EVENT_ENABLED=ON")
+        if not event_scenes_sheet:
+            raise RuntimeError("EVENT_SCENES_SHEET must be set when EVENT_ENABLED=ON")
 
     return Config(
         bot_token=bot_token,
@@ -372,6 +394,12 @@ def load_config(env_file: str | None = None) -> Config:
         analytics_spreadsheet_id=analytics_spreadsheet_id,
         admin_webapp_url=admin_webapp_url,
         admin_api_base_url=admin_api_base_url,
+        event_enabled=event_enabled,
+        event_id=event_id,
+        event_scenes_sheet=event_scenes_sheet,
+        event_prompt_json=event_prompt_json,
+        event_debug_bundle=event_debug_bundle,
+        event_model_name=event_model_name,
     )
 
 

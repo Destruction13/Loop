@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import asyncio
 from email import message
+import hashlib
 import io
 import json
+import random
 import time
 import uuid
 from dataclasses import dataclass
@@ -36,10 +38,21 @@ from app.keyboards import (
     CONTACT_NEVER_CALLBACK,
     CONTACT_SHARE_CALLBACK,
     CONTACT_SKIP_CALLBACK,
+    EVENT_BACK_CALLBACK,
+    EVENT_MORE_CALLBACK,
+    EVENT_NEW_PHOTO_CALLBACK,
+    EVENT_REUSE_PHOTO_CALLBACK,
+    EVENT_TRY_CALLBACK,
     REUSE_SAME_PHOTO_CALLBACK,
     batch_selection_keyboard,
     contact_request_keyboard,
     contact_share_reply_keyboard,
+    event_back_to_wear_keyboard,
+    event_attempts_exhausted_keyboard,
+    event_phone_keyboard,
+    event_phone_bonus_keyboard,
+    event_trigger_keyboard,
+    event_try_more_keyboard,
     gender_keyboard,
     generation_result_keyboard,
     idle_reminder_keyboard,
@@ -54,7 +67,7 @@ from app.keyboards import (
 )
 from app.models import FilterOptions, GlassModel, UserContact, UserProfile, STYLE_UNKNOWN
 from app.services.catalog_base import CatalogError, CatalogService
-from app.config import CollageConfig
+from app.config import CollageConfig, DEFAULT_EVENT_MODEL_NAME
 from app.media import probe_video_size
 from app.services.collage import (
     CollageProcessingError,
@@ -62,10 +75,11 @@ from app.services.collage import (
     build_three_tile_collage,
 )
 from app.services.contact_export import ContactRecord, ContactSheetExporter
+from app.services.event_scenes import EventScenesService
 from app.services.leads_export import LeadPayload, LeadsExporter
 from app.services.repository import Repository
 from app.infrastructure.concurrency import with_generation_slot
-from app.services.drive_fetch import fetch_drive_file
+from app.services.drive_fetch import fetch_drive_bytes, fetch_drive_file
 from app.services.image_io import (
     redownload_user_photo,
     resize_inplace,
@@ -73,12 +87,14 @@ from app.services.image_io import (
 )
 from app.services.nanobanana import (
     NanoBananaGenerationError,
+    generate_event,
     generate_glasses,
 )
 from app.recommender import StyleRecommender, VOTE_DUPLICATE, VOTE_INVALID, VOTE_OK
 from app.utils.phone import normalize_phone
+from app.utils.paths import ensure_dir
 from app.texts import messages as msg
-from logger import get_logger, info_domain
+from logger import bind_context, get_logger, info_domain, reset_context
 
 
 class TryOnStates(StatesGroup):
@@ -171,6 +187,12 @@ def setup_router(
     promo_video_enabled: bool,
     promo_video_width: int | None,
     promo_video_height: int | None,
+    event_enabled: bool = False,
+    event_id: str | None = None,
+    event_scenes_sheet: str | None = None,
+    event_prompt_json: str | None = None,
+    event_debug_bundle: bool = False,
+    event_model_name: str | None = None,
 ) -> Router:
     router = Router()
     logger = get_logger("bot.handlers")
@@ -194,6 +216,64 @@ def setup_router(
     )
     BUSY_STATES = {TryOnStates.GENERATING.state, TryOnStates.SHOW_RECS.state}
     INVISIBLE_PROMPT = "\u2060"
+    EVENT_FREE_LIMIT = 1
+    EVENT_PAID_LIMIT = 10
+    EVENT_INFLIGHT_TTL_SEC = 120
+    ACTIVE_MODE_WEAR = "WEAR"
+    ACTIVE_MODE_EVENT = "EVENT"
+
+    event_key = (event_id or "").strip()
+    event_prompt = (event_prompt_json or "").strip()
+    event_ready = bool(event_enabled and event_key and event_scenes_sheet and event_prompt)
+    event_debug_enabled = bool(event_debug_bundle)
+    resolved_event_model_name = (event_model_name or "").strip() or DEFAULT_EVENT_MODEL_NAME
+    if resolved_event_model_name.startswith("models/"):
+        resolved_event_model_name = resolved_event_model_name.replace("models/", "", 1)
+    event_scenes = (
+        EventScenesService(event_scenes_sheet) if event_ready else None
+    )
+    event_inflight: dict[tuple[int, str, int | None], float] = {}
+    event_inflight_lock = asyncio.Lock()
+
+    if event_enabled and not event_ready:
+        logger.warning(
+            "Event enabled but not fully configured",
+            extra={"stage": "EVENT_CONFIG"},
+        )
+
+    def _event_log_human(message: str, *, user_id: int | str | None = None) -> None:
+        info_domain("event", message, user_id=user_id, event_human=True)
+
+    def _event_model_label(model_name: str) -> str:
+        normalized = model_name.strip()
+        if normalized.startswith("models/"):
+            normalized = normalized.replace("models/", "", 1)
+        if normalized.startswith("gemini-3-pro"):
+            return "Gemini 3 Pro"
+        return normalized
+
+    event_model_label = _event_model_label(resolved_event_model_name)
+
+    def _event_result_caption(*, attempts_left: int) -> str:
+        if attempts_left > 0:
+            return msg.EVENT_SUCCESS_FOOTER
+        return msg.EVENT_SUCCESS_FOOTER_EXHAUSTED
+
+    def _event_result_keyboard(
+        model: GlassModel | None, *, attempts_left: int
+    ) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        site_url = (getattr(model, "site_url", None) or "").strip()
+        if site_url:
+            base = generation_result_keyboard(
+                site_url, remaining=0, show_more=False, vote_payload=None
+            )
+            rows.extend(base.inline_keyboard)
+        if attempts_left > 0:
+            rows.extend(event_try_more_keyboard(attempts_left).inline_keyboard)
+        else:
+            rows.extend(event_back_to_wear_keyboard().inline_keyboard)
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def _format_model_button_label(model: GlassModel) -> str:
         title = (model.title or "").strip()
@@ -405,6 +485,357 @@ def setup_router(
                 extra={"stage": "CONTACT_KEYBOARD_REMOVE"},
             )
 
+    def _new_event_rid() -> str:
+        return uuid.uuid4().hex[:8]
+
+    def _event_mime_from_path(path: Path) -> str:
+        suffix = path.suffix.lower()
+        if suffix in {".jpg", ".jpeg"}:
+            return "image/jpeg"
+        if suffix == ".png":
+            return "image/png"
+        return "image/jpeg"
+
+    def _extension_from_mime(mime: str) -> str:
+        normalized = (mime or "").lower()
+        if "jpeg" in normalized or "jpg" in normalized:
+            return "jpg"
+        if "png" in normalized:
+            return "png"
+        if "webp" in normalized:
+            return "webp"
+        return "bin"
+
+    def _bytes_signature(data: bytes, length: int = 16) -> str:
+        return data[:length].hex()
+
+    def _detect_bytes_kind(data: bytes) -> str:
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if data.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+        stripped = data.lstrip()
+        if stripped.startswith(b"{") or stripped.startswith(b"["):
+            return "application/json"
+        if stripped.startswith(b"<"):
+            return "text/html"
+        return "unknown"
+
+    def _safe_write_debug_bytes(
+        path: Path, payload: bytes, *, user_id: int, label: str
+    ) -> None:
+        try:
+            path.write_bytes(payload)
+        except OSError as exc:
+            info_domain(
+                "event",
+                "Event debug write failed",
+                stage="EVENT_DEBUG_WRITE_FAILED",
+                user_id=user_id,
+                event_id=event_key,
+                label=label,
+                error_type=exc.__class__.__name__,
+            )
+
+    def _safe_write_debug_text(
+        path: Path, payload: str, *, user_id: int, label: str
+    ) -> None:
+        try:
+            path.write_text(payload, encoding="utf-8")
+        except OSError as exc:
+            info_domain(
+                "event",
+                "Event debug write failed",
+                stage="EVENT_DEBUG_WRITE_FAILED",
+                user_id=user_id,
+                event_id=event_key,
+                label=label,
+                error_type=exc.__class__.__name__,
+            )
+
+    def _safe_write_debug_json(
+        path: Path, payload: Mapping[str, Any], *, user_id: int, label: str
+    ) -> None:
+        try:
+            path.write_text(
+                json.dumps(payload, ensure_ascii=True, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            info_domain(
+                "event",
+                "Event debug write failed",
+                stage="EVENT_DEBUG_WRITE_FAILED",
+                user_id=user_id,
+                event_id=event_key,
+                label=label,
+                error_type=exc.__class__.__name__,
+            )
+
+    def _normalize_active_mode(value: str | None) -> str:
+        if value and value.upper() == ACTIVE_MODE_EVENT:
+            return ACTIVE_MODE_EVENT
+        return ACTIVE_MODE_WEAR
+
+    def _get_active_mode(data: Mapping[str, Any]) -> str:
+        return _normalize_active_mode(data.get("active_mode"))
+
+    async def _set_active_mode(
+        state: FSMContext, user_id: int, mode: str, *, source: str
+    ) -> None:
+        normalized = _normalize_active_mode(mode)
+        data = await state.get_data()
+        current = _normalize_active_mode(data.get("active_mode"))
+        if current == normalized:
+            return
+        await state.update_data(active_mode=normalized)
+        info_domain(
+            "event",
+            "Mode switched",
+            stage="MODE_SWITCH",
+            user_id=user_id,
+            event_id=event_key,
+            source=source,
+            from_mode=current,
+            to_mode=normalized,
+        )
+
+    def _normalize_cycle(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_event_photo_context(
+        data: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        upload = data.get("event_upload")
+        upload_file_id = data.get("event_upload_file_id")
+        last_photo_file_id = data.get("event_last_photo_file_id")
+        if not (upload or upload_file_id or last_photo_file_id):
+            return None
+        return {
+            "upload": upload,
+            "upload_file_id": upload_file_id,
+            "last_photo_file_id": last_photo_file_id,
+        }
+
+    def _extract_wear_photo_context(
+        data: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        upload = data.get("upload")
+        upload_file_id = data.get("upload_file_id")
+        last_photo_file_id = data.get("last_photo_file_id")
+        if not (upload or upload_file_id or last_photo_file_id):
+            return None
+        return {
+            "upload": upload,
+            "upload_file_id": upload_file_id,
+            "last_photo_file_id": last_photo_file_id,
+        }
+
+    def _has_photo_context(context: Mapping[str, Any] | None) -> bool:
+        if not context:
+            return False
+        return bool(
+            context.get("upload")
+            or context.get("upload_file_id")
+            or context.get("last_photo_file_id")
+        )
+
+    async def _store_event_photo_context(
+        state: FSMContext,
+        context: Mapping[str, Any],
+        *,
+        cycle_id: int | None = None,
+    ) -> None:
+        updates = {
+            "event_upload": context.get("upload"),
+            "event_upload_file_id": context.get("upload_file_id"),
+            "event_last_photo_file_id": context.get("last_photo_file_id"),
+        }
+        if cycle_id is not None:
+            updates["event_current_cycle"] = cycle_id
+        await state.update_data(**updates)
+
+    async def _seed_event_photo_from_wear(
+        state: FSMContext,
+        *,
+        user_id: int,
+    ) -> tuple[dict[str, Any] | None, int | None]:
+        data = await state.get_data()
+        if _extract_event_photo_context(data):
+            return None, None
+        wear_context = _extract_wear_photo_context(data)
+        if not wear_context:
+            return None, None
+        cycle_id = _normalize_cycle(data.get("current_cycle"))
+        if cycle_id is None:
+            cycle_id = await _ensure_current_cycle_id(state, user_id)
+        await _store_event_photo_context(state, wear_context, cycle_id=cycle_id)
+        return wear_context, cycle_id
+
+    async def _register_event_session(
+        state: FSMContext,
+        message: Message,
+        *,
+        cycle_id: int | None,
+        photo_context: Mapping[str, Any],
+    ) -> None:
+        resolved_cycle = _normalize_cycle(cycle_id)
+        if resolved_cycle is None:
+            return
+        data = await state.get_data()
+        sessions = dict(data.get("event_sessions", {}))
+        sessions[str(message.message_id)] = {
+            "upload": photo_context.get("upload"),
+            "upload_file_id": photo_context.get("upload_file_id"),
+            "last_photo_file_id": photo_context.get("last_photo_file_id"),
+            "cycle": resolved_cycle,
+        }
+        if len(sessions) > 100:
+            keep_keys = list(sessions.keys())[-100:]
+            sessions = {key: sessions[key] for key in keep_keys}
+        await state.update_data(event_sessions=sessions)
+
+    def _log_event_user_id_sanity(
+        *,
+        user_id: int,
+        bot_id: int,
+        chat_id: int | None,
+        from_user_id: int | None,
+        source: str,
+    ) -> bool:
+        info_domain(
+            "event",
+            "Event user_id sanity",
+            stage="EVENT_USER_ID_SANITY",
+            user_id=user_id,
+            event_id=event_key,
+            source=source,
+            bot_id=bot_id,
+            chat_id=chat_id,
+            from_user_id=from_user_id,
+        )
+        if user_id == bot_id:
+            info_domain(
+                "event",
+                "Event user_id bug",
+                stage="EVENT_USER_ID_BUG",
+                user_id=user_id,
+                event_id=event_key,
+                source=source,
+                bot_id=bot_id,
+                chat_id=chat_id,
+                from_user_id=from_user_id,
+            )
+            return False
+        return True
+
+    async def _safe_answer_callback(
+        callback: CallbackQuery, *, user_id: int, source: str
+    ) -> None:
+        started_at = time.perf_counter()
+        try:
+            await callback.answer()
+            delta_ms = int((time.perf_counter() - started_at) * 1000)
+            info_domain(
+                "event",
+                "Event callback answered",
+                stage="EVENT_CALLBACK_ANSWERED",
+                user_id=user_id,
+                event_id=event_key,
+                source=source,
+                delta_ms_from_received=delta_ms,
+            )
+        except Exception as exc:  # noqa: BLE001
+            delta_ms = int((time.perf_counter() - started_at) * 1000)
+            info_domain(
+                "event",
+                "Event callback answer failed",
+                stage="EVENT_CALLBACK_ANSWER_FAILED",
+                user_id=user_id,
+                event_id=event_key,
+                source=source,
+                delta_ms_from_received=delta_ms,
+                error_type=exc.__class__.__name__,
+                error_detail=str(exc),
+            )
+
+    async def _maybe_delete_event_attempts_message(
+        message: Message, state: FSMContext, user_id: int
+    ) -> None:
+        data = await state.get_data()
+        message_id = data.get("event_attempts_message_id")
+        if not message_id:
+            return
+        if message.message_id != message_id:
+            return
+        try:
+            await message.bot.delete_message(message.chat.id, int(message_id))
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            info_domain(
+                "event",
+                "Event postprocess Telegram error",
+                stage="EVENT_POSTPROCESS_TG_ERROR",
+                user_id=user_id,
+                event_id=event_key,
+                action="delete_event_attempts_message",
+                error_type=exc.__class__.__name__,
+            )
+        finally:
+            updates: dict[str, Any] = {"event_attempts_message_id": None}
+            if data.get("contact_prompt_message_id") == message_id:
+                updates["contact_prompt_message_id"] = None
+            await state.update_data(**updates)
+
+    async def _acquire_event_lock(user_id: int, *, cycle_id: int | None) -> bool:
+        key = (user_id, event_key, cycle_id)
+        now = time.time()
+        async with event_inflight_lock:
+            stale = [
+                item_key
+                for item_key, ts in event_inflight.items()
+                if now - ts > EVENT_INFLIGHT_TTL_SEC
+            ]
+            for item_key in stale:
+                event_inflight.pop(item_key, None)
+            if key in event_inflight:
+                return False
+            event_inflight[key] = now
+            return True
+
+    async def _release_event_lock(user_id: int, *, cycle_id: int | None) -> None:
+        key = (user_id, event_key, cycle_id)
+        async with event_inflight_lock:
+            event_inflight.pop(key, None)
+
+    async def _event_phone_present(user_id: int) -> bool:
+        contact = await repository.get_user_contact(user_id)
+        return bool(contact and contact.consent)
+
+    async def _event_attempts_snapshot(
+        user_id: int, phone_present: bool
+    ) -> tuple[bool, int, int, bool, int, int]:
+        free_unlocked, free_used, paid_used = await repository.get_event_attempts(
+            user_id, event_key
+        )
+        free_available = free_unlocked and free_used < EVENT_FREE_LIMIT
+        paid_remaining = (
+            max(EVENT_PAID_LIMIT - paid_used, 0) if phone_present else 0
+        )
+        attempts_left = (1 if free_available else 0) + paid_remaining
+        return (
+            free_unlocked,
+            free_used,
+            paid_used,
+            free_available,
+            paid_remaining,
+            attempts_left,
+        )
+
 
     async def _is_generation_in_progress(state: FSMContext) -> bool:
         data = await state.get_data()
@@ -441,6 +872,1144 @@ def setup_router(
                 or data.get("generation_progress_message_id")
             )
         return False
+
+    def _event_attempts_left(
+        *, phone_present: bool, free_unlocked: bool, free_used: int, paid_used: int
+    ) -> int:
+        free_available = free_unlocked and free_used < EVENT_FREE_LIMIT
+        paid_remaining = max(EVENT_PAID_LIMIT - paid_used, 0) if phone_present else 0
+        return (1 if free_available else 0) + paid_remaining
+
+    async def _maybe_show_event_trigger(message: Message, user_id: int) -> None:
+        if not event_ready:
+            return
+        if await repository.has_event_trigger_shown(user_id, event_key):
+            return
+        try:
+            await message.answer(
+                msg.EVENT_TRIGGER_TEXT,
+                reply_markup=event_trigger_keyboard(),
+            )
+        except TelegramBadRequest as exc:
+            logger.debug("Failed to send event trigger: %s", exc)
+            return
+        inserted = await repository.mark_event_trigger_shown(user_id, event_key)
+        if inserted:
+            info_domain(
+                "event",
+                "Event trigger shown",
+                stage="EVENT_TRIGGER_SHOWN",
+                user_id=user_id,
+                event_id=event_key,
+            )
+
+    async def _send_event_phone_prompt(
+        message: Message, state: FSMContext, user_id: int
+    ) -> None:
+        data = await state.get_data()
+        if data.get("contact_request_active"):
+            return
+        contact = await repository.get_user_contact(user_id)
+        if contact and contact.consent:
+            return
+        await _dismiss_reply_keyboard(message)
+        prompt_message = await message.answer(
+            msg.EVENT_PHONE_PROMPT,
+            reply_markup=event_phone_keyboard(),
+        )
+        await state.update_data(
+            contact_request_active=True,
+            contact_pending_generation=False,
+            contact_pending_result_state=None,
+            contact_prompt_message_id=prompt_message.message_id,
+            contact_prompt_due=None,
+            phone_bad_attempts=0,
+            phone_invalid_message_id=None,
+        )
+        await state.set_state(ContactRequest.waiting_for_phone)
+
+    async def _send_event_attempts_exhausted(
+        message: Message,
+        state: FSMContext,
+        *,
+        user_id: int,
+        phone_present: bool,
+    ) -> None:
+        reply_markup = event_attempts_exhausted_keyboard(
+            show_phone_button=not phone_present
+        )
+        exhausted_message = await message.answer(
+            msg.EVENT_ATTEMPTS_EXHAUSTED,
+            reply_markup=reply_markup,
+        )
+        await state.update_data(event_attempts_message_id=exhausted_message.message_id)
+        if phone_present:
+            return
+        await state.update_data(
+            contact_request_active=True,
+            contact_pending_generation=False,
+            contact_pending_result_state=None,
+            contact_prompt_message_id=exhausted_message.message_id,
+            contact_prompt_due=None,
+            phone_bad_attempts=0,
+            phone_invalid_message_id=None,
+        )
+        await state.set_state(ContactRequest.waiting_for_phone)
+
+    async def _prompt_event_photo(
+        message: Message,
+        state: FSMContext,
+        *,
+        user_id: int,
+        source: str,
+    ) -> None:
+        await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source=source)
+        await state.set_state(TryOnStates.AWAITING_PHOTO)
+        await message.answer(
+            msg.EVENT_NEED_PHOTO,
+            reply_markup=event_back_to_wear_keyboard(),
+        )
+
+    async def _run_event_generation(
+        message: Message,
+        state: FSMContext,
+        *,
+        user_id: int,
+        source: str,
+        attempts_snapshot: tuple[bool, int, int, bool, int, int] | None = None,
+        phone_present: bool | None = None,
+        photo_context: dict[str, Any] | None = None,
+        event_cycle_id: int | None = None,
+    ) -> None:
+        if not event_enabled:
+            await message.answer(msg.EVENT_DISABLED)
+            return
+        if not event_ready:
+            await message.answer(msg.EVENT_DISABLED)
+            return
+        data = await state.get_data()
+        if await _is_generation_in_progress(state):
+            if _get_active_mode(data) == ACTIVE_MODE_WEAR:
+                await message.answer(msg.GENERATION_BUSY)
+                return
+        current_state = await state.get_state()
+        if current_state == ContactRequest.waiting_for_phone.state:
+            await message.answer(msg.GENERATION_BUSY)
+            return
+
+        if attempts_snapshot is None:
+            phone_present = await _event_phone_present(user_id)
+            (
+                free_unlocked,
+                free_used,
+                paid_used,
+                free_available,
+                paid_remaining,
+                attempts_left,
+            ) = await _event_attempts_snapshot(user_id, phone_present)
+        else:
+            if phone_present is None:
+                phone_present = await _event_phone_present(user_id)
+            (
+                free_unlocked,
+                free_used,
+                paid_used,
+                free_available,
+                paid_remaining,
+                attempts_left,
+            ) = attempts_snapshot
+        generation_latency_ms = 0
+
+        def _event_log_failure(reason: str, *, attempts_charged: bool = False) -> None:
+            charged_label = "да" if attempts_charged else "нет"
+            _event_log_human(
+                f"❌ Ошибка генерации: {reason}. Попытка списана: {charged_label}",
+                user_id=user_id,
+            )
+        info_domain(
+            "event",
+            "Event phone present",
+            stage="EVENT_PHONE_PRESENT",
+            user_id=user_id,
+            event_id=event_key,
+            phone_present=phone_present,
+        )
+        info_domain(
+            "event",
+            "Event entry",
+            stage="EVENT_ENTER",
+            user_id=user_id,
+            event_id=event_key,
+            source=source,
+            phone_present=phone_present,
+            free_available=free_available,
+            paid_available=paid_remaining,
+        )
+        if attempts_left <= 0:
+            if not phone_present and not free_unlocked:
+                await message.answer(msg.EVENT_NO_ACCESS)
+                return
+            await _send_event_attempts_exhausted(
+                message,
+                state,
+                user_id=user_id,
+                phone_present=phone_present,
+            )
+            return
+
+        resolved_context = (
+            dict(photo_context) if photo_context else _extract_event_photo_context(data)
+        )
+        if not _has_photo_context(resolved_context):
+            await _prompt_event_photo(message, state, user_id=user_id, source=source)
+            return
+        resolved_cycle = event_cycle_id
+        if resolved_cycle is None:
+            resolved_cycle = _normalize_cycle(data.get("event_current_cycle"))
+        if resolved_cycle is None:
+            resolved_cycle = await _ensure_current_cycle_id(state, user_id)
+        await _store_event_photo_context(
+            state,
+            resolved_context or {},
+            cycle_id=resolved_cycle,
+        )
+
+        if not await _acquire_event_lock(user_id, cycle_id=resolved_cycle):
+            info_domain(
+                "event",
+                "Event inflight rejected",
+                stage="EVENT_INFLIGHT_REJECTED",
+                user_id=user_id,
+                event_id=event_key,
+                source=source,
+                cycle_id=resolved_cycle,
+            )
+            await message.answer(msg.GENERATION_BUSY)
+            return
+
+        lock_cycle_id = resolved_cycle
+        rid = _new_event_rid()
+        tokens = bind_context(request_id=rid, user_id=user_id)
+        debug_dir: Path | None = None
+        debug_meta: dict[str, Any] | None = None
+        request_meta_path: Path | None = None
+        if event_debug_enabled:
+            debug_dir = ensure_dir(Path("./results/debug"))
+            debug_meta = {
+                "rid": rid,
+                "user_id": user_id,
+                "event_id": event_key,
+                "source": source,
+            }
+            request_meta_path = debug_dir / f"request_meta_{rid}.json"
+        progress_message: Message | None = None
+        progress_message_id: int | None = None
+        user_photo_path: Path | None = None
+        start_time = 0.0
+        source_kind: str | None = None
+
+        def _write_debug_meta() -> None:
+            if not debug_dir or not debug_meta or not request_meta_path:
+                return
+            _safe_write_debug_json(
+                request_meta_path,
+                debug_meta,
+                user_id=user_id,
+                label="request_meta",
+            )
+
+        async def _edit_progress(text: str) -> None:
+            nonlocal progress_message
+            if not progress_message:
+                return
+            try:
+                await progress_message.edit_text(text)
+            except TelegramBadRequest as exc:
+                logger.debug(
+                    "Failed to edit event progress message %s: %s",
+                    getattr(progress_message, "message_id", None),
+                    exc,
+                )
+                progress_message = None
+
+        async def _delete_progress() -> None:
+            nonlocal progress_message, progress_message_id
+            if progress_message_id:
+                try:
+                    await message.bot.delete_message(
+                        message.chat.id, int(progress_message_id)
+                    )
+                except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                    info_domain(
+                        "event",
+                        "Event postprocess Telegram error",
+                        stage="EVENT_POSTPROCESS_TG_ERROR",
+                        user_id=user_id,
+                        event_id=event_key,
+                        action="delete_progress_message",
+                        error_type=exc.__class__.__name__,
+                    )
+            progress_message = None
+            progress_message_id = None
+
+        try:
+            _event_log_human(
+                f"📸 Пользователь отправил фото (event_id={event_key}, попыток до: {attempts_left})",
+                user_id=user_id,
+            )
+            _event_log_human(
+                f"🧠 Модель генерации: {event_model_label} (EVENT)",
+                user_id=user_id,
+            )
+            info_domain(
+                "event",
+                "Event try request",
+                stage="EVENT_TRY_REQUEST",
+                user_id=user_id,
+                event_id=event_key,
+                attempts_left_before=attempts_left,
+            )
+            use_free = free_available
+            attempts_left_after = max(attempts_left - 1, 0)
+
+            progress_message = await message.answer(msg.EVENT_STARTING)
+            progress_message_id = getattr(progress_message, "message_id", None)
+
+            upload_value = None
+            upload_file_id = None
+            last_photo_file_id = None
+            if resolved_context:
+                upload_value = resolved_context.get("upload")
+                upload_file_id = resolved_context.get("upload_file_id")
+                last_photo_file_id = resolved_context.get("last_photo_file_id")
+            file_id = upload_file_id or last_photo_file_id
+            face_source = "event_upload"
+            source_kind = "path"
+            if upload_value and Path(upload_value).exists():
+                user_photo_path = Path(upload_value)
+            elif file_id:
+                face_source = (
+                    "event_upload_file_id"
+                    if upload_file_id
+                    else "event_last_photo_file_id"
+                )
+                source_kind = "file_id"
+                downloaded = await redownload_user_photo(
+                    message.bot, file_id, user_id
+                )
+                user_photo_path = Path(downloaded)
+            else:
+                await _prompt_event_photo(
+                    message, state, user_id=user_id, source=source
+                )
+                info_domain(
+                    "event",
+                    "Event face missing",
+                    stage="EVENT_FACE_MISSING",
+                    user_id=user_id,
+                    event_id=event_key,
+                    source=face_source,
+                )
+                _event_log_failure("не удалось получить фото")
+                return
+            await asyncio.to_thread(resize_inplace, user_photo_path)
+            face_bytes = user_photo_path.read_bytes()
+            face_mime = _event_mime_from_path(user_photo_path)
+            if not face_bytes:
+                await _prompt_event_photo(
+                    message, state, user_id=user_id, source=source
+                )
+                info_domain(
+                    "event",
+                    "Event face missing",
+                    stage="EVENT_FACE_MISSING",
+                    user_id=user_id,
+                    event_id=event_key,
+                    source=face_source,
+                )
+                _event_log_failure("не удалось получить фото")
+                return
+            face_hash = hashlib.sha256(face_bytes).hexdigest()[:12]
+            if debug_dir and debug_meta:
+                face_ext = _extension_from_mime(face_mime)
+                _safe_write_debug_bytes(
+                    debug_dir / f"face_{rid}.{face_ext}",
+                    face_bytes,
+                    user_id=user_id,
+                    label="face",
+                )
+                debug_meta.update(
+                    {
+                        "face": {
+                            "bytes": len(face_bytes),
+                            "hash": face_hash,
+                            "mime": face_mime,
+                            "source": face_source,
+                            "source_kind": source_kind,
+                        }
+                    }
+                )
+                _write_debug_meta()
+            info_domain(
+                "event",
+                "Face selected",
+                stage="EVENT_SELECT_FACE",
+                user_id=user_id,
+                event_id=event_key,
+                source=face_source,
+                source_kind=source_kind,
+                face_bytes=len(face_bytes),
+                face_hash=face_hash,
+                face_mime=face_mime,
+            )
+
+            await _edit_progress(msg.PROGRESS_DOWNLOADING_GLASSES)
+
+            try:
+                snapshot = await catalog.snapshot()
+            except CatalogError as exc:
+                info_domain(
+                    "event",
+                    "Event failed: catalog unavailable",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="frame_catalog",
+                    error_type=exc.__class__.__name__,
+                    retryable=True,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("не удалось получить каталог оправ")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+            models = [model for model in snapshot.models if model.img_nano_url]
+            if not models:
+                info_domain(
+                    "event",
+                    "Event failed: no frames",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="frame_select",
+                    error_type="no_frames",
+                    retryable=False,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("нет доступных оправ")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+            rng = random.Random()
+            rng.shuffle(models)
+
+            frame_model: GlassModel | None = None
+            frame_download = None
+            frame_attempts = 0
+            for idx, model in enumerate(models[: min(len(models), 5)], start=1):
+                frame_attempts = idx
+                try:
+                    download = await fetch_drive_bytes(model.img_nano_url, retries=3)
+                except Exception as exc:  # noqa: BLE001
+                    info_domain(
+                        "event",
+                        "Frame download failed",
+                        stage="EVENT_SELECT_FRAME",
+                        user_id=user_id,
+                        event_id=event_key,
+                        model_id=model.unique_id,
+                        model_code=model.model_code,
+                        url=model.img_nano_url,
+                        retry_count=idx - 1,
+                        ok=False,
+                        error_type=exc.__class__.__name__,
+                    )
+                    continue
+                frame_model = model
+                frame_download = download
+                info_domain(
+                    "event",
+                    "Frame selected",
+                    stage="EVENT_SELECT_FRAME",
+                    user_id=user_id,
+                    event_id=event_key,
+                    model_id=model.unique_id,
+                    model_code=model.model_code,
+                    url=model.img_nano_url,
+                    retry_count=idx - 1,
+                    ok=True,
+                )
+                break
+            if frame_model is None or frame_download is None:
+                info_domain(
+                    "event",
+                    "Event failed: frame download",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="frame_select",
+                    error_type="frame_download_failed",
+                    retryable=True,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("не удалось скачать оправу")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+            frame_hash = hashlib.sha256(frame_download.data).hexdigest()[:12]
+            if debug_dir and debug_meta:
+                frame_ext = frame_download.extension or _extension_from_mime(
+                    frame_download.mime
+                )
+                _safe_write_debug_bytes(
+                    debug_dir / f"frame_{rid}.{frame_ext}",
+                    frame_download.data,
+                    user_id=user_id,
+                    label="frame",
+                )
+                debug_meta.update(
+                    {
+                        "frame": {
+                            "bytes": frame_download.size,
+                            "hash": frame_hash,
+                            "mime": frame_download.mime,
+                            "drive_id": frame_download.drive_id,
+                        },
+                        "model_id": frame_model.unique_id,
+                        "model_code": frame_model.model_code,
+                    }
+                )
+                _write_debug_meta()
+
+            await _edit_progress(msg.EVENT_PROGRESS_DOWNLOADING_SCENE)
+
+            if event_scenes is None:
+                info_domain(
+                    "event",
+                    "Event failed: scenes not configured",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="scene_select",
+                    error_type="no_scenes",
+                    retryable=False,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("нет доступных сцен")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+            try:
+                scenes = await event_scenes.list_scenes()
+            except Exception as exc:  # noqa: BLE001
+                info_domain(
+                    "event",
+                    "Event failed: scenes list",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="scene_list",
+                    error_type=exc.__class__.__name__,
+                    retryable=True,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("не удалось получить список сцен")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+            seen_ids = await repository.list_event_seen_scene_ids(
+                user_id, event_key
+            )
+            candidates = [scene for scene in scenes if scene.scene_id not in seen_ids]
+            repeated = False
+            if not candidates:
+                candidates = list(scenes)
+                repeated = True
+            rng.shuffle(candidates)
+            chosen_scene = None
+            scene_download = None
+            for idx, scene in enumerate(candidates[: min(len(candidates), 5)], start=1):
+                try:
+                    download = await fetch_drive_bytes(scene.drive_url, retries=3)
+                except Exception as exc:  # noqa: BLE001
+                    info_domain(
+                        "event",
+                        "Scene download failed",
+                        stage="EVENT_SELECT_SCENE",
+                        user_id=user_id,
+                        event_id=event_key,
+                        scene_id=scene.scene_id,
+                        url=scene.drive_url,
+                        retry_count=idx - 1,
+                        repeat=repeated,
+                        ok=False,
+                        error_type=exc.__class__.__name__,
+                    )
+                    continue
+                chosen_scene = scene
+                scene_download = download
+                info_domain(
+                    "event",
+                    "Scene selected",
+                    stage="EVENT_SELECT_SCENE",
+                    user_id=user_id,
+                    event_id=event_key,
+                    scene_id=scene.scene_id,
+                    url=scene.drive_url,
+                    retry_count=idx - 1,
+                    repeat=repeated,
+                    ok=True,
+                )
+                break
+            if chosen_scene is None or scene_download is None:
+                info_domain(
+                    "event",
+                    "Event failed: scene download",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="scene_select",
+                    error_type="scene_download_failed",
+                    retryable=True,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("не удалось скачать сцену")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+            _event_log_human(
+                (
+                    "🎭 Запуск генерации: оправа №"
+                    f"{frame_model.unique_id} ({frame_model.model_code}), сцена №{chosen_scene.scene_id}"
+                ),
+                user_id=user_id,
+            )
+            scene_hash = hashlib.sha256(scene_download.data).hexdigest()[:12]
+            if debug_dir and debug_meta:
+                scene_ext = scene_download.extension or _extension_from_mime(
+                    scene_download.mime
+                )
+                _safe_write_debug_bytes(
+                    debug_dir / f"scene_{rid}.{scene_ext}",
+                    scene_download.data,
+                    user_id=user_id,
+                    label="scene",
+                )
+                debug_meta.update(
+                    {
+                        "scene": {
+                            "bytes": scene_download.size,
+                            "hash": scene_hash,
+                            "mime": scene_download.mime,
+                            "drive_id": scene_download.drive_id,
+                            "scene_id": chosen_scene.scene_id,
+                        }
+                    }
+                )
+                debug_meta["scene_id"] = chosen_scene.scene_id
+                _write_debug_meta()
+
+            await _edit_progress(msg.PROGRESS_WAIT_GENERATION)
+
+            prompt_hash = hashlib.sha256(
+                event_prompt.encode("utf-8")
+            ).hexdigest()[:12]
+            parts_order = ["face", "frame", "scene", "prompt"]
+            payload_kind = "bytes_from_file_id"
+            if debug_dir and debug_meta:
+                _safe_write_debug_text(
+                    debug_dir / f"prompt_{rid}.json",
+                    event_prompt,
+                    user_id=user_id,
+                    label="prompt",
+                )
+                debug_meta.update(
+                    {
+                        "prompt": {
+                            "len": len(event_prompt),
+                            "hash": prompt_hash,
+                        },
+                        "order": parts_order,
+                        "payload_kind": payload_kind,
+                    }
+                )
+                _write_debug_meta()
+            info_domain(
+                "event",
+                "Event NanoBanana manifest",
+                stage="EVENT_NANOBANANA_MULTIPART_MANIFEST",
+                user_id=user_id,
+                event_id=event_key,
+                order=parts_order,
+                parts=[
+                    {"name": "face", "mime": face_mime, "size": len(face_bytes)},
+                    {
+                        "name": "frame",
+                        "mime": frame_download.mime,
+                        "size": frame_download.size,
+                    },
+                    {
+                        "name": "scene",
+                        "mime": scene_download.mime,
+                        "size": scene_download.size,
+                    },
+                    {"name": "prompt", "mime": "application/json", "size": len(event_prompt)},
+                ],
+            )
+            info_domain(
+                "event",
+                "Event NanoBanana request",
+                stage="EVENT_NANOBANANA_REQUEST",
+                user_id=user_id,
+                event_id=event_key,
+                mode="EVENT",
+                face_bytes=len(face_bytes),
+                frame_bytes=frame_download.size,
+                scene_bytes=scene_download.size,
+                face_mime=face_mime,
+                frame_mime=frame_download.mime,
+                scene_mime=scene_download.mime,
+                face_hash=face_hash,
+                frame_hash=frame_hash,
+                scene_hash=scene_hash,
+                frame_drive_id=frame_download.drive_id,
+                scene_drive_id=scene_download.drive_id,
+                order=parts_order,
+                face_source=face_source,
+                payload_kind=payload_kind,
+                prompt_len=len(event_prompt),
+                prompt_hash=prompt_hash,
+            )
+            start_time = time.perf_counter()
+            generation_result = await with_generation_slot(
+                generate_event(
+                    face_bytes=face_bytes,
+                    face_mime=face_mime,
+                    glasses_bytes=frame_download.data,
+                    glasses_mime=frame_download.mime,
+                    scene_bytes=scene_download.data,
+                    scene_mime=scene_download.mime,
+                    prompt_json=event_prompt,
+                    model_name=resolved_event_model_name,
+                )
+            )
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            generation_latency_ms = latency_ms
+            info_domain(
+                "event",
+                "Event NanoBanana response",
+                stage="EVENT_NANOBANANA_RESPONSE",
+                user_id=user_id,
+                event_id=event_key,
+                status_code=200,
+                latency_ms=latency_ms,
+                ok=True,
+            )
+            result_bytes = generation_result.image_bytes
+            response_len = len(result_bytes)
+            response_hash = hashlib.sha256(result_bytes).hexdigest()[:12]
+            response_signature = _bytes_signature(result_bytes)
+            response_kind = _detect_bytes_kind(result_bytes)
+            info_domain(
+                "event",
+                "Event NanoBanana response bytes",
+                stage="EVENT_NANOBANANA_RESPONSE_BYTES",
+                user_id=user_id,
+                event_id=event_key,
+                response_bytes_len=response_len,
+                response_hash=response_hash,
+                response_signature=response_signature,
+            )
+            info_domain(
+                "event",
+                "Event response kind",
+                stage="EVENT_RESPONSE_KIND",
+                user_id=user_id,
+                event_id=event_key,
+                response_kind=response_kind,
+            )
+            if debug_dir and debug_meta:
+                _safe_write_debug_bytes(
+                    debug_dir / f"response_raw_{rid}.bin",
+                    result_bytes,
+                    user_id=user_id,
+                    label="response_raw",
+                )
+                debug_meta.update(
+                    {
+                        "response": {
+                            "bytes": response_len,
+                            "hash": response_hash,
+                            "signature": response_signature,
+                            "kind": response_kind,
+                        }
+                    }
+                )
+                _write_debug_meta()
+
+            if response_kind not in {"image/png", "image/jpeg", "image/webp"}:
+                info_domain(
+                    "event",
+                    "Event failed: response not image",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="response_validation",
+                    error_type="response_not_image",
+                    retryable=True,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("ответ генерации не изображение")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+
+            matched_input = None
+            if response_hash == face_hash:
+                matched_input = "face"
+            elif response_hash == frame_hash:
+                matched_input = "frame"
+            elif response_hash == scene_hash:
+                matched_input = "scene"
+            if matched_input:
+                info_domain(
+                    "event",
+                    "Event result equals input",
+                    stage="EVENT_RESULT_EQUALS_INPUT_BUG",
+                    user_id=user_id,
+                    event_id=event_key,
+                    matched_input=matched_input,
+                    response_hash=response_hash,
+                )
+                info_domain(
+                    "event",
+                    "Event failed: response equals input",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="response_validation",
+                    error_type="response_equals_input",
+                    retryable=True,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("результат совпал с исходным изображением")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+
+            saved_bytes = result_bytes
+            saved_len = len(saved_bytes)
+            saved_hash = hashlib.sha256(saved_bytes).hexdigest()[:12]
+            saved_signature = _bytes_signature(saved_bytes)
+            saved_match = None
+            if saved_hash == face_hash:
+                saved_match = "face"
+            elif saved_hash == frame_hash:
+                saved_match = "frame"
+            elif saved_hash == scene_hash:
+                saved_match = "scene"
+            if saved_match:
+                info_domain(
+                    "event",
+                    "Event result equals input",
+                    stage="EVENT_RESULT_EQUALS_INPUT_BUG",
+                    user_id=user_id,
+                    event_id=event_key,
+                    matched_input=saved_match,
+                    response_hash=saved_hash,
+                )
+                info_domain(
+                    "event",
+                    "Event failed: response equals input",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="response_validation",
+                    error_type="response_equals_input",
+                    retryable=True,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("результат совпал с исходным изображением")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+            results_dir = ensure_dir(Path("./results"))
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            safe_event = event_key.replace(" ", "_")
+            result_path = results_dir / f"event_{safe_event}_{user_id}_{timestamp}.png"
+            saved_source = "response"
+            try:
+                result_path.write_bytes(saved_bytes)
+            except OSError as exc:
+                info_domain(
+                    "event",
+                    "Event save failed",
+                    stage="EVENT_SAVE_RESULT",
+                    user_id=user_id,
+                    event_id=event_key,
+                    ok=False,
+                    error_type=exc.__class__.__name__,
+                )
+                info_domain(
+                    "event",
+                    "Event failed: save",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="save_result",
+                    error_type=exc.__class__.__name__,
+                    retryable=True,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("не удалось сохранить результат")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+
+            info_domain(
+                "event",
+                "Event saved",
+                stage="EVENT_SAVE_RESULT",
+                user_id=user_id,
+                event_id=event_key,
+                ok=True,
+                path=str(result_path),
+            )
+            info_domain(
+                "event",
+                "Event save result details",
+                stage="EVENT_SAVE_RESULT_DETAILS",
+                user_id=user_id,
+                event_id=event_key,
+                saved_bytes_len=saved_len,
+                saved_hash=saved_hash,
+                saved_signature=saved_signature,
+                saved_path=str(result_path),
+                source_of_saved_bytes=saved_source,
+            )
+            if debug_dir and debug_meta:
+                saved_ext = _extension_from_mime(response_kind)
+                _safe_write_debug_bytes(
+                    debug_dir / f"result_saved_{rid}.{saved_ext}",
+                    saved_bytes,
+                    user_id=user_id,
+                    label="result_saved",
+                )
+                debug_meta.update(
+                    {
+                        "saved": {
+                            "bytes": saved_len,
+                            "hash": saved_hash,
+                            "signature": saved_signature,
+                            "path": str(result_path),
+                            "source": saved_source,
+                        }
+                    }
+                )
+                _write_debug_meta()
+            await _delete_progress()
+
+            caption_text = _event_result_caption(attempts_left=attempts_left_after)
+            result_keyboard = _event_result_keyboard(
+                frame_model, attempts_left=attempts_left_after
+            )
+            try:
+                result_message = await message.answer_photo(
+                    BufferedInputFile(saved_bytes, filename="event_result.png"),
+                    caption=caption_text,
+                    reply_markup=result_keyboard,
+                )
+            except TelegramBadRequest as exc:
+                info_domain(
+                    "event",
+                    "Event send failed",
+                    stage="EVENT_SEND_RESULT",
+                    user_id=user_id,
+                    event_id=event_key,
+                    ok=False,
+                    error_type=exc.__class__.__name__,
+                )
+                info_domain(
+                    "event",
+                    "Event failed: send",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="send_result",
+                    error_type=exc.__class__.__name__,
+                    retryable=True,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("не удалось отправить результат")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+
+            info_domain(
+                "event",
+                "Event result delivered",
+                stage="EVENT_SEND_RESULT",
+                user_id=user_id,
+                event_id=event_key,
+                ok=True,
+                message_id=result_message.message_id,
+            )
+            await _register_event_session(
+                state,
+                result_message,
+                cycle_id=resolved_cycle,
+                photo_context=resolved_context or {},
+            )
+
+            try:
+                free_unlocked_after, free_used_after, paid_used_after = (
+                    await repository.commit_event_success(
+                        user_id,
+                        event_key,
+                        chosen_scene.scene_id,
+                        use_free=use_free,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                info_domain(
+                    "event",
+                    "Event commit failed",
+                    stage="EVENT_FAIL",
+                    user_id=user_id,
+                    event_id=event_key,
+                    stage_name="commit",
+                    error_type=exc.__class__.__name__,
+                    retryable=False,
+                    attempts_not_charged=True,
+                )
+                _event_log_failure("не удалось списать попытку")
+                return
+
+            attempts_left_after_db = _event_attempts_left(
+                phone_present=phone_present,
+                free_unlocked=free_unlocked_after,
+                free_used=free_used_after,
+                paid_used=paid_used_after,
+            )
+            updated_caption = _event_result_caption(
+                attempts_left=attempts_left_after_db
+            )
+            updated_keyboard = _event_result_keyboard(
+                frame_model, attempts_left=attempts_left_after_db
+            )
+            try:
+                await message.bot.edit_message_caption(
+                    chat_id=result_message.chat.id,
+                    message_id=result_message.message_id,
+                    caption=updated_caption,
+                    reply_markup=updated_keyboard,
+                )
+            except (TelegramBadRequest, TelegramForbiddenError):
+                try:
+                    await message.bot.edit_message_reply_markup(
+                        chat_id=result_message.chat.id,
+                        message_id=result_message.message_id,
+                        reply_markup=updated_keyboard,
+                    )
+                except (TelegramBadRequest, TelegramForbiddenError):
+                    pass
+            info_domain(
+                "event",
+                "Event commit success",
+                stage="EVENT_COMMIT_SUCCESS",
+                user_id=user_id,
+                event_id=event_key,
+                scene_id=chosen_scene.scene_id,
+                attempts_left_after=attempts_left_after_db,
+                attempts_left_ui=attempts_left_after,
+                use_free=use_free,
+            )
+            latency_sec = generation_latency_ms / 1000.0
+            _event_log_human(
+                (
+                    f"✅ Готово за {latency_sec:.1f}s. "
+                    f"Осталось попыток: {attempts_left_after_db} "
+                    f"(msg_id={result_message.message_id})"
+                ),
+                user_id=user_id,
+            )
+
+            if not phone_present and (free_used_after + paid_used_after) == 1:
+                info_domain(
+                    "event",
+                    "Event phone offer shown",
+                    stage="EVENT_PHONE_OFFER_SHOWN",
+                    user_id=user_id,
+                    event_id=event_key,
+                    reason="first_success_event",
+                    phone_present=phone_present,
+                )
+                try:
+                    await _send_event_phone_prompt(message, state, user_id)
+                except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                    info_domain(
+                        "event",
+                        "Event postprocess Telegram error",
+                        stage="EVENT_POSTPROCESS_TG_ERROR",
+                        user_id=user_id,
+                        event_id=event_key,
+                        action="send_phone_prompt",
+                        error_type=exc.__class__.__name__,
+                    )
+
+        except NanoBananaGenerationError as exc:
+            latency_ms = (
+                int((time.perf_counter() - start_time) * 1000)
+                if start_time
+                else 0
+            )
+            info_domain(
+                "event",
+                "Event NanoBanana response",
+                stage="EVENT_NANOBANANA_RESPONSE",
+                user_id=user_id,
+                event_id=event_key,
+                status_code=exc.status_code,
+                latency_ms=latency_ms,
+                ok=False,
+                reason_code=exc.reason_code,
+                reason_detail=exc.reason_detail,
+            )
+            info_domain(
+                "event",
+                "Event failed: nanobanana",
+                stage="EVENT_FAIL",
+                user_id=user_id,
+                event_id=event_key,
+                stage_name="nanobanana",
+                error_type=exc.reason_code,
+                retryable=exc.reason_code == "TRANSIENT",
+                attempts_not_charged=True,
+            )
+            reason = "ошибка генерации"
+            if exc.reason_code:
+                reason = f"ошибка генерации ({exc.reason_code})"
+            _event_log_failure(reason)
+            await message.answer(msg.EVENT_RETRY_MESSAGE)
+        except Exception as exc:  # noqa: BLE001
+            info_domain(
+                "event",
+                "Event failed",
+                stage="EVENT_FAIL",
+                user_id=user_id,
+                event_id=event_key,
+                stage_name="exception",
+                error_type=exc.__class__.__name__,
+                retryable=True,
+                attempts_not_charged=True,
+            )
+            _event_log_failure("неожиданная ошибка")
+            await message.answer(msg.EVENT_RETRY_MESSAGE)
+        finally:
+            if (
+                user_photo_path
+                and user_photo_path.exists()
+                and source_kind == "file_id"
+            ):
+                try:
+                    user_photo_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.debug(
+                        "Failed to delete event temp file %s",
+                        user_photo_path,
+                    )
+            await _delete_progress()
+            reset_context(tokens)
+            await _release_event_lock(user_id, cycle_id=lock_cycle_id)
 
     # Try-on cycles:
     # /start and /wear always bump current_cycle so a fresh flow can start while older generations finish in the background.
@@ -1276,6 +2845,7 @@ def setup_router(
     ) -> None:
         data = await state.get_data()
         user_id = message.from_user.id
+        active_mode = _get_active_mode(data)
         pending_state = data.get("contact_pending_result_state")
         await state.update_data(
             contact_request_active=False,
@@ -1288,12 +2858,15 @@ def setup_router(
         elif pending_state == "result":
             await state.set_state(TryOnStates.RESULT)
         else:
-            await state.set_state(TryOnStates.SHOW_RECS)
+            if active_mode == ACTIVE_MODE_EVENT:
+                await state.set_state(TryOnStates.RESULT)
+            else:
+                await state.set_state(TryOnStates.SHOW_RECS)
         pending_generation = data.get("contact_pending_generation", False)
         allow_generation = (
             send_generation and pending_generation and pending_state != "limit"
         )
-        if allow_generation:
+        if allow_generation and active_mode != ACTIVE_MODE_EVENT:
             await state.update_data(contact_pending_generation=False)
             filters = await _ensure_filters(user_id, state)
             await _send_models(
@@ -1303,6 +2876,8 @@ def setup_router(
                 state,
                 skip_contact_prompt=True,
             )
+        elif allow_generation:
+            await state.update_data(contact_pending_generation=False)
         else:
             await state.update_data(contact_pending_generation=False)
 
@@ -1425,6 +3000,7 @@ def setup_router(
         full_name = getattr(user, "full_name", None)
         username = getattr(user, "username", None)
         state_data = await state.get_data()
+        active_mode = _get_active_mode(state_data)
         await _export_contact_row(
             message,
             original_phone or phone_e164,
@@ -1466,6 +3042,13 @@ def setup_router(
             )
             await _resume_after_contact(message, state, send_generation=False)
             current_state = await state.get_state()
+            if active_mode == ACTIVE_MODE_EVENT:
+                if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
+                    await message.answer(
+                        msg.EVENT_PHONE_BONUS_TEXT,
+                        reply_markup=event_phone_bonus_keyboard(),
+                    )
+                return
             if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
                 gender = state_data.get("gender")
                 gen_count = await repository.get_generation_count(user_id)
@@ -2072,6 +3655,7 @@ def setup_router(
         await state.set_state(TryOnStates.START)
         await state.update_data(
             allow_try_button=False,
+            active_mode=ACTIVE_MODE_WEAR,
             contact_request_cooldown=contact_cooldown,
             phone_bad_attempts=0,
             phone_invalid_message_id=None,
@@ -2268,6 +3852,54 @@ def setup_router(
         """Accept a new user photo and spin a dedicated try-on cycle for it without cancelling older ones."""
         user_id = message.from_user.id
         data_before = await state.get_data()
+        active_mode = _get_active_mode(data_before)
+        if active_mode == ACTIVE_MODE_EVENT:
+            await _delete_last_aux_message(message, state)
+            phone_present = await _event_phone_present(user_id)
+            _, _, _, _, _, attempts_left = await _event_attempts_snapshot(
+                user_id, phone_present
+            )
+            if attempts_left <= 0:
+                await _send_event_attempts_exhausted(
+                    message,
+                    state,
+                    user_id=user_id,
+                    phone_present=phone_present,
+                )
+                return
+            photo = message.photo[-1]
+            path = await save_user_photo(message)
+            event_cycle = await _start_new_cycle(state, user_id)
+            await state.update_data(
+                event_upload=path,
+                event_upload_file_id=photo.file_id,
+                event_last_photo_file_id=photo.file_id,
+                event_current_cycle=event_cycle,
+            )
+            photo_context = {
+                "upload": path,
+                "upload_file_id": photo.file_id,
+                "last_photo_file_id": photo.file_id,
+            }
+            info_domain(
+                "bot.handlers",
+                "Photo received",
+                stage="PHOTO_RECEIVED",
+                user_id=user_id,
+                active_mode=active_mode,
+                saved_as_last_photo=True,
+                next_action="event_flow",
+            )
+            await state.set_state(TryOnStates.RESULT)
+            await _run_event_generation(
+                message,
+                state,
+                user_id=user_id,
+                source="photo_upload",
+                photo_context=photo_context,
+                event_cycle_id=event_cycle,
+            )
+            return
         current_state = await state.get_state()
         has_active_flow = any(
             [
@@ -2322,6 +3954,16 @@ def setup_router(
             "upload_file_id": photo.file_id,
             "last_photo_file_id": photo.file_id,
         }
+        next_action = "event_ack" if active_mode == ACTIVE_MODE_EVENT else "wear_flow"
+        info_domain(
+            "bot.handlers",
+            "Photo received",
+            stage="PHOTO_RECEIVED",
+            user_id=user_id,
+            active_mode=active_mode,
+            saved_as_last_photo=True,
+            next_action=next_action,
+        )
         await track_event(str(user_id), "photo_uploaded")
         profile = await repository.ensure_daily_reset(user_id)
         if profile.tries_used == 0:
@@ -2760,12 +4402,20 @@ def setup_router(
         F.data == CONTACT_SHARE_CALLBACK,
     )
     async def contact_share_button(callback: CallbackQuery, state: FSMContext) -> None:
-        await callback.answer()
-        if callback.message:
-            await _delete_contact_prompt_message(callback.message, state)
-        await callback.message.answer(
-            msg.ASK_PHONE_PROMPT_MANUAL,  # ← вместо INVISIBLE_PROMPT
+        user_id = callback.from_user.id
+        await _safe_answer_callback(callback, user_id=user_id, source="contact_share")
+        message = callback.message
+        if message is None:
+            return
+        await _maybe_delete_event_attempts_message(message, state, user_id)
+        await _delete_contact_prompt_message(message, state)
+        prompt_message = await message.answer(
+            msg.ASK_PHONE_PROMPT_MANUAL,
             reply_markup=contact_share_reply_keyboard(),
+        )
+        await state.update_data(
+            contact_prompt_message_id=prompt_message.message_id,
+            last_aux_message_id=prompt_message.message_id,
         )
 
 
@@ -3239,6 +4889,8 @@ def setup_router(
             vote_payload=vote_payload,
         )
         new_gen_count = await repository.increment_generation_count(user_id)
+        if gen_count_before == 0:
+            await _maybe_show_event_trigger(message, user_id)
         daily_gen_count, contact_trigger = await repository.register_contact_generation(
             user_id,
             initial_trigger=CONTACT_INITIAL_TRIGGER,
@@ -3335,6 +4987,10 @@ def setup_router(
             await callback.answer()
             return
         data_before = await state.get_data()
+        active_mode = _get_active_mode(data_before)
+        if active_mode == ACTIVE_MODE_EVENT:
+            await callback.answer()
+            return
         if message:
             current_markup = getattr(message, "reply_markup", None)
             updated_markup = remove_more_button(current_markup)
@@ -3580,8 +5236,20 @@ def setup_router(
         await _prompt_for_next_photo(message, state, prompt_text)
 
     @router.message(Command("wear"))
-    async def command_wear(message: Message, state: FSMContext) -> None:
-        user_id = message.from_user.id
+    async def command_wear(
+        message: Message,
+        state: FSMContext,
+        *,
+        source: str = "command",
+        user_id_override: int | None = None,
+    ) -> None:
+        if user_id_override is not None:
+            user_id = user_id_override
+        else:
+            if not message.from_user:
+                return
+            user_id = message.from_user.id
+        await _set_active_mode(state, user_id, ACTIVE_MODE_WEAR, source=source)
         data = await state.get_data()
         await _cleanup_cycle_messages(message, state, data=data)
         await _delete_phone_invalid_message(message, state, data=data)
@@ -3664,6 +5332,298 @@ def setup_router(
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await _deliver_instruction()
 
+    @router.message(Command("event"))
+    async def command_event(message: Message, state: FSMContext) -> None:
+        if not message.from_user:
+            return
+        user_id = message.from_user.id
+        bot_id = message.bot.id
+        if not _log_event_user_id_sanity(
+            user_id=user_id,
+            bot_id=bot_id,
+            chat_id=message.chat.id,
+            from_user_id=message.from_user.id,
+            source="command",
+        ):
+            return
+        if not event_enabled or not event_ready:
+            await message.answer(msg.EVENT_DISABLED)
+            return
+        await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="command")
+        seeded_context, seeded_cycle = await _seed_event_photo_from_wear(
+            state, user_id=user_id
+        )
+        await _run_event_generation(
+            message,
+            state,
+            user_id=user_id,
+            source="command",
+            photo_context=seeded_context,
+            event_cycle_id=seeded_cycle,
+        )
+
+    @router.callback_query(F.data == EVENT_TRY_CALLBACK)
+    async def event_trigger(callback: CallbackQuery, state: FSMContext) -> None:
+        user_id = callback.from_user.id
+        await _safe_answer_callback(callback, user_id=user_id, source="trigger")
+        message = callback.message
+        if message is None:
+            return
+        bot_id = message.bot.id
+        if not _log_event_user_id_sanity(
+            user_id=user_id,
+            bot_id=bot_id,
+            chat_id=message.chat.id,
+            from_user_id=callback.from_user.id,
+            source="trigger",
+        ):
+            return
+        if not event_enabled or not event_ready:
+            await message.answer(msg.EVENT_DISABLED)
+            return
+        await _deactivate_previous_more_button(message.bot, user_id)
+        await _trim_last_card_message(message, state, site_url=site_url)
+        try:
+            await message.bot.delete_message(message.chat.id, message.message_id)
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            logger.debug(
+                "Failed to delete event trigger message %s: %s",
+                message.message_id,
+                exc,
+            )
+        info_domain(
+            "event",
+            "Event try callback received",
+            stage="EVENT_TRY_CALLBACK_RECEIVED",
+            user_id=user_id,
+            event_id=event_key,
+            source="trigger",
+        )
+        await repository.unlock_event_free_attempt(user_id, event_key)
+        phone_present = await _event_phone_present(user_id)
+        attempts_snapshot = await _event_attempts_snapshot(user_id, phone_present)
+        free_unlocked, free_used, paid_used, _, _, attempts_left = attempts_snapshot
+        info_domain(
+            "event",
+            "Event access after unlock",
+            stage="EVENT_ACCESS_AFTER_UNLOCK",
+            user_id=user_id,
+            event_id=event_key,
+            source="trigger",
+            free_unlocked=free_unlocked,
+            free_used=free_used,
+            paid_used=paid_used,
+            phone_present=phone_present,
+            attempts_left=attempts_left,
+        )
+        if attempts_left <= 0:
+            info_domain(
+                "event",
+                "Event access mismatch",
+                stage="EVENT_ACCESS_MISMATCH",
+                user_id=user_id,
+                event_id=event_key,
+                source="trigger",
+                db_snapshot={
+                    "free_unlocked": free_unlocked,
+                    "free_used": free_used,
+                    "paid_used": paid_used,
+                    "attempts_left": attempts_left,
+                    "phone_present": phone_present,
+                },
+            )
+            await message.answer(msg.EVENT_ACCESS_FAILED)
+            return
+        await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="callback")
+        seeded_context, seeded_cycle = await _seed_event_photo_from_wear(
+            state, user_id=user_id
+        )
+        await _run_event_generation(
+            message,
+            state,
+            user_id=user_id,
+            source="trigger",
+            attempts_snapshot=attempts_snapshot,
+            phone_present=phone_present,
+            photo_context=seeded_context,
+            event_cycle_id=seeded_cycle,
+        )
+
+    @router.callback_query(F.data == EVENT_MORE_CALLBACK)
+    async def event_more(callback: CallbackQuery, state: FSMContext) -> None:
+        user_id = callback.from_user.id
+        await _safe_answer_callback(callback, user_id=user_id, source="more")
+        message = callback.message
+        if message is None:
+            return
+        bot_id = message.bot.id
+        if not _log_event_user_id_sanity(
+            user_id=user_id,
+            bot_id=bot_id,
+            chat_id=message.chat.id,
+            from_user_id=callback.from_user.id,
+            source="more",
+        ):
+            return
+        if not event_enabled or not event_ready:
+            await message.answer(msg.EVENT_DISABLED)
+            return
+        data = await state.get_data()
+        session_entry = dict(data.get("event_sessions", {})).get(
+            str(message.message_id)
+        )
+        photo_context = None
+        event_cycle_id = None
+        if session_entry:
+            photo_context = {
+                "upload": session_entry.get("upload"),
+                "upload_file_id": session_entry.get("upload_file_id"),
+                "last_photo_file_id": session_entry.get("last_photo_file_id"),
+            }
+            event_cycle_id = _normalize_cycle(session_entry.get("cycle"))
+        await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="callback")
+        await _run_event_generation(
+            message,
+            state,
+            user_id=user_id,
+            source="command",
+            photo_context=photo_context,
+            event_cycle_id=event_cycle_id,
+        )
+
+    @router.callback_query(F.data == EVENT_REUSE_PHOTO_CALLBACK)
+    async def event_reuse_photo(callback: CallbackQuery, state: FSMContext) -> None:
+        user_id = callback.from_user.id
+        await _safe_answer_callback(callback, user_id=user_id, source="reuse_photo")
+        message = callback.message
+        if message is None:
+            return
+        bot_id = message.bot.id
+        if not _log_event_user_id_sanity(
+            user_id=user_id,
+            bot_id=bot_id,
+            chat_id=message.chat.id,
+            from_user_id=callback.from_user.id,
+            source="reuse_photo",
+        ):
+            return
+        if not event_enabled or not event_ready:
+            await message.answer(msg.EVENT_DISABLED)
+            return
+        try:
+            await message.bot.delete_message(message.chat.id, message.message_id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            try:
+                await message.edit_reply_markup(reply_markup=None)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                try:
+                    await message.edit_text("Запускаю генерацию...")
+                except (TelegramBadRequest, TelegramForbiddenError):
+                    pass
+        await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="callback")
+        phone_present = await _event_phone_present(user_id)
+        _, _, _, _, _, attempts_left = await _event_attempts_snapshot(
+            user_id, phone_present
+        )
+        if attempts_left <= 0:
+            await _send_event_attempts_exhausted(
+                message,
+                state,
+                user_id=user_id,
+                phone_present=phone_present,
+            )
+            return
+        data = await state.get_data()
+        photo_context = _extract_event_photo_context(data)
+        if not _has_photo_context(photo_context):
+            await _prompt_event_photo(message, state, user_id=user_id, source="callback")
+            return
+        new_cycle = await _start_new_cycle(state, user_id)
+        await _store_event_photo_context(state, photo_context or {}, cycle_id=new_cycle)
+        await state.set_state(TryOnStates.RESULT)
+        await _run_event_generation(
+            message,
+            state,
+            user_id=user_id,
+            source="reuse_photo",
+            photo_context=dict(photo_context or {}),
+            event_cycle_id=new_cycle,
+        )
+
+    @router.callback_query(F.data == EVENT_NEW_PHOTO_CALLBACK)
+    async def event_send_new_photo(callback: CallbackQuery, state: FSMContext) -> None:
+        user_id = callback.from_user.id
+        await _safe_answer_callback(callback, user_id=user_id, source="new_photo")
+        message = callback.message
+        if message is None:
+            return
+        bot_id = message.bot.id
+        if not _log_event_user_id_sanity(
+            user_id=user_id,
+            bot_id=bot_id,
+            chat_id=message.chat.id,
+            from_user_id=callback.from_user.id,
+            source="new_photo",
+        ):
+            return
+        if not event_enabled or not event_ready:
+            await message.answer(msg.EVENT_DISABLED)
+            return
+        try:
+            await message.bot.delete_message(message.chat.id, message.message_id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            try:
+                await message.edit_reply_markup(reply_markup=None)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                try:
+                    await message.edit_text("Ок, жду новое фото.")
+                except (TelegramBadRequest, TelegramForbiddenError):
+                    pass
+        await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="callback")
+        phone_present = await _event_phone_present(user_id)
+        _, _, _, _, _, attempts_left = await _event_attempts_snapshot(
+            user_id, phone_present
+        )
+        if attempts_left <= 0:
+            await _send_event_attempts_exhausted(
+                message,
+                state,
+                user_id=user_id,
+                phone_present=phone_present,
+            )
+            return
+        await state.set_state(TryOnStates.AWAITING_PHOTO)
+        await _send_aux_message(
+            message,
+            state,
+            message.answer,
+            msg.EVENT_NEW_PHOTO_PROMPT,
+        )
+
+    @router.callback_query(F.data == EVENT_BACK_CALLBACK)
+    async def event_back_to_wear(callback: CallbackQuery, state: FSMContext) -> None:
+        user_id = callback.from_user.id
+        await _safe_answer_callback(callback, user_id=user_id, source="back")
+        message = callback.message
+        if message is None:
+            return
+        bot_id = message.bot.id
+        if not _log_event_user_id_sanity(
+            user_id=user_id,
+            bot_id=bot_id,
+            chat_id=message.chat.id,
+            from_user_id=callback.from_user.id,
+            source="back",
+        ):
+            return
+        await _maybe_delete_event_attempts_message(message, state, user_id)
+        await command_wear(
+            message,
+            state,
+            source="callback",
+            user_id_override=user_id,
+        )
+
     @router.message(Command("admin"))
     async def command_admin(message: Message) -> None:
         user_id = message.from_user.id if message.from_user else None
@@ -3723,6 +5683,8 @@ def setup_router(
 
     @router.message(F.text == msg.MAIN_MENU_TRY_BUTTON)
     async def handle_main_menu_try(message: Message, state: FSMContext) -> None:
+        user_id = message.from_user.id
+        await _set_active_mode(state, user_id, ACTIVE_MODE_WEAR, source="command")
         await start_wear_flow(
             message,
             state,
