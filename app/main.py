@@ -126,13 +126,13 @@ async def main() -> None:
     )
 )
     commands = [
-        BotCommand(command="start", description="Запуск бота"),
-        BotCommand(command="wear", description="Примерить новые очки"),
-        BotCommand(command="help", description="Как это работает"),
-        BotCommand(command="privacy", description="Политика конфиденциальности"),
+        BotCommand(command="start", description="🚀 Запуск бота"),
+        BotCommand(command="wear", description="👓 Примерить новые очки"),
+        BotCommand(command="help", description="❓ Как это работает"),
+        BotCommand(command="privacy", description="🔒 Политика конфиденциальности"),
     ]
     if config.event_enabled:
-        commands.append(BotCommand(command="event", description="Ивент"))
+        commands.append(BotCommand(command="event", description="🎄 Ивент"))
     await bot.set_my_commands(commands)
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     repository_path = (PROJECT_ROOT / "loop.db").resolve()

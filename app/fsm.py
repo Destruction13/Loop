@@ -219,6 +219,9 @@ def setup_router(
     EVENT_FREE_LIMIT = 1
     EVENT_PAID_LIMIT = 10
     EVENT_INFLIGHT_TTL_SEC = 120
+    EVENT_TRIGGER_IMAGE_PATH = (
+        Path(__file__).resolve().parent.parent / "images" / "event_new_year.jpg"
+    )
     ACTIVE_MODE_WEAR = "WEAR"
     ACTIVE_MODE_EVENT = "EVENT"
 
@@ -254,9 +257,11 @@ def setup_router(
 
     event_model_label = _event_model_label(resolved_event_model_name)
 
-    def _event_result_caption(*, attempts_left: int) -> str:
+    def _event_result_caption(*, attempts_left: int, show_upsell: bool = False) -> str:
         if attempts_left > 0:
             return msg.EVENT_SUCCESS_FOOTER
+        if show_upsell:
+            return msg.EVENT_SUCCESS_UPSELL
         return msg.EVENT_SUCCESS_FOOTER_EXHAUSTED
 
     def _event_result_keyboard(
@@ -274,6 +279,182 @@ def setup_router(
         else:
             rows.extend(event_back_to_wear_keyboard().inline_keyboard)
         return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _event_details_markup_from_reply(
+        markup: InlineKeyboardMarkup | None,
+    ) -> InlineKeyboardMarkup | None:
+        if not markup or not markup.inline_keyboard:
+            return None
+        rows: list[list[InlineKeyboardButton]] = []
+        for row in markup.inline_keyboard:
+            url_buttons = [button for button in row if getattr(button, "url", None)]
+            if url_buttons:
+                rows.append(url_buttons)
+        if not rows:
+            return None
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _event_details_markup_from_url(
+        site_url: str | None,
+    ) -> InlineKeyboardMarkup | None:
+        clean_url = (site_url or "").strip()
+        if not clean_url:
+            return None
+        return generation_result_keyboard(clean_url, remaining=0, show_more=False)
+
+    async def _cleanup_event_result_message(
+        bot: Bot,
+        *,
+        chat_id: int,
+        message_id: int,
+        reason: str,
+        user_id: int | None = None,
+        message: Message | None = None,
+        site_url: str | None = None,
+    ) -> None:
+        markup = _event_details_markup_from_reply(
+            message.reply_markup if message else None
+        )
+        if markup is None:
+            markup = _event_details_markup_from_url(site_url)
+        edit_error: Exception | None = None
+        try:
+            if message is not None:
+                await message.edit_caption(caption="", reply_markup=markup)
+            else:
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption="",
+                    reply_markup=markup,
+                )
+            return
+        except AttributeError as exc:
+            edit_error = exc
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            edit_error = exc
+        except TelegramForbiddenError as exc:
+            edit_error = exc
+        try:
+            if message is not None:
+                await message.edit_reply_markup(reply_markup=markup)
+            else:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=markup,
+                )
+            return
+        except AttributeError as exc:
+            edit_error = exc
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            edit_error = exc
+        if edit_error:
+            logger.debug(
+                "Failed to cleanup event result %s: %s",
+                message_id,
+                edit_error,
+                extra={"stage": "EVENT_RESULT_CLEANUP", "reason": reason, "user_id": user_id},
+            )
+
+    async def _cleanup_last_event_result(
+        message: Message,
+        state: FSMContext,
+        *,
+        user_id: int,
+        reason: str,
+        data: Mapping[str, Any] | None = None,
+        message_ref: Message | None = None,
+    ) -> None:
+        payload = dict(data or await state.get_data())
+        message_id = payload.get("last_event_result_message_id")
+        if not message_id:
+            if message_ref:
+                await _cleanup_event_result_message(
+                    message.bot,
+                    chat_id=message.chat.id,
+                    message_id=message_ref.message_id,
+                    reason=reason,
+                    user_id=user_id,
+                    message=message_ref,
+                )
+            return
+        site_url = payload.get("last_event_result_site_url")
+        try:
+            resolved_id = int(message_id)
+        except (TypeError, ValueError):
+            return
+        if not site_url:
+            session_entry = dict(payload.get("event_sessions", {})).get(
+                str(resolved_id)
+            )
+            if session_entry:
+                site_url = session_entry.get("site_url")
+        if message_ref and message_ref.message_id != resolved_id:
+            message_ref = None
+        await _cleanup_event_result_message(
+            message.bot,
+            chat_id=message.chat.id,
+            message_id=resolved_id,
+            reason=reason,
+            user_id=user_id,
+            message=message_ref,
+            site_url=site_url,
+        )
+
+    async def _delete_event_aux_message(
+        message: Message,
+        state: FSMContext,
+        *,
+        data: Mapping[str, Any] | None = None,
+    ) -> None:
+        payload = dict(data or await state.get_data())
+        message_id = payload.get("last_event_aux_message_id")
+        if not message_id:
+            return
+        try:
+            await message.bot.delete_message(message.chat.id, int(message_id))
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            logger.debug(
+                "Failed to delete event aux message %s: %s",
+                message_id,
+                exc,
+            )
+        finally:
+            await state.update_data(last_event_aux_message_id=None)
+
+    async def _delete_event_exhausted_message(
+        message: Message,
+        state: FSMContext,
+        *,
+        data: Mapping[str, Any] | None = None,
+        user_id: int | None = None,
+    ) -> None:
+        payload = dict(data or await state.get_data())
+        message_id = payload.get("last_event_exhausted_message_id")
+        if not message_id:
+            return
+        try:
+            await message.bot.delete_message(message.chat.id, int(message_id))
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            info_domain(
+                "event",
+                "Event postprocess Telegram error",
+                stage="EVENT_POSTPROCESS_TG_ERROR",
+                user_id=user_id,
+                event_id=event_key,
+                action="delete_event_exhausted_message",
+                error_type=exc.__class__.__name__,
+            )
+        finally:
+            updates: dict[str, Any] = {"last_event_exhausted_message_id": None}
+            if payload.get("event_attempts_message_id") == message_id:
+                updates["event_attempts_message_id"] = None
+            if payload.get("contact_prompt_message_id") == message_id:
+                updates["contact_prompt_message_id"] = None
+            await state.update_data(**updates)
 
     def _format_model_button_label(model: GlassModel) -> str:
         title = (model.title or "").strip()
@@ -683,6 +864,7 @@ def setup_router(
         *,
         cycle_id: int | None,
         photo_context: Mapping[str, Any],
+        site_url: str | None,
     ) -> None:
         resolved_cycle = _normalize_cycle(cycle_id)
         if resolved_cycle is None:
@@ -694,6 +876,7 @@ def setup_router(
             "upload_file_id": photo_context.get("upload_file_id"),
             "last_photo_file_id": photo_context.get("last_photo_file_id"),
             "cycle": resolved_cycle,
+            "site_url": site_url,
         }
         if len(sessions) > 100:
             keep_keys = list(sessions.keys())[-100:]
@@ -789,6 +972,8 @@ def setup_router(
             updates: dict[str, Any] = {"event_attempts_message_id": None}
             if data.get("contact_prompt_message_id") == message_id:
                 updates["contact_prompt_message_id"] = None
+            if data.get("last_event_exhausted_message_id") == message_id:
+                updates["last_event_exhausted_message_id"] = None
             await state.update_data(**updates)
 
     async def _acquire_event_lock(user_id: int, *, cycle_id: int | None) -> bool:
@@ -885,14 +1070,38 @@ def setup_router(
             return
         if await repository.has_event_trigger_shown(user_id, event_key):
             return
-        try:
-            await message.answer(
-                msg.EVENT_TRIGGER_TEXT,
-                reply_markup=event_trigger_keyboard(),
+        sent = False
+        if EVENT_TRIGGER_IMAGE_PATH.exists():
+            try:
+                await message.answer_photo(
+                    FSInputFile(EVENT_TRIGGER_IMAGE_PATH),
+                    caption=msg.EVENT_TRIGGER_TEXT,
+                    reply_markup=event_trigger_keyboard(),
+                )
+                sent = True
+            except (OSError, TelegramBadRequest, TelegramForbiddenError) as exc:
+                logger.warning(
+                    "Failed to send event trigger image %s: %s",
+                    EVENT_TRIGGER_IMAGE_PATH,
+                    exc,
+                    extra={"stage": "EVENT_TRIGGER_IMAGE_FAILED"},
+                )
+        else:
+            logger.warning(
+                "Event trigger image missing: %s",
+                EVENT_TRIGGER_IMAGE_PATH,
+                extra={"stage": "EVENT_TRIGGER_IMAGE_MISSING"},
             )
-        except TelegramBadRequest as exc:
-            logger.debug("Failed to send event trigger: %s", exc)
-            return
+        if not sent:
+            try:
+                await message.answer(
+                    msg.EVENT_TRIGGER_TEXT,
+                    reply_markup=event_trigger_keyboard(),
+                )
+                sent = True
+            except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                logger.debug("Failed to send event trigger: %s", exc)
+                return
         inserted = await repository.mark_event_trigger_shown(user_id, event_key)
         if inserted:
             info_domain(
@@ -942,7 +1151,10 @@ def setup_router(
             msg.EVENT_ATTEMPTS_EXHAUSTED,
             reply_markup=reply_markup,
         )
-        await state.update_data(event_attempts_message_id=exhausted_message.message_id)
+        await state.update_data(
+            event_attempts_message_id=exhausted_message.message_id,
+            last_event_exhausted_message_id=exhausted_message.message_id,
+        )
         if phone_present:
             return
         await state.update_data(
@@ -1799,10 +2011,28 @@ def setup_router(
                 _write_debug_meta()
             await _delete_progress()
 
-            caption_text = _event_result_caption(attempts_left=attempts_left_after)
-            result_keyboard = _event_result_keyboard(
-                frame_model, attempts_left=attempts_left_after
+            data_for_delivery = await state.get_data()
+            active_cycle_id = _normalize_cycle(
+                data_for_delivery.get("event_active_cycle_id")
             )
+            result_site_url = (getattr(frame_model, "site_url", None) or "").strip()
+            is_active_delivery = _is_event_cycle_active(
+                active_cycle_id, resolved_cycle
+            )
+            if is_active_delivery:
+                show_upsell = bool(
+                    not phone_present and free_used == 0 and paid_used == 0
+                )
+                caption_text = _event_result_caption(
+                    attempts_left=attempts_left_after,
+                    show_upsell=show_upsell,
+                )
+                result_keyboard = _event_result_keyboard(
+                    frame_model, attempts_left=attempts_left_after
+                )
+            else:
+                caption_text = ""
+                result_keyboard = _event_details_markup_from_url(result_site_url)
             try:
                 result_message = await message.answer_photo(
                     BufferedInputFile(saved_bytes, filename="event_result.png"),
@@ -1848,7 +2078,31 @@ def setup_router(
                 result_message,
                 cycle_id=resolved_cycle,
                 photo_context=resolved_context or {},
+                site_url=result_site_url or None,
             )
+            data_after_send = await state.get_data()
+            active_cycle_after_send = _normalize_cycle(
+                data_after_send.get("event_active_cycle_id")
+            )
+            is_active_after_send = _is_event_cycle_active(
+                active_cycle_after_send, resolved_cycle
+            )
+            if is_active_after_send:
+                await state.update_data(
+                    last_event_result_message_id=result_message.message_id,
+                    last_event_result_site_url=result_site_url or None,
+                    last_event_result_cycle_id=resolved_cycle,
+                )
+            else:
+                result_chat_id = _resolve_chat_id(result_message) or message.chat.id
+                await _cleanup_event_result_message(
+                    message.bot,
+                    chat_id=int(result_chat_id),
+                    message_id=int(result_message.message_id),
+                    reason="event_result_stale_post_send",
+                    user_id=user_id,
+                    site_url=result_site_url or None,
+                )
 
             try:
                 free_unlocked_after, free_used_after, paid_used_after = (
@@ -1880,28 +2134,49 @@ def setup_router(
                 free_used=free_used_after,
                 paid_used=paid_used_after,
             )
-            updated_caption = _event_result_caption(
-                attempts_left=attempts_left_after_db
+            show_upsell_after = bool(
+                not phone_present and (free_used_after + paid_used_after) == 1
             )
-            updated_keyboard = _event_result_keyboard(
-                frame_model, attempts_left=attempts_left_after_db
+            active_cycle_after_commit = _normalize_cycle(
+                (await state.get_data()).get("event_active_cycle_id")
             )
-            try:
-                await message.bot.edit_message_caption(
-                    chat_id=result_message.chat.id,
-                    message_id=result_message.message_id,
-                    caption=updated_caption,
-                    reply_markup=updated_keyboard,
+            is_active_after_commit = _is_event_cycle_active(
+                active_cycle_after_commit, resolved_cycle
+            )
+            if is_active_after_commit:
+                updated_caption = _event_result_caption(
+                    attempts_left=attempts_left_after_db,
+                    show_upsell=show_upsell_after,
                 )
-            except (TelegramBadRequest, TelegramForbiddenError):
+                updated_keyboard = _event_result_keyboard(
+                    frame_model, attempts_left=attempts_left_after_db
+                )
                 try:
-                    await message.bot.edit_message_reply_markup(
+                    await message.bot.edit_message_caption(
                         chat_id=result_message.chat.id,
                         message_id=result_message.message_id,
+                        caption=updated_caption,
                         reply_markup=updated_keyboard,
                     )
                 except (TelegramBadRequest, TelegramForbiddenError):
-                    pass
+                    try:
+                        await message.bot.edit_message_reply_markup(
+                            chat_id=result_message.chat.id,
+                            message_id=result_message.message_id,
+                            reply_markup=updated_keyboard,
+                        )
+                    except (TelegramBadRequest, TelegramForbiddenError):
+                        pass
+            else:
+                result_chat_id = _resolve_chat_id(result_message) or message.chat.id
+                await _cleanup_event_result_message(
+                    message.bot,
+                    chat_id=int(result_chat_id),
+                    message_id=int(result_message.message_id),
+                    reason="event_result_stale_post_commit",
+                    user_id=user_id,
+                    site_url=result_site_url or None,
+                )
             info_domain(
                 "event",
                 "Event commit success",
@@ -1923,7 +2198,7 @@ def setup_router(
                 user_id=user_id,
             )
 
-            if not phone_present and (free_used_after + paid_used_after) == 1:
+            if show_upsell_after:
                 info_domain(
                     "event",
                     "Event phone offer shown",
@@ -2037,6 +2312,26 @@ def setup_router(
         current_cycle = await repository.start_new_tryon_cycle(user_id)
         await state.update_data(current_cycle=current_cycle)
         return current_cycle
+
+    async def _start_new_event_cycle(state: FSMContext) -> int:
+        data = await state.get_data()
+        current_cycle = _normalize_cycle(data.get("event_active_cycle_id")) or 0
+        new_cycle = current_cycle + 1
+        await state.update_data(
+            event_active_cycle_id=new_cycle,
+            event_current_cycle=new_cycle,
+            last_event_result_message_id=None,
+            last_event_result_site_url=None,
+            last_event_result_cycle_id=None,
+        )
+        return new_cycle
+
+    def _is_event_cycle_active(
+        active_cycle_id: int | None, cycle_id: int | None
+    ) -> bool:
+        if active_cycle_id is None or cycle_id is None:
+            return True
+        return int(active_cycle_id) == int(cycle_id)
 
     async def _is_cycle_current(state: FSMContext, cycle_id: int) -> bool:
         data = await state.get_data()
@@ -3043,6 +3338,18 @@ def setup_router(
             await _resume_after_contact(message, state, send_generation=False)
             current_state = await state.get_state()
             if active_mode == ACTIVE_MODE_EVENT:
+                data = await state.get_data()
+                await _cleanup_last_event_result(
+                    message,
+                    state,
+                    user_id=user_id,
+                    reason="event_phone_shared",
+                    data=data,
+                )
+                await _delete_event_aux_message(message, state, data=data)
+                await _delete_event_exhausted_message(
+                    message, state, data=data, user_id=user_id
+                )
                 if current_state != TryOnStates.DAILY_LIMIT_REACHED.state:
                     await message.answer(
                         msg.EVENT_PHONE_BONUS_TEXT,
@@ -3855,6 +4162,17 @@ def setup_router(
         active_mode = _get_active_mode(data_before)
         if active_mode == ACTIVE_MODE_EVENT:
             await _delete_last_aux_message(message, state)
+            await _cleanup_last_event_result(
+                message,
+                state,
+                user_id=user_id,
+                reason="event_new_photo",
+                data=data_before,
+            )
+            await _delete_event_aux_message(message, state, data=data_before)
+            await _delete_event_exhausted_message(
+                message, state, data=data_before, user_id=user_id
+            )
             phone_present = await _event_phone_present(user_id)
             _, _, _, _, _, attempts_left = await _event_attempts_snapshot(
                 user_id, phone_present
@@ -3869,7 +4187,7 @@ def setup_router(
                 return
             photo = message.photo[-1]
             path = await save_user_photo(message)
-            event_cycle = await _start_new_cycle(state, user_id)
+            event_cycle = await _start_new_event_cycle(state)
             await state.update_data(
                 event_upload=path,
                 event_upload_file_id=photo.file_id,
@@ -5251,6 +5569,17 @@ def setup_router(
             user_id = message.from_user.id
         await _set_active_mode(state, user_id, ACTIVE_MODE_WEAR, source=source)
         data = await state.get_data()
+        await _cleanup_last_event_result(
+            message,
+            state,
+            user_id=user_id,
+            reason="wear_command",
+            data=data,
+        )
+        await _delete_event_aux_message(message, state, data=data)
+        await _delete_event_exhausted_message(
+            message, state, data=data, user_id=user_id
+        )
         await _cleanup_cycle_messages(message, state, data=data)
         await _delete_phone_invalid_message(message, state, data=data)
         await _delete_last_aux_message(message, state)
@@ -5350,16 +5679,29 @@ def setup_router(
             await message.answer(msg.EVENT_DISABLED)
             return
         await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="command")
-        seeded_context, seeded_cycle = await _seed_event_photo_from_wear(
+        data = await state.get_data()
+        await _cleanup_last_event_result(
+            message,
+            state,
+            user_id=user_id,
+            reason="event_command",
+            data=data,
+        )
+        await _delete_event_aux_message(message, state, data=data)
+        await _delete_event_exhausted_message(
+            message, state, data=data, user_id=user_id
+        )
+        seeded_context, _ = await _seed_event_photo_from_wear(
             state, user_id=user_id
         )
+        new_cycle = await _start_new_event_cycle(state)
         await _run_event_generation(
             message,
             state,
             user_id=user_id,
             source="command",
             photo_context=seeded_context,
-            event_cycle_id=seeded_cycle,
+            event_cycle_id=new_cycle,
         )
 
     @router.callback_query(F.data == EVENT_TRY_CALLBACK)
@@ -5381,6 +5723,18 @@ def setup_router(
         if not event_enabled or not event_ready:
             await message.answer(msg.EVENT_DISABLED)
             return
+        data = await state.get_data()
+        await _cleanup_last_event_result(
+            message,
+            state,
+            user_id=user_id,
+            reason="event_trigger",
+            data=data,
+        )
+        await _delete_event_aux_message(message, state, data=data)
+        await _delete_event_exhausted_message(
+            message, state, data=data, user_id=user_id
+        )
         await _deactivate_previous_more_button(message.bot, user_id)
         await _trim_last_card_message(message, state, site_url=site_url)
         try:
@@ -5435,9 +5789,10 @@ def setup_router(
             await message.answer(msg.EVENT_ACCESS_FAILED)
             return
         await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="callback")
-        seeded_context, seeded_cycle = await _seed_event_photo_from_wear(
+        seeded_context, _ = await _seed_event_photo_from_wear(
             state, user_id=user_id
         )
+        new_cycle = await _start_new_event_cycle(state)
         await _run_event_generation(
             message,
             state,
@@ -5446,7 +5801,7 @@ def setup_router(
             attempts_snapshot=attempts_snapshot,
             phone_present=phone_present,
             photo_context=seeded_context,
-            event_cycle_id=seeded_cycle,
+            event_cycle_id=new_cycle,
         )
 
     @router.callback_query(F.data == EVENT_MORE_CALLBACK)
@@ -5469,18 +5824,48 @@ def setup_router(
             await message.answer(msg.EVENT_DISABLED)
             return
         data = await state.get_data()
+        await _cleanup_last_event_result(
+            message,
+            state,
+            user_id=user_id,
+            reason="event_more",
+            data=data,
+            message_ref=message,
+        )
+        await _delete_event_aux_message(message, state, data=data)
+        await _delete_event_exhausted_message(
+            message, state, data=data, user_id=user_id
+        )
+        active_cycle_id = _normalize_cycle(data.get("event_active_cycle_id"))
+        last_result_id = data.get("last_event_result_message_id")
+        if last_result_id is None:
+            if active_cycle_id is not None:
+                return
+        else:
+            try:
+                last_result_id = int(last_result_id)
+            except (TypeError, ValueError):
+                return
+            if last_result_id != message.message_id:
+                return
+            last_result_cycle = _normalize_cycle(data.get("last_event_result_cycle_id"))
+            if (
+                last_result_cycle is not None
+                and active_cycle_id is not None
+                and last_result_cycle != active_cycle_id
+            ):
+                return
+        new_cycle = await _start_new_event_cycle(state)
         session_entry = dict(data.get("event_sessions", {})).get(
             str(message.message_id)
         )
         photo_context = None
-        event_cycle_id = None
         if session_entry:
             photo_context = {
                 "upload": session_entry.get("upload"),
                 "upload_file_id": session_entry.get("upload_file_id"),
                 "last_photo_file_id": session_entry.get("last_photo_file_id"),
             }
-            event_cycle_id = _normalize_cycle(session_entry.get("cycle"))
         await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="callback")
         await _run_event_generation(
             message,
@@ -5488,7 +5873,7 @@ def setup_router(
             user_id=user_id,
             source="command",
             photo_context=photo_context,
-            event_cycle_id=event_cycle_id,
+            event_cycle_id=new_cycle,
         )
 
     @router.callback_query(F.data == EVENT_REUSE_PHOTO_CALLBACK)
@@ -5510,6 +5895,18 @@ def setup_router(
         if not event_enabled or not event_ready:
             await message.answer(msg.EVENT_DISABLED)
             return
+        data = await state.get_data()
+        await _cleanup_last_event_result(
+            message,
+            state,
+            user_id=user_id,
+            reason="event_reuse_photo",
+            data=data,
+        )
+        await _delete_event_aux_message(message, state, data=data)
+        await _delete_event_exhausted_message(
+            message, state, data=data, user_id=user_id
+        )
         try:
             await message.bot.delete_message(message.chat.id, message.message_id)
         except (TelegramBadRequest, TelegramForbiddenError):
@@ -5538,7 +5935,7 @@ def setup_router(
         if not _has_photo_context(photo_context):
             await _prompt_event_photo(message, state, user_id=user_id, source="callback")
             return
-        new_cycle = await _start_new_cycle(state, user_id)
+        new_cycle = await _start_new_event_cycle(state)
         await _store_event_photo_context(state, photo_context or {}, cycle_id=new_cycle)
         await state.set_state(TryOnStates.RESULT)
         await _run_event_generation(
@@ -5569,6 +5966,18 @@ def setup_router(
         if not event_enabled or not event_ready:
             await message.answer(msg.EVENT_DISABLED)
             return
+        data = await state.get_data()
+        await _cleanup_last_event_result(
+            message,
+            state,
+            user_id=user_id,
+            reason="event_new_photo",
+            data=data,
+        )
+        await _delete_event_aux_message(message, state, data=data)
+        await _delete_event_exhausted_message(
+            message, state, data=data, user_id=user_id
+        )
         try:
             await message.bot.delete_message(message.chat.id, message.message_id)
         except (TelegramBadRequest, TelegramForbiddenError):
@@ -5616,6 +6025,19 @@ def setup_router(
             source="back",
         ):
             return
+        data = await state.get_data()
+        await _cleanup_last_event_result(
+            message,
+            state,
+            user_id=user_id,
+            reason="event_back_to_wear",
+            data=data,
+            message_ref=message,
+        )
+        await _delete_event_aux_message(message, state, data=data)
+        await _delete_event_exhausted_message(
+            message, state, data=data, user_id=user_id
+        )
         await _maybe_delete_event_attempts_message(message, state, user_id)
         await command_wear(
             message,
