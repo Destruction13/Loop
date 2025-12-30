@@ -14,6 +14,10 @@ UTC = getattr(datetime, "UTC", timezone.utc)
 from app.config import CollageConfig
 from app.fsm import ContactRequest, TryOnStates, setup_router
 from app.keyboards import (
+    EVENT_MORE_CALLBACK,
+    EVENT_NEW_PHOTO_CALLBACK,
+    EVENT_REUSE_PHOTO_CALLBACK,
+    EVENT_TRY_CALLBACK,
     REUSE_SAME_PHOTO_CALLBACK,
     contact_request_keyboard,
     contact_share_reply_keyboard,
@@ -42,6 +46,7 @@ class PhotoStub:
 
 class DummyBot:
     def __init__(self) -> None:
+        self.id = 4242
         self.deleted: list[tuple[int, int]] = []
         self.downloads: list[tuple[Any, Path]] = []
         self.chat_actions: list[tuple[int, Any]] = []
@@ -223,6 +228,9 @@ class StubRepository:
         self.nudge_sent: bool = False
         self.more_buttons: dict[int, tuple[Optional[int], Optional[str], Optional[dict[str, Any]]]] = {}
         self.saved_contacts: list[tuple[int, str]] = []
+        self.event_triggers: set[tuple[int, str]] = set()
+        self.event_attempts: dict[tuple[int, str], tuple[bool, int, int]] = {}
+        self.event_seen: dict[tuple[int, str], set[int]] = {}
 
     async def ensure_user(self, user_id: int) -> Any:
         message_id, message_type, payload = self.more_buttons.get(
@@ -397,6 +405,59 @@ class StubRepository:
     async def list_due_reminders(self, now: Any) -> list[Any]:  # noqa: D401 - no reminders in tests
         return []
 
+    async def has_event_trigger_shown(self, user_id: int, event_id: str) -> bool:
+        return (user_id, event_id) in self.event_triggers
+
+    async def mark_event_trigger_shown(
+        self, user_id: int, event_id: str, *, shown_at: Optional[datetime] = None
+    ) -> bool:
+        key = (user_id, event_id)
+        if key in self.event_triggers:
+            return False
+        self.event_triggers.add(key)
+        return True
+
+    async def unlock_event_free_attempt(self, user_id: int, event_id: str) -> None:
+        key = (user_id, event_id)
+        free_unlocked, free_used, paid_used = self.event_attempts.get(
+            key, (True, 0, 0)
+        )
+        self.event_attempts[key] = (True, free_used, paid_used)
+
+    async def get_event_attempts(
+        self, user_id: int, event_id: str
+    ) -> tuple[bool, int, int]:
+        return self.event_attempts.get((user_id, event_id), (True, 0, 0))
+
+    async def list_event_seen_scene_ids(
+        self, user_id: int, event_id: str
+    ) -> list[int]:
+        return list(self.event_seen.get((user_id, event_id), set()))
+
+    async def commit_event_success(
+        self,
+        user_id: int,
+        event_id: str,
+        scene_id: int,
+        *,
+        use_free: bool,
+    ) -> tuple[bool, int, int]:
+        key = (user_id, event_id)
+        free_unlocked, free_used, paid_used = self.event_attempts.get(
+            key, (True, 0, 0)
+        )
+        if use_free:
+            if not free_unlocked or free_used >= 1:
+                raise RuntimeError("Free event attempt is not available")
+            free_used += 1
+        else:
+            if paid_used >= 10:
+                raise RuntimeError("Paid event attempts are exhausted")
+            paid_used += 1
+        self.event_attempts[key] = (free_unlocked, free_used, paid_used)
+        self.event_seen.setdefault(key, set()).add(scene_id)
+        return free_unlocked, free_used, paid_used
+
     async def reset_user_session(self, user_id: int) -> None:  # noqa: D401 - no-op
         return None
 
@@ -547,12 +608,18 @@ def build_router(
     models: Optional[list[GlassModel]] = None,
     *,
     collage_builder: Optional[StubCollageBuilder] = None,
+    event_enabled: bool = False,
+    event_id: str = "event",
+    event_scenes_sheet: str = "sheet",
+    event_prompt_json: str = "{}",
+    event_scenes: Optional[list[Any]] = None,
 ) -> tuple[Any, StubRepository, StubTryOn, StubCollageBuilder, StubCatalog]:
     repository = StubRepository()
     catalog = StubCatalog(models or [])
     style_recommender = StubStyleRecommender()
     result_path = tmp_path / "result.png"
-    result_path.write_bytes(b"fake-image")
+    image = Image.new("RGB", (2, 2), color=(255, 255, 255))
+    image.save(result_path, format="PNG")
     tryon = StubTryOn(result_path=result_path)
     builder = collage_builder or StubCollageBuilder()
     leads_exporter = StubLeadsExporter()
@@ -569,7 +636,7 @@ def build_router(
     )
 
     from app import fsm as fsm_module
-    from app.services import drive_fetch, image_io, nanobanana
+    from app.services import drive_fetch, event_scenes as event_scenes_module, image_io, nanobanana
 
     async def fake_save_user_photo(message: DummyMessage, tmp_dir: str = "tmp") -> str:
         destination = tmp_path / f"user_{message.from_user.id}.jpg"
@@ -596,6 +663,18 @@ def build_router(
     async def fake_fetch_drive_file(url: str, cache_dir: str = ".cache/frames") -> str:
         return str(glasses_path)
 
+    async def fake_fetch_drive_bytes(
+        url: str, *, retries: int = 3
+    ) -> drive_fetch.DriveDownload:
+        data = b"drive-bytes"
+        return drive_fetch.DriveDownload(
+            data=data,
+            mime="image/png",
+            extension="png",
+            size=len(data),
+            drive_id="fake",
+        )
+
     async def fake_generate_glasses(
         *, face_path: str, glasses_path: str
     ) -> nanobanana.GenerationSuccess:
@@ -617,17 +696,50 @@ def build_router(
             retried=False,
         )
 
+    async def fake_generate_event(**_: Any) -> nanobanana.GenerationSuccess:
+        return nanobanana.GenerationSuccess(
+            image_bytes=result_path.read_bytes(),
+            response={"candidates": [{"finishReason": "SUCCESS"}]},
+            finish_reason="SUCCESS",
+            has_inline=True,
+            has_data_url=False,
+            has_file_uri=False,
+            attempt=1,
+            retried=False,
+        )
+
     image_io.save_user_photo = fake_save_user_photo  # type: ignore[assignment]
     image_io.redownload_user_photo = fake_redownload_user_photo  # type: ignore[assignment]
     image_io.resize_inplace = fake_resize_inplace  # type: ignore[assignment]
     drive_fetch.fetch_drive_file = fake_fetch_drive_file  # type: ignore[assignment]
+    drive_fetch.fetch_drive_bytes = fake_fetch_drive_bytes  # type: ignore[assignment]
     nanobanana.generate_glasses = fake_generate_glasses  # type: ignore[assignment]
+    nanobanana.generate_event = fake_generate_event  # type: ignore[assignment]
 
     fsm_module.save_user_photo = fake_save_user_photo  # type: ignore[assignment]
     fsm_module.redownload_user_photo = fake_redownload_user_photo  # type: ignore[assignment]
     fsm_module.resize_inplace = fake_resize_inplace  # type: ignore[assignment]
     fsm_module.fetch_drive_file = fake_fetch_drive_file  # type: ignore[assignment]
+    fsm_module.fetch_drive_bytes = fake_fetch_drive_bytes  # type: ignore[assignment]
     fsm_module.generate_glasses = fake_generate_glasses  # type: ignore[assignment]
+    fsm_module.generate_event = fake_generate_event  # type: ignore[assignment]
+
+    if event_enabled:
+        from app.services.event_scenes import EventScene
+
+        default_scenes = event_scenes or [
+            EventScene(scene_id=1, drive_url="https://drive.google.com/file/d/scene/view")
+        ]
+
+        class StubEventScenesService:
+            def __init__(self, sheet_url: str) -> None:
+                self._scenes = list(default_scenes)
+
+            async def list_scenes(self) -> list[EventScene]:
+                return list(self._scenes)
+
+        event_scenes_module.EventScenesService = StubEventScenesService  # type: ignore[assignment]
+        fsm_module.EventScenesService = StubEventScenesService  # type: ignore[assignment]
 
     async def fake_track_event(*args: Any, **kwargs: Any) -> None:
         return None
@@ -660,6 +772,11 @@ def build_router(
         promo_video_enabled=False,
         promo_video_width=None,
         promo_video_height=None,
+        event_enabled=event_enabled,
+        event_id=event_id,
+        event_scenes_sheet=event_scenes_sheet,
+        event_prompt_json=event_prompt_json,
+        event_debug_bundle=False,
     )
     return router, repository, tryon, builder, catalog
 
@@ -2261,6 +2378,122 @@ def test_wear_makes_old_collage_inactive(tmp_path: Path) -> None:
         )
 
         assert len(tryon.calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_event_trigger_cleans_wear_more_and_deletes_teaser(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path, event_enabled=True)
+        handler = get_callback_handler(router, "event_trigger")
+
+        user_id = 7070
+        repository.more_buttons[user_id] = (
+            111,
+            "result",
+            {"site_url": "https://example.com"},
+        )
+        bot = DummyBot()
+        teaser = DummyMessage(user_id=user_id, bot=bot, message_id=222)
+        callback = DummyCallback(EVENT_TRY_CALLBACK, teaser)
+        state = DummyState()
+
+        await handler(callback, state)
+
+        assert any(item[1] == 111 for item in bot.edited_markups)
+        assert (user_id, 222) in bot.deleted
+        assert repository.more_buttons.get(user_id) == (None, None, None)
+
+    asyncio.run(scenario())
+
+
+def test_event_more_prompts_for_photo_in_event(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, _, _, _, _ = build_router(tmp_path, event_enabled=True)
+        handler = get_callback_handler(router, "event_more")
+
+        bot = DummyBot()
+        message = DummyMessage(user_id=5050, bot=bot, message_id=350)
+        callback = DummyCallback(EVENT_MORE_CALLBACK, message)
+        state = DummyState()
+
+        await handler(callback, state)
+
+        assert state.state == TryOnStates.AWAITING_PHOTO
+        assert message.answers[-1][0] == msg.EVENT_NEED_PHOTO
+
+    asyncio.run(scenario())
+
+
+def test_event_photo_upload_creates_new_cycle_and_sessions(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        models = [
+            GlassModel(
+                unique_id="m1",
+                title="Model 1",
+                model_code="M1",
+                site_url="https://example.com/1",
+                img_user_url="https://example.com/1.jpg",
+                img_nano_url="https://drive.google.com/file/d/frame/view",
+                gender="male",
+            )
+        ]
+        router, repository, _, _, _ = build_router(
+            tmp_path, models=models, event_enabled=True
+        )
+        handler_photo = get_message_handler(router, "accept_photo")
+
+        user_id = 9099
+        bot = DummyBot()
+        state = DummyState()
+        await state.update_data(active_mode="EVENT")
+        await state.set_state(TryOnStates.AWAITING_PHOTO)
+        repository.contacts[user_id] = SimpleNamespace(consent=True)
+
+        message1 = DummyMessage(user_id=user_id, bot=bot, message_id=10)
+        message1.photo = [PhotoStub("p1")]  # type: ignore[attr-defined]
+        await handler_photo(message1, state)
+
+        message2 = DummyMessage(user_id=user_id, bot=bot, message_id=20)
+        message2.photo = [PhotoStub("p2")]  # type: ignore[attr-defined]
+        await handler_photo(message2, state)
+
+        data = await state.get_data()
+        sessions = data.get("event_sessions", {})
+        assert len(sessions) == 2
+        cycles = {entry["cycle"] for entry in sessions.values()}
+        assert len(cycles) == 2
+        file_ids = {entry.get("last_photo_file_id") for entry in sessions.values()}
+        assert file_ids == {"p1_id", "p2_id"}
+
+    asyncio.run(scenario())
+
+
+def test_event_phone_bonus_message_after_contact(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        router, repository, _, _, _ = build_router(tmp_path, event_enabled=True)
+        handler = get_message_handler(router, "contact_shared")
+
+        user_id = 7878
+        bot = DummyBot()
+        state = DummyState()
+        await state.update_data(active_mode="EVENT")
+        await state.set_state(ContactRequest.waiting_for_phone)
+
+        message = DummyMessage(user_id=user_id, bot=bot, message_id=500)
+        message.contact = SimpleNamespace(phone_number="79991234567")  # type: ignore[attr-defined]
+
+        await handler(message, state)
+
+        assert message.answers[-1][0] == msg.EVENT_PHONE_BONUS_TEXT
+        reply_markup = message.answers[-1][1]
+        assert isinstance(reply_markup, InlineKeyboardMarkup)
+        buttons = [
+            button.callback_data
+            for row in reply_markup.inline_keyboard
+            for button in row
+        ]
+        assert buttons == [EVENT_REUSE_PHOTO_CALLBACK, EVENT_NEW_PHOTO_CALLBACK]
 
     asyncio.run(scenario())
 

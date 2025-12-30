@@ -242,6 +242,21 @@ class _DomainInfoFilter(Filter):
         return bool(getattr(record, "domain", False))
 
 
+class _EventHumanFilter(Filter):
+    """Hide verbose event INFO logs unless explicitly enabled."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401 - standard interface
+        if record.levelno != logging.INFO:
+            return True
+        module_name = getattr(record, "module_name", record.name)
+        if module_name != "event":
+            return True
+        level = (os.getenv("EVENT_LOG_LEVEL", "HUMAN") or "HUMAN").strip().upper()
+        if level == "DEBUG":
+            return True
+        return bool(getattr(record, "event_human", False))
+
+
 def setup_logging() -> logging.Logger:
     """Configure logging once for the entire application."""
 
@@ -272,6 +287,7 @@ def setup_logging() -> logging.Logger:
         markup=True,
     )
     console_handler.setFormatter(formatter_console)
+    console_handler.addFilter(_EventHumanFilter())
 
     noise_mode = os.getenv("LOG_NOISE", "low").strip().lower() or "low"
     if noise_mode != "debug":
@@ -286,6 +302,7 @@ def setup_logging() -> logging.Logger:
         encoding="utf-8",
     )
     file_handler.setFormatter(_CompactFormatter(datefmt="%Y-%m-%d %H:%M:%S"))
+    file_handler.addFilter(_EventHumanFilter())
 
     sheet_handler = _SheetLoggingHandler()
     sheet_handler.setLevel(logging.WARNING)
@@ -316,12 +333,15 @@ def info_domain(
     *,
     stage: str | None = None,
     user_id: int | str | None = None,
+    event_human: bool = False,
     **context: Any,
 ) -> None:
     """Log a milestone INFO message visible in console output."""
 
     logger = get_logger(module)
     extra: Dict[str, Any] = {"domain": True}
+    if event_human:
+        extra["event_human"] = True
     if stage:
         extra["stage"] = stage
     if context:

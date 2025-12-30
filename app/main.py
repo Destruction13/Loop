@@ -12,7 +12,8 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand, MenuButtonCommands
-
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from app.analytics import (
     AnalyticsExporter,
     AnalyticsExporterConfig,
@@ -118,15 +119,21 @@ async def main() -> None:
 
     nanobanana.configure(config.nanobanana_key_slots)
 
-    bot = Bot(token=config.bot_token, parse_mode=ParseMode.HTML)
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Запуск бота"),
-            BotCommand(command="wear", description="Примерить новые очки"),
-            BotCommand(command="help", description="Как это работает"),
-            BotCommand(command="privacy", description="Политика конфиденциальности"),
-        ]
+    bot = Bot(
+    token=config.bot_token,
+    default=DefaultBotProperties(
+        parse_mode=ParseMode.HTML
     )
+)
+    commands = [
+        BotCommand(command="start", description="Запуск бота"),
+        BotCommand(command="wear", description="Примерить новые очки"),
+        BotCommand(command="help", description="Как это работает"),
+        BotCommand(command="privacy", description="Политика конфиденциальности"),
+    ]
+    if config.event_enabled:
+        commands.append(BotCommand(command="event", description="Ивент"))
+    await bot.set_my_commands(commands)
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     repository_path = (PROJECT_ROOT / "loop.db").resolve()
     repository = Repository(repository_path, config.daily_try_limit)
@@ -210,6 +217,12 @@ async def main() -> None:
         promo_video_enabled=config.promo_video_enabled,
         promo_video_width=config.promo_video_width,
         promo_video_height=config.promo_video_height,
+        event_enabled=config.event_enabled,
+        event_id=config.event_id,
+        event_scenes_sheet=config.event_scenes_sheet,
+        event_prompt_json=config.event_prompt_json,
+        event_debug_bundle=config.event_debug_bundle,
+        event_model_name=config.event_model_name,
     )
     dp.include_router(router)
 

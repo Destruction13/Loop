@@ -368,6 +368,11 @@ CONTACT_SHARE_CALLBACK = "contact_share"
 CONTACT_SKIP_CALLBACK = "contact_skip"
 CONTACT_NEVER_CALLBACK = "contact_never"
 REUSE_SAME_PHOTO_CALLBACK = "reuse_same_photo"
+EVENT_TRY_CALLBACK = "event_try"
+EVENT_MORE_CALLBACK = "event_more"
+EVENT_BACK_CALLBACK = "event_wear"
+EVENT_REUSE_PHOTO_CALLBACK = "event_reuse_photo"
+EVENT_NEW_PHOTO_CALLBACK = "event_new_photo"
 
 
 def contact_request_keyboard() -> InlineKeyboardMarkup:
@@ -409,6 +414,124 @@ def contact_share_reply_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
+    )
+
+
+def event_trigger_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard shown in the event trigger message."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=msg.EVENT_TRY_BUTTON_TEXT,
+                    callback_data=EVENT_TRY_CALLBACK,
+                )
+            ]
+        ]
+    )
+
+
+def event_try_more_keyboard(remaining: int) -> InlineKeyboardMarkup:
+    """Keyboard shown after a successful event generation."""
+
+    label = msg.EVENT_TRY_MORE_BUTTON_TEMPLATE.format(remaining=remaining)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=EVENT_MORE_CALLBACK,
+                )
+            ]
+        ]
+    )
+
+
+def event_attempts_exhausted_keyboard(
+    *, show_phone_button: bool
+) -> InlineKeyboardMarkup:
+    """Keyboard shown when event attempts are exhausted."""
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if show_phone_button:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=msg.EVENT_PHONE_BUTTON_TEXT,
+                    callback_data=CONTACT_SHARE_CALLBACK,
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=msg.EVENT_BACK_TO_WEAR_BUTTON_TEXT,
+                callback_data=EVENT_BACK_CALLBACK,
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def event_back_to_wear_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard returning the user back to the wear flow."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=msg.EVENT_BACK_TO_WEAR_BUTTON_TEXT,
+                    callback_data=EVENT_BACK_CALLBACK,
+                )
+            ]
+        ]
+    )
+
+
+def event_phone_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard prompting the user to share a phone number for the event."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=msg.EVENT_PHONE_BUTTON_TEXT,
+                    callback_data=CONTACT_SHARE_CALLBACK,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=msg.ASK_PHONE_BUTTON_SKIP,
+                    callback_data=CONTACT_SKIP_CALLBACK,
+                ),
+                InlineKeyboardButton(
+                    text=msg.ASK_PHONE_BUTTON_NEVER,
+                    callback_data=CONTACT_NEVER_CALLBACK,
+                ),
+            ],
+        ]
+    )
+
+
+def event_phone_bonus_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard shown after unlocking additional event attempts."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=msg.EVENT_REUSE_PHOTO_BUTTON_TEXT,
+                    callback_data=EVENT_REUSE_PHOTO_CALLBACK,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=msg.EVENT_SEND_NEW_PHOTO_BUTTON_TEXT,
+                    callback_data=EVENT_NEW_PHOTO_CALLBACK,
+                )
+            ],
+        ]
     )
 
 

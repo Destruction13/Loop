@@ -134,6 +134,7 @@ class NanoBananaGenerationError(RuntimeError):
         safety_present: bool = False,
         safety_categories: tuple[str, ...] | list[str] | None = None,
         safety_levels: dict[str, str] | None = None,
+        status_code: int | None = None,
     ) -> None:
         super().__init__(message)
         self.response = response
@@ -148,6 +149,7 @@ class NanoBananaGenerationError(RuntimeError):
         self.safety_present = safety_present
         self.safety_categories = tuple(safety_categories or ())
         self.safety_levels = dict(safety_levels or {})
+        self.status_code = status_code
 
 def configure(slots: Sequence[NanoBananaKeySlot]) -> None:
     """Configure the key provider used for subsequent requests."""
@@ -201,6 +203,109 @@ async def generate_glasses(face_path: str, glasses_path: str) -> GenerationSucce
     }
 
     url = f"{API_ENDPOINT}?key={slot.api_key}"
+    data = await _request_generation(url, payload)
+
+    scan = _scan_response(data)
+    if scan.inline_data:
+        try:
+            decoded = base64.b64decode(scan.inline_data, validate=True)
+        except (ValueError, TypeError) as exc:  # pragma: no cover - unexpected format
+            reason_code, reason_detail, safety = classify_failure(data, exc, scan=scan)
+            raise NanoBananaGenerationError(
+                "Invalid base64 image in Gemini response",
+                response=data,
+                finish_reason=scan.finish_reason,
+                reason_code=reason_code,
+                reason_detail=reason_detail,
+                has_inline=scan.has_inline,
+                has_data_url=scan.has_data_url,
+                has_file_uri=scan.has_file_uri,
+                safety_present=safety.present,
+                safety_categories=safety.categories,
+                safety_levels=safety.levels,
+            ) from exc
+        return GenerationSuccess(
+            image_bytes=decoded,
+            response=data,
+            finish_reason=scan.finish_reason,
+            has_inline=scan.has_inline,
+            has_data_url=scan.has_data_url,
+            has_file_uri=scan.has_file_uri,
+            attempt=1,
+            retried=False,
+        )
+
+    reason_code, reason_detail, safety = classify_failure(data, scan=scan)
+    raise NanoBananaGenerationError(
+        "Gemini response missing image data",
+        response=data,
+        finish_reason=scan.finish_reason,
+        reason_code=reason_code,
+        reason_detail=reason_detail,
+        has_inline=scan.has_inline,
+        has_data_url=scan.has_data_url,
+        has_file_uri=scan.has_file_uri,
+        safety_present=safety.present,
+        safety_categories=safety.categories,
+        safety_levels=safety.levels,
+    )
+
+
+async def generate_event(
+    *,
+    face_bytes: bytes,
+    face_mime: str,
+    glasses_bytes: bytes,
+    glasses_mime: str,
+    scene_bytes: bytes,
+    scene_mime: str,
+    prompt_json: str,
+    model_name: str | None = None,
+) -> GenerationSuccess:
+    """Generate a composite image using three inputs and a fixed JSON prompt."""
+
+    if not prompt_json:
+        raise RuntimeError("Event prompt JSON must not be empty")
+    try:
+        slot, slot_index = await _KEY_PROVIDER.next_slot()
+    except RuntimeError as exc:
+        raise RuntimeError("NanoBanana API key is not set") from exc
+    info_domain(
+        "generation.nano",
+        f"NanoBanana slot selected: {slot.name}",
+        stage="NANO_KEY_SELECT",
+        slot=slot.name,
+        slot_index=slot_index,
+    )
+    LOGGER.debug(
+        "using NanoBanana key slot=%s slot_index=%d",
+        slot.name,
+        slot_index,
+    )
+    face_payload = _encode_image_bytes(face_bytes, face_mime)
+    glasses_payload = _encode_image_bytes(glasses_bytes, glasses_mime)
+    scene_payload = _encode_image_bytes(scene_bytes, scene_mime)
+    resolved_model = (model_name or MODEL_NAME).strip()
+    if resolved_model.startswith("models/"):
+        resolved_model = resolved_model.replace("models/", "", 1)
+    api_endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{resolved_model}:generateContent"
+    )
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    face_payload,
+                    glasses_payload,
+                    scene_payload,
+                    {"text": prompt_json},
+                ],
+            }
+        ],
+    }
+    url = f"{api_endpoint}?key={slot.api_key}"
     data = await _request_generation(url, payload)
 
     scan = _scan_response(data)
@@ -542,6 +647,7 @@ async def _request_generation(url: str, payload: dict[str, Any]) -> dict[str, An
                         safety_present=safety.present,
                         safety_categories=safety.categories,
                         safety_levels=safety.levels,
+                        status_code=response.status,
                     )
                 try:
                     return json.loads(text)
@@ -583,6 +689,16 @@ def _encode_image(path: Path) -> dict[str, Any]:
     return {
         "inline_data": {
             "mime_type": _guess_mime(path),
+            "data": encoded,
+        }
+    }
+
+
+def _encode_image_bytes(data: bytes, mime: str) -> dict[str, Any]:
+    encoded = base64.b64encode(data).decode("ascii")
+    return {
+        "inline_data": {
+            "mime_type": mime,
             "data": encoded,
         }
     }
@@ -662,6 +778,7 @@ __all__ = [
     "SafetySummary",
     "classify_failure",
     "configure",
+    "generate_event",
     "generate_glasses",
 ]
 
