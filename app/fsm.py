@@ -218,7 +218,14 @@ def setup_router(
     INVISIBLE_PROMPT = "\u2060"
     EVENT_FREE_LIMIT = 1
     EVENT_PAID_LIMIT = 10
+    EVENT_MAX_IN_FLIGHT_PER_USER = 3
     EVENT_INFLIGHT_TTL_SEC = 120
+    EVENT_NOTICE_WAIT_TTL_SEC = 25
+    EVENT_NOTICE_ATTEMPTS_TTL_SEC = 25
+    EVENT_NOTICE_LIMIT_TTL_SEC = 15
+    EVENT_NOTICE_WAIT_PREVIOUS = "wait_previous"
+    EVENT_NOTICE_ATTEMPTS_IN_FLIGHT = "attempts_in_flight"
+    EVENT_NOTICE_IN_FLIGHT_LIMIT = "in_flight_limit"
     EVENT_TRIGGER_IMAGE_PATH = (
         Path(__file__).resolve().parent.parent / "images" / "event_new_year.jpg"
     )
@@ -237,6 +244,15 @@ def setup_router(
     )
     event_inflight: dict[tuple[int, str, int | None], float] = {}
     event_inflight_lock = asyncio.Lock()
+
+    @dataclass(slots=True)
+    class EventNoticeRecord:
+        message_id: int
+        chat_id: int
+        token: str
+
+    event_notice_state: dict[tuple[int, str], EventNoticeRecord] = {}
+    event_notice_lock = asyncio.Lock()
 
     if event_enabled and not event_ready:
         logger.warning(
@@ -1065,11 +1081,331 @@ def setup_router(
         paid_remaining = max(EVENT_PAID_LIMIT - paid_used, 0) if phone_present else 0
         return (1 if free_available else 0) + paid_remaining
 
-    async def _maybe_show_event_trigger(message: Message, user_id: int) -> None:
+    async def _delete_event_notice(
+        bot: Bot,
+        *,
+        user_id: int,
+        notice_type: str,
+        token: str | None = None,
+    ) -> bool:
+        key = (user_id, notice_type)
+        async with event_notice_lock:
+            record = event_notice_state.get(key)
+            if not record:
+                return False
+            if token is None:
+                token = record.token
+            if record.token != token:
+                return False
+            chat_id = record.chat_id
+            message_id = record.message_id
+        try:
+            await bot.delete_message(chat_id, int(message_id))
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            logger.debug(
+                "Failed to delete event notice %s for %s: %s",
+                notice_type,
+                user_id,
+                exc,
+            )
+        finally:
+            async with event_notice_lock:
+                current = event_notice_state.get(key)
+                if current and current.token == token:
+                    event_notice_state.pop(key, None)
+        return True
+
+    async def _expire_event_notice(
+        bot: Bot,
+        *,
+        user_id: int,
+        notice_type: str,
+        token: str,
+        ttl_seconds: int,
+    ) -> None:
+        try:
+            await asyncio.sleep(ttl_seconds)
+            await _delete_event_notice(
+                bot, user_id=user_id, notice_type=notice_type, token=token
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug(
+                "Event notice TTL cleanup failed for %s %s: %s",
+                user_id,
+                notice_type,
+                exc,
+            )
+
+    async def _send_event_notice(
+        message: Message,
+        *,
+        user_id: int,
+        notice_type: str,
+        text: str,
+        ttl_seconds: int,
+    ) -> None:
+        token = uuid.uuid4().hex
+        key = (user_id, notice_type)
+        async with event_notice_lock:
+            record = event_notice_state.get(key)
+            if record:
+                record.token = token
+                asyncio.create_task(
+                    _expire_event_notice(
+                        message.bot,
+                        user_id=user_id,
+                        notice_type=notice_type,
+                        token=token,
+                        ttl_seconds=ttl_seconds,
+                    )
+                )
+                return
+            try:
+                sent = await message.answer(text)
+            except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                logger.debug(
+                    "Failed to send event notice %s for %s: %s",
+                    notice_type,
+                    user_id,
+                    exc,
+                )
+                return
+            event_notice_state[key] = EventNoticeRecord(
+                message_id=sent.message_id,
+                chat_id=sent.chat.id,
+                token=token,
+            )
+            asyncio.create_task(
+                _expire_event_notice(
+                    message.bot,
+                    user_id=user_id,
+                    notice_type=notice_type,
+                    token=token,
+                    ttl_seconds=ttl_seconds,
+                )
+            )
+
+    async def _event_attempts_gate(
+        message: Message,
+        state: FSMContext,
+        *,
+        user_id: int,
+        phone_present: bool,
+        free_unlocked: bool,
+        attempts_left: int,
+        reserved: int,
+        max_in_flight: int,
+    ) -> bool:
+        if attempts_left <= 0:
+            if reserved > 0:
+                if phone_present:
+                    await _send_event_notice(
+                        message,
+                        user_id=user_id,
+                        notice_type=EVENT_NOTICE_ATTEMPTS_IN_FLIGHT,
+                        text=msg.EVENT_ATTEMPTS_IN_FLIGHT,
+                        ttl_seconds=EVENT_NOTICE_ATTEMPTS_TTL_SEC,
+                    )
+                else:
+                    await _send_event_notice(
+                        message,
+                        user_id=user_id,
+                        notice_type=EVENT_NOTICE_WAIT_PREVIOUS,
+                        text=msg.EVENT_WAIT_PREVIOUS,
+                        ttl_seconds=EVENT_NOTICE_WAIT_TTL_SEC,
+                    )
+                return False
+            if not phone_present and not free_unlocked:
+                await message.answer(msg.EVENT_NO_ACCESS)
+                return False
+            await _send_event_attempts_exhausted(
+                message,
+                state,
+                user_id=user_id,
+                phone_present=phone_present,
+            )
+            return False
+        if max_in_flight > 0 and reserved >= max_in_flight:
+            if phone_present:
+                await _send_event_notice(
+                    message,
+                    user_id=user_id,
+                    notice_type=EVENT_NOTICE_IN_FLIGHT_LIMIT,
+                    text=msg.EVENT_IN_FLIGHT_LIMIT,
+                    ttl_seconds=EVENT_NOTICE_LIMIT_TTL_SEC,
+                )
+            else:
+                await _send_event_notice(
+                    message,
+                    user_id=user_id,
+                    notice_type=EVENT_NOTICE_WAIT_PREVIOUS,
+                    text=msg.EVENT_WAIT_PREVIOUS,
+                    ttl_seconds=EVENT_NOTICE_WAIT_TTL_SEC,
+                )
+            return False
+        return True
+
+    async def _event_preflight_attempt(
+        message: Message,
+        state: FSMContext,
+        *,
+        user_id: int,
+        phone_present: bool,
+    ) -> bool:
+        free_unlocked, free_used, paid_used, reserved = (
+            await repository.get_event_attempts_state(user_id, event_key)
+        )
+        attempts_available = _event_attempts_left(
+            phone_present=phone_present,
+            free_unlocked=free_unlocked,
+            free_used=free_used,
+            paid_used=paid_used,
+        )
+        attempts_left = attempts_available - reserved
+        max_in_flight = EVENT_MAX_IN_FLIGHT_PER_USER if phone_present else 1
+        return await _event_attempts_gate(
+            message,
+            state,
+            user_id=user_id,
+            phone_present=phone_present,
+            free_unlocked=free_unlocked,
+            attempts_left=attempts_left,
+            reserved=reserved,
+            max_in_flight=max_in_flight,
+        )
+
+    async def _cleanup_event_notices(
+        bot: Bot,
+        *,
+        user_id: int,
+        max_in_flight: int,
+    ) -> None:
+        if not event_key:
+            return
+        try:
+            _, _, _, reserved = await repository.get_event_attempts_state(
+                user_id, event_key
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug(
+                "Failed to read event attempts for notice cleanup %s: %s",
+                user_id,
+                exc,
+            )
+            return
+        if reserved <= 0:
+            await _delete_event_notice(
+                bot, user_id=user_id, notice_type=EVENT_NOTICE_WAIT_PREVIOUS
+            )
+        await _delete_event_notice(
+            bot, user_id=user_id, notice_type=EVENT_NOTICE_ATTEMPTS_IN_FLIGHT
+        )
+        if max_in_flight > 0 and reserved < max_in_flight:
+            await _delete_event_notice(
+                bot, user_id=user_id, notice_type=EVENT_NOTICE_IN_FLIGHT_LIMIT
+            )
+
+    async def _handle_wear_success_event(
+        message: Message,
+        *,
+        user_id: int,
+        generation_cycle: int,
+        generation_id: str | None,
+        source_message_id: int | None,
+        result_message_id: int | None,
+        photo_file_id: str | None,
+        model_id: str | None,
+        source: str,
+    ) -> None:
+        if not event_key:
+            return
+        unlocked = await repository.unlock_event_access(user_id, event_key)
+        if unlocked:
+            info_domain(
+                "event",
+                "Event access unlocked after wear success",
+                stage="EVENT_ACCESS_UNLOCKED",
+                user_id=user_id,
+                event_id=event_key,
+                generation_cycle=generation_cycle,
+                generation_id=generation_id,
+                source_message_id=source_message_id,
+                result_message_id=result_message_id,
+                photo_file_id=photo_file_id,
+                model_id=model_id,
+                source=source,
+            )
+            info_domain(
+                "event",
+                "Wear first success reached",
+                stage="WEAR_FIRST_SUCCESS",
+                user_id=user_id,
+                event_id=event_key,
+                generation_cycle=generation_cycle,
+                generation_id=generation_id,
+                source_message_id=source_message_id,
+                result_message_id=result_message_id,
+                photo_file_id=photo_file_id,
+                model_id=model_id,
+                source=source,
+            )
+        await _maybe_show_event_trigger(
+            message,
+            user_id,
+            generation_cycle=generation_cycle,
+            generation_id=generation_id,
+            source_message_id=source_message_id,
+            result_message_id=result_message_id,
+            photo_file_id=photo_file_id,
+            model_id=model_id,
+            source=source,
+        )
+
+    async def _maybe_show_event_trigger(
+        message: Message,
+        user_id: int,
+        *,
+        generation_cycle: int | None = None,
+        generation_id: str | None = None,
+        source_message_id: int | None = None,
+        result_message_id: int | None = None,
+        photo_file_id: str | None = None,
+        model_id: str | None = None,
+        source: str | None = None,
+    ) -> None:
         if not event_ready:
             return
-        if await repository.has_event_trigger_shown(user_id, event_key):
+        claimed = await repository.claim_event_trigger(user_id, event_key)
+        payload = {
+            "generation_cycle": generation_cycle,
+            "generation_id": generation_id,
+            "source_message_id": source_message_id,
+            "result_message_id": result_message_id,
+            "photo_file_id": photo_file_id,
+            "model_id": model_id,
+            "source": source,
+        }
+        if not claimed:
+            info_domain(
+                "event",
+                "Event trigger skipped",
+                stage="EVENT_TRIGGER_SKIPPED",
+                user_id=user_id,
+                event_id=event_key,
+                reason="already_shown",
+                **payload,
+            )
             return
+        info_domain(
+            "event",
+            "Event trigger attempt",
+            stage="EVENT_TRIGGER_ATTEMPT",
+            user_id=user_id,
+            event_id=event_key,
+            **payload,
+        )
         sent = False
         if EVENT_TRIGGER_IMAGE_PATH.exists():
             try:
@@ -1101,15 +1437,25 @@ def setup_router(
                 sent = True
             except (TelegramBadRequest, TelegramForbiddenError) as exc:
                 logger.debug("Failed to send event trigger: %s", exc)
+                await repository.release_event_trigger(user_id, event_key)
+                info_domain(
+                    "event",
+                    "Event trigger failed",
+                    stage="EVENT_TRIGGER_FAILED",
+                    user_id=user_id,
+                    event_id=event_key,
+                    error_type=exc.__class__.__name__,
+                    **payload,
+                )
                 return
-        inserted = await repository.mark_event_trigger_shown(user_id, event_key)
-        if inserted:
+        if sent:
             info_domain(
                 "event",
                 "Event trigger shown",
                 stage="EVENT_TRIGGER_SHOWN",
                 user_id=user_id,
                 event_id=event_key,
+                **payload,
             )
 
     async def _send_event_phone_prompt(
@@ -1231,6 +1577,7 @@ def setup_router(
                 attempts_left,
             ) = attempts_snapshot
         generation_latency_ms = 0
+        max_in_flight = EVENT_MAX_IN_FLIGHT_PER_USER if phone_present else 1
 
         def _event_log_failure(reason: str, *, attempts_charged: bool = False) -> None:
             charged_label = "да" if attempts_charged else "нет"
@@ -1257,18 +1604,6 @@ def setup_router(
             free_available=free_available,
             paid_available=paid_remaining,
         )
-        if attempts_left <= 0:
-            if not phone_present and not free_unlocked:
-                await message.answer(msg.EVENT_NO_ACCESS)
-                return
-            await _send_event_attempts_exhausted(
-                message,
-                state,
-                user_id=user_id,
-                phone_present=phone_present,
-            )
-            return
-
         resolved_context = (
             dict(photo_context) if photo_context else _extract_event_photo_context(data)
         )
@@ -1319,6 +1654,8 @@ def setup_router(
         user_photo_path: Path | None = None
         start_time = 0.0
         source_kind: str | None = None
+        reservation = None
+        attempt_finalized = False
 
         def _write_debug_meta() -> None:
             if not debug_dir or not debug_meta or not request_meta_path:
@@ -1365,8 +1702,54 @@ def setup_router(
             progress_message_id = None
 
         try:
+            reservation = await repository.reserve_event_attempt(
+                user_id,
+                event_key,
+                rid,
+                phone_present=phone_present,
+                max_in_flight=max_in_flight,
+            )
+            info_domain(
+                "event",
+                "Event attempt reserve",
+                stage="EVENT_ATTEMPT_RESERVE",
+                user_id=user_id,
+                event_id=event_key,
+                rid=rid,
+                ok=reservation.ok,
+                reason=reservation.reason,
+                use_free=reservation.use_free,
+                reserved=reservation.reserved,
+                attempts_available=reservation.attempts_available,
+                attempts_left=reservation.attempts_left,
+                max_in_flight=max_in_flight,
+                phone_present=phone_present,
+                free_unlocked=reservation.free_unlocked,
+                free_used=reservation.free_used,
+                paid_used=reservation.paid_used,
+            )
+            if not reservation.ok:
+                if reservation.reason in {"no_attempts", "in_flight_limit"}:
+                    await _event_attempts_gate(
+                        message,
+                        state,
+                        user_id=user_id,
+                        phone_present=phone_present,
+                        free_unlocked=reservation.free_unlocked,
+                        attempts_left=reservation.attempts_left,
+                        reserved=reservation.reserved,
+                        max_in_flight=max_in_flight,
+                    )
+                    return
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+
+            attempts_left_before = reservation.attempts_left
+            if reservation.reason is None:
+                attempts_left_before += 1
+
             _event_log_human(
-                f"📸 Пользователь отправил фото (event_id={event_key}, попыток до: {attempts_left})",
+                f"📸 Пользователь отправил фото (event_id={event_key}, попыток до: {attempts_left_before})",
                 user_id=user_id,
             )
             _event_log_human(
@@ -1379,10 +1762,9 @@ def setup_router(
                 stage="EVENT_TRY_REQUEST",
                 user_id=user_id,
                 event_id=event_key,
-                attempts_left_before=attempts_left,
+                attempts_left_before=attempts_left_before,
+                rid=rid,
             )
-            use_free = free_available
-            attempts_left_after = max(attempts_left - 1, 0)
 
             progress_message = await message.answer(msg.EVENT_STARTING)
             progress_message_id = getattr(progress_message, "message_id", None)
@@ -2011,6 +2393,56 @@ def setup_router(
                 _write_debug_meta()
             await _delete_progress()
 
+            commit_result = await repository.commit_event_attempt(
+                user_id,
+                event_key,
+                rid,
+                scene_id=chosen_scene.scene_id,
+            )
+            info_domain(
+                "event",
+                "Event attempt commit",
+                stage="EVENT_ATTEMPT_COMMIT",
+                user_id=user_id,
+                event_id=event_key,
+                rid=rid,
+                scene_id=chosen_scene.scene_id,
+                ok=commit_result.ok,
+                status=commit_result.status,
+                use_free=commit_result.use_free,
+                reserved=commit_result.reserved,
+                free_unlocked=commit_result.free_unlocked,
+                free_used=commit_result.free_used,
+                paid_used=commit_result.paid_used,
+            )
+            if not commit_result.ok:
+                _event_log_failure("не удалось списать попытку")
+                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                return
+            attempt_finalized = True
+            attempts_left_after_db = _event_attempts_left(
+                phone_present=phone_present,
+                free_unlocked=commit_result.free_unlocked,
+                free_used=commit_result.free_used,
+                paid_used=commit_result.paid_used,
+            )
+            show_upsell_after = bool(
+                not phone_present
+                and (commit_result.free_used + commit_result.paid_used) == 1
+            )
+            info_domain(
+                "event",
+                "Event commit success",
+                stage="EVENT_COMMIT_SUCCESS",
+                user_id=user_id,
+                event_id=event_key,
+                scene_id=chosen_scene.scene_id,
+                attempts_left_after=attempts_left_after_db,
+                attempts_left_ui=attempts_left_after_db,
+                use_free=commit_result.use_free,
+                rid=rid,
+            )
+
             data_for_delivery = await state.get_data()
             active_cycle_id = _normalize_cycle(
                 data_for_delivery.get("event_active_cycle_id")
@@ -2020,15 +2452,12 @@ def setup_router(
                 active_cycle_id, resolved_cycle
             )
             if is_active_delivery:
-                show_upsell = bool(
-                    not phone_present and free_used == 0 and paid_used == 0
-                )
                 caption_text = _event_result_caption(
-                    attempts_left=attempts_left_after,
-                    show_upsell=show_upsell,
+                    attempts_left=attempts_left_after_db,
+                    show_upsell=show_upsell_after,
                 )
                 result_keyboard = _event_result_keyboard(
-                    frame_model, attempts_left=attempts_left_after
+                    frame_model, attempts_left=attempts_left_after_db
                 )
             else:
                 caption_text = ""
@@ -2048,6 +2477,7 @@ def setup_router(
                     event_id=event_key,
                     ok=False,
                     error_type=exc.__class__.__name__,
+                    rid=rid,
                 )
                 info_domain(
                     "event",
@@ -2058,9 +2488,10 @@ def setup_router(
                     stage_name="send_result",
                     error_type=exc.__class__.__name__,
                     retryable=True,
-                    attempts_not_charged=True,
+                    attempts_not_charged=False,
+                    rid=rid,
                 )
-                _event_log_failure("не удалось отправить результат")
+                _event_log_failure("?? ??????? ????????? ?????????", attempts_charged=True)
                 await message.answer(msg.EVENT_RETRY_MESSAGE)
                 return
 
@@ -2072,6 +2503,7 @@ def setup_router(
                 event_id=event_key,
                 ok=True,
                 message_id=result_message.message_id,
+                rid=rid,
             )
             await _register_event_session(
                 state,
@@ -2103,91 +2535,6 @@ def setup_router(
                     user_id=user_id,
                     site_url=result_site_url or None,
                 )
-
-            try:
-                free_unlocked_after, free_used_after, paid_used_after = (
-                    await repository.commit_event_success(
-                        user_id,
-                        event_key,
-                        chosen_scene.scene_id,
-                        use_free=use_free,
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001
-                info_domain(
-                    "event",
-                    "Event commit failed",
-                    stage="EVENT_FAIL",
-                    user_id=user_id,
-                    event_id=event_key,
-                    stage_name="commit",
-                    error_type=exc.__class__.__name__,
-                    retryable=False,
-                    attempts_not_charged=True,
-                )
-                _event_log_failure("не удалось списать попытку")
-                return
-
-            attempts_left_after_db = _event_attempts_left(
-                phone_present=phone_present,
-                free_unlocked=free_unlocked_after,
-                free_used=free_used_after,
-                paid_used=paid_used_after,
-            )
-            show_upsell_after = bool(
-                not phone_present and (free_used_after + paid_used_after) == 1
-            )
-            active_cycle_after_commit = _normalize_cycle(
-                (await state.get_data()).get("event_active_cycle_id")
-            )
-            is_active_after_commit = _is_event_cycle_active(
-                active_cycle_after_commit, resolved_cycle
-            )
-            if is_active_after_commit:
-                updated_caption = _event_result_caption(
-                    attempts_left=attempts_left_after_db,
-                    show_upsell=show_upsell_after,
-                )
-                updated_keyboard = _event_result_keyboard(
-                    frame_model, attempts_left=attempts_left_after_db
-                )
-                try:
-                    await message.bot.edit_message_caption(
-                        chat_id=result_message.chat.id,
-                        message_id=result_message.message_id,
-                        caption=updated_caption,
-                        reply_markup=updated_keyboard,
-                    )
-                except (TelegramBadRequest, TelegramForbiddenError):
-                    try:
-                        await message.bot.edit_message_reply_markup(
-                            chat_id=result_message.chat.id,
-                            message_id=result_message.message_id,
-                            reply_markup=updated_keyboard,
-                        )
-                    except (TelegramBadRequest, TelegramForbiddenError):
-                        pass
-            else:
-                result_chat_id = _resolve_chat_id(result_message) or message.chat.id
-                await _cleanup_event_result_message(
-                    message.bot,
-                    chat_id=int(result_chat_id),
-                    message_id=int(result_message.message_id),
-                    reason="event_result_stale_post_commit",
-                    user_id=user_id,
-                    site_url=result_site_url or None,
-                )
-            info_domain(
-                "event",
-                "Event commit success",
-                stage="EVENT_COMMIT_SUCCESS",
-                user_id=user_id,
-                event_id=event_key,
-                scene_id=chosen_scene.scene_id,
-                attempts_left_after=attempts_left_after_db,
-                attempts_left_ui=attempts_left_after,
-                use_free=use_free,
-            )
             latency_sec = generation_latency_ms / 1000.0
             _event_log_human(
                 (
@@ -2282,6 +2629,33 @@ def setup_router(
                         "Failed to delete event temp file %s",
                         user_photo_path,
                     )
+            if reservation and reservation.ok and not attempt_finalized:
+                rollback_result = await repository.rollback_event_attempt(
+                    user_id,
+                    event_key,
+                    rid,
+                )
+                info_domain(
+                    "event",
+                    "Event attempt rollback",
+                    stage="EVENT_ATTEMPT_ROLLBACK",
+                    user_id=user_id,
+                    event_id=event_key,
+                    rid=rid,
+                    ok=rollback_result.ok,
+                    status=rollback_result.status,
+                    use_free=rollback_result.use_free,
+                    reserved=rollback_result.reserved,
+                    free_unlocked=rollback_result.free_unlocked,
+                    free_used=rollback_result.free_used,
+                    paid_used=rollback_result.paid_used,
+                )
+            if reservation and reservation.ok:
+                await _cleanup_event_notices(
+                    message.bot,
+                    user_id=user_id,
+                    max_in_flight=max_in_flight,
+                )
             await _delete_progress()
             reset_context(tokens)
             await _release_event_lock(user_id, cycle_id=lock_cycle_id)
@@ -4174,16 +4548,9 @@ def setup_router(
                 message, state, data=data_before, user_id=user_id
             )
             phone_present = await _event_phone_present(user_id)
-            _, _, _, _, _, attempts_left = await _event_attempts_snapshot(
-                user_id, phone_present
-            )
-            if attempts_left <= 0:
-                await _send_event_attempts_exhausted(
-                    message,
-                    state,
-                    user_id=user_id,
-                    phone_present=phone_present,
-                )
+            if not await _event_preflight_attempt(
+                message, state, user_id=user_id, phone_present=phone_present
+            ):
                 return
             photo = message.photo[-1]
             path = await save_user_photo(message)
@@ -5104,7 +5471,7 @@ def setup_router(
                 generation_cycle=generation_cycle,
                 model_id=model.unique_id,
             )
-            await _send_delivery_message(
+            stale_message = await _send_delivery_message(
                 message,
                 state,
                 message.answer_photo,
@@ -5117,6 +5484,17 @@ def setup_router(
                 user_id,
                 initial_trigger=CONTACT_INITIAL_TRIGGER,
                 reminder_trigger=CONTACT_REMINDER_TRIGGER,
+            )
+            await _handle_wear_success_event(
+                message,
+                user_id=user_id,
+                generation_cycle=generation_cycle,
+                generation_id=generation_id,
+                source_message_id=message.message_id,
+                result_message_id=stale_message.message_id,
+                photo_file_id=upload_file_id or last_photo_file_id,
+                model_id=model.unique_id,
+                source="stale",
             )
             return
 
@@ -5206,9 +5584,18 @@ def setup_router(
             source_message_id=message.message_id,
             vote_payload=vote_payload,
         )
+        await _handle_wear_success_event(
+            message,
+            user_id=user_id,
+            generation_cycle=generation_cycle,
+            generation_id=generation_id,
+            source_message_id=message.message_id,
+            result_message_id=result_message.message_id,
+            photo_file_id=upload_file_id or last_photo_file_id,
+            model_id=model.unique_id,
+            source="current",
+        )
         new_gen_count = await repository.increment_generation_count(user_id)
-        if gen_count_before == 0:
-            await _maybe_show_event_trigger(message, user_id)
         daily_gen_count, contact_trigger = await repository.register_contact_generation(
             user_id,
             initial_trigger=CONTACT_INITIAL_TRIGGER,
@@ -5919,16 +6306,9 @@ def setup_router(
                     pass
         await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="callback")
         phone_present = await _event_phone_present(user_id)
-        _, _, _, _, _, attempts_left = await _event_attempts_snapshot(
-            user_id, phone_present
-        )
-        if attempts_left <= 0:
-            await _send_event_attempts_exhausted(
-                message,
-                state,
-                user_id=user_id,
-                phone_present=phone_present,
-            )
+        if not await _event_preflight_attempt(
+            message, state, user_id=user_id, phone_present=phone_present
+        ):
             return
         data = await state.get_data()
         photo_context = _extract_event_photo_context(data)
@@ -5990,16 +6370,9 @@ def setup_router(
                     pass
         await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="callback")
         phone_present = await _event_phone_present(user_id)
-        _, _, _, _, _, attempts_left = await _event_attempts_snapshot(
-            user_id, phone_present
-        )
-        if attempts_left <= 0:
-            await _send_event_attempts_exhausted(
-                message,
-                state,
-                user_id=user_id,
-                phone_present=phone_present,
-            )
+        if not await _event_preflight_attempt(
+            message, state, user_id=user_id, phone_present=phone_present
+        ):
             return
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await _send_aux_message(
