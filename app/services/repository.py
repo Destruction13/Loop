@@ -7,12 +7,36 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator, Iterable, List, Optional, Tuple
 
 from app.models import UserContact, UserProfile
+
+
+@dataclass(frozen=True)
+class EventAttemptReservation:
+    ok: bool
+    reason: str | None
+    use_free: bool
+    free_unlocked: bool
+    free_used: int
+    paid_used: int
+    reserved: int
+    attempts_available: int
+    attempts_left: int
+
+
+@dataclass(frozen=True)
+class EventAttemptFinalization:
+    ok: bool
+    status: str
+    use_free: bool
+    free_unlocked: bool
+    free_used: int
+    paid_used: int
+    reserved: int
 
 
 class Repository:
@@ -264,6 +288,25 @@ class Repository:
                 self._mark_event_trigger_shown_sync, user_id, event_id, moment
             )
 
+    async def claim_event_trigger(
+        self, user_id: int, event_id: str, *, claimed_at: Optional[datetime] = None
+    ) -> bool:
+        moment = claimed_at or datetime.now(timezone.utc)
+        return await asyncio.to_thread(
+            self._claim_event_trigger_sync, user_id, event_id, moment
+        )
+
+    async def release_event_trigger(self, user_id: int, event_id: str) -> None:
+        await asyncio.to_thread(self._release_event_trigger_sync, user_id, event_id)
+
+    async def unlock_event_access(
+        self, user_id: int, event_id: str, *, unlocked_at: Optional[datetime] = None
+    ) -> bool:
+        moment = unlocked_at or datetime.now(timezone.utc)
+        return await asyncio.to_thread(
+            self._unlock_event_access_sync, user_id, event_id, moment
+        )
+
     async def unlock_event_free_attempt(self, user_id: int, event_id: str) -> None:
         moment = datetime.now(timezone.utc)
         lock = self._ensure_lock()
@@ -277,6 +320,66 @@ class Repository:
     ) -> tuple[bool, int, int]:
         return await asyncio.to_thread(
             self._get_event_attempts_sync, user_id, event_id
+        )
+
+    async def get_event_attempts_state(
+        self, user_id: int, event_id: str
+    ) -> tuple[bool, int, int, int]:
+        return await asyncio.to_thread(
+            self._get_event_attempts_state_sync, user_id, event_id
+        )
+
+    async def reserve_event_attempt(
+        self,
+        user_id: int,
+        event_id: str,
+        rid: str,
+        *,
+        phone_present: bool,
+        max_in_flight: int,
+        reserved_at: Optional[datetime] = None,
+    ) -> EventAttemptReservation:
+        moment = reserved_at or datetime.now(timezone.utc)
+        return await asyncio.to_thread(
+            self._reserve_event_attempt_sync,
+            user_id,
+            event_id,
+            rid,
+            phone_present,
+            max_in_flight,
+            moment,
+        )
+
+    async def commit_event_attempt(
+        self,
+        user_id: int,
+        event_id: str,
+        rid: str,
+        *,
+        scene_id: int,
+        committed_at: Optional[datetime] = None,
+    ) -> EventAttemptFinalization:
+        moment = committed_at or datetime.now(timezone.utc)
+        return await asyncio.to_thread(
+            self._commit_event_attempt_sync,
+            user_id,
+            event_id,
+            rid,
+            scene_id,
+            moment,
+        )
+
+    async def rollback_event_attempt(
+        self,
+        user_id: int,
+        event_id: str,
+        rid: str,
+        *,
+        rolled_back_at: Optional[datetime] = None,
+    ) -> EventAttemptFinalization:
+        moment = rolled_back_at or datetime.now(timezone.utc)
+        return await asyncio.to_thread(
+            self._rollback_event_attempt_sync, user_id, event_id, rid, moment
         )
 
     async def list_event_seen_scene_ids(
@@ -1396,6 +1499,26 @@ class Repository:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_attempt_reservations (
+                user_id INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                rid TEXT NOT NULL,
+                status TEXT NOT NULL,
+                use_free INTEGER NOT NULL,
+                reserved_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, event_id, rid)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_event_attempt_reservations_active
+            ON event_attempt_reservations (user_id, event_id, status)
+            """
+        )
 
     def _has_event_trigger_shown_sync(self, user_id: int, event_id: str) -> bool:
         with self._connection() as conn:
@@ -1418,6 +1541,67 @@ class Repository:
             )
             conn.commit()
             return cursor.rowcount > 0
+
+    def _claim_event_trigger_sync(
+        self, user_id: int, event_id: str, moment: datetime
+    ) -> bool:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO event_triggers (user_id, event_id, shown_at)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, event_id, moment.isoformat()),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def _release_event_trigger_sync(self, user_id: int, event_id: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "DELETE FROM event_triggers WHERE user_id = ? AND event_id = ?",
+                (user_id, event_id),
+            )
+            conn.commit()
+
+    def _unlock_event_access_sync(
+        self, user_id: int, event_id: str, moment: datetime
+    ) -> bool:
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT free_unlocked
+                FROM event_attempts
+                WHERE user_id = ? AND event_id = ?
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            already_unlocked = bool(row[0]) if row else False
+            if already_unlocked:
+                conn.commit()
+                return False
+            if row:
+                conn.execute(
+                    """
+                    UPDATE event_attempts
+                    SET free_unlocked = 1, updated_at = ?
+                    WHERE user_id = ? AND event_id = ?
+                    """,
+                    (moment.isoformat(), user_id, event_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO event_attempts (
+                        user_id, event_id, free_unlocked, free_used, paid_used, updated_at
+                    )
+                    VALUES (?, ?, 1, 0, 0, ?)
+                    """,
+                    (user_id, event_id, moment.isoformat()),
+                )
+            conn.commit()
+            return True
 
     def _unlock_event_free_attempt_sync(
         self, user_id: int, event_id: str, moment: datetime
@@ -1453,6 +1637,186 @@ class Repository:
                 return False, 0, 0
             return bool(row[0]), int(row[1] or 0), int(row[2] or 0)
 
+    def _get_event_attempts_state_sync(
+        self, user_id: int, event_id: str
+    ) -> tuple[bool, int, int, int]:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT free_unlocked, free_used, paid_used
+                FROM event_attempts
+                WHERE user_id = ? AND event_id = ?
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            if not row:
+                free_unlocked, free_used, paid_used = False, 0, 0
+            else:
+                free_unlocked = bool(row[0])
+                free_used = int(row[1] or 0)
+                paid_used = int(row[2] or 0)
+            reserved = conn.execute(
+                """
+                SELECT COUNT(1)
+                FROM event_attempt_reservations
+                WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            reserved_count = int(reserved[0] or 0) if reserved else 0
+            return free_unlocked, free_used, paid_used, reserved_count
+
+    def _reserve_event_attempt_sync(
+        self,
+        user_id: int,
+        event_id: str,
+        rid: str,
+        phone_present: bool,
+        max_in_flight: int,
+        moment: datetime,
+    ) -> EventAttemptReservation:
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT status, use_free
+                FROM event_attempt_reservations
+                WHERE user_id = ? AND event_id = ? AND rid = ?
+                """,
+                (user_id, event_id, rid),
+            ).fetchone()
+            row = conn.execute(
+                """
+                SELECT free_unlocked, free_used, paid_used
+                FROM event_attempts
+                WHERE user_id = ? AND event_id = ?
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            if not row:
+                free_unlocked, free_used, paid_used = False, 0, 0
+            else:
+                free_unlocked = bool(row[0])
+                free_used = int(row[1] or 0)
+                paid_used = int(row[2] or 0)
+            reserved_row = conn.execute(
+                """
+                SELECT COUNT(1)
+                FROM event_attempt_reservations
+                WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            reserved_count = int(reserved_row[0] or 0) if reserved_row else 0
+            free_available = free_unlocked and free_used < 1
+            paid_remaining = max(10 - paid_used, 0) if phone_present else 0
+            attempts_available = (1 if free_available else 0) + paid_remaining
+            attempts_left = attempts_available - reserved_count
+
+            if existing:
+                status = str(existing[0] or "")
+                use_free = bool(existing[1])
+                conn.commit()
+                if status == "reserved":
+                    return EventAttemptReservation(
+                        ok=True,
+                        reason="already_reserved",
+                        use_free=use_free,
+                        free_unlocked=free_unlocked,
+                        free_used=free_used,
+                        paid_used=paid_used,
+                        reserved=reserved_count,
+                        attempts_available=attempts_available,
+                        attempts_left=attempts_left,
+                    )
+                if status == "committed":
+                    reason = "already_committed"
+                elif status == "rolled_back":
+                    reason = "already_rolled_back"
+                else:
+                    reason = "invalid_state"
+                return EventAttemptReservation(
+                    ok=False,
+                    reason=reason,
+                    use_free=use_free,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                    reserved=reserved_count,
+                    attempts_available=attempts_available,
+                    attempts_left=attempts_left,
+                )
+
+            if attempts_left <= 0:
+                conn.commit()
+                return EventAttemptReservation(
+                    ok=False,
+                    reason="no_attempts",
+                    use_free=False,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                    reserved=reserved_count,
+                    attempts_available=attempts_available,
+                    attempts_left=attempts_left,
+                )
+
+            if max_in_flight > 0 and reserved_count >= max_in_flight:
+                conn.commit()
+                return EventAttemptReservation(
+                    ok=False,
+                    reason="in_flight_limit",
+                    use_free=False,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                    reserved=reserved_count,
+                    attempts_available=attempts_available,
+                    attempts_left=attempts_left,
+                )
+
+            reserved_free_row = conn.execute(
+                """
+                SELECT COUNT(1)
+                FROM event_attempt_reservations
+                WHERE user_id = ? AND event_id = ?
+                  AND status = 'reserved' AND use_free = 1
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            reserved_free = int(reserved_free_row[0] or 0) if reserved_free_row else 0
+            use_free = free_available and reserved_free == 0
+            conn.execute(
+                """
+                INSERT INTO event_attempt_reservations (
+                    user_id, event_id, rid, status, use_free, reserved_at, updated_at
+                )
+                VALUES (?, ?, ?, 'reserved', ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    event_id,
+                    rid,
+                    1 if use_free else 0,
+                    moment.isoformat(),
+                    moment.isoformat(),
+                ),
+            )
+            reserved_after = reserved_count + 1
+            attempts_left_after = attempts_available - reserved_after
+            conn.commit()
+            return EventAttemptReservation(
+                ok=True,
+                reason=None,
+                use_free=use_free,
+                free_unlocked=free_unlocked,
+                free_used=free_used,
+                paid_used=paid_used,
+                reserved=reserved_after,
+                attempts_available=attempts_available,
+                attempts_left=attempts_left_after,
+            )
+
     def _list_event_seen_scene_ids_sync(
         self, user_id: int, event_id: str
     ) -> list[int]:
@@ -1464,6 +1828,368 @@ class Repository:
                 (user_id, event_id),
             ).fetchall()
             return [int(row[0]) for row in rows if row and row[0] is not None]
+
+    def _commit_event_attempt_sync(
+        self,
+        user_id: int,
+        event_id: str,
+        rid: str,
+        scene_id: int,
+        moment: datetime,
+    ) -> EventAttemptFinalization:
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            reservation = conn.execute(
+                """
+                SELECT status, use_free
+                FROM event_attempt_reservations
+                WHERE user_id = ? AND event_id = ? AND rid = ?
+                """,
+                (user_id, event_id, rid),
+            ).fetchone()
+            row = conn.execute(
+                """
+                SELECT free_unlocked, free_used, paid_used
+                FROM event_attempts
+                WHERE user_id = ? AND event_id = ?
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            if not row:
+                free_unlocked, free_used, paid_used = False, 0, 0
+            else:
+                free_unlocked = bool(row[0])
+                free_used = int(row[1] or 0)
+                paid_used = int(row[2] or 0)
+
+            if not reservation:
+                conn.commit()
+                reserved_count = conn.execute(
+                    """
+                    SELECT COUNT(1)
+                    FROM event_attempt_reservations
+                    WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                    """,
+                    (user_id, event_id),
+                ).fetchone()
+                reserved = int(reserved_count[0] or 0) if reserved_count else 0
+                return EventAttemptFinalization(
+                    ok=False,
+                    status="missing",
+                    use_free=False,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                    reserved=reserved,
+                )
+
+            status = str(reservation[0] or "")
+            use_free = bool(reservation[1])
+            if status == "committed":
+                conn.commit()
+                reserved_count = conn.execute(
+                    """
+                    SELECT COUNT(1)
+                    FROM event_attempt_reservations
+                    WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                    """,
+                    (user_id, event_id),
+                ).fetchone()
+                reserved = int(reserved_count[0] or 0) if reserved_count else 0
+                return EventAttemptFinalization(
+                    ok=True,
+                    status="already_committed",
+                    use_free=use_free,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                    reserved=reserved,
+                )
+            if status == "rolled_back":
+                conn.commit()
+                reserved_count = conn.execute(
+                    """
+                    SELECT COUNT(1)
+                    FROM event_attempt_reservations
+                    WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                    """,
+                    (user_id, event_id),
+                ).fetchone()
+                reserved = int(reserved_count[0] or 0) if reserved_count else 0
+                return EventAttemptFinalization(
+                    ok=False,
+                    status="rolled_back",
+                    use_free=use_free,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                    reserved=reserved,
+                )
+            if status != "reserved":
+                conn.commit()
+                reserved_count = conn.execute(
+                    """
+                    SELECT COUNT(1)
+                    FROM event_attempt_reservations
+                    WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                    """,
+                    (user_id, event_id),
+                ).fetchone()
+                reserved = int(reserved_count[0] or 0) if reserved_count else 0
+                return EventAttemptFinalization(
+                    ok=False,
+                    status="invalid_state",
+                    use_free=use_free,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                    reserved=reserved,
+                )
+
+            if use_free:
+                if not free_unlocked or free_used >= 1:
+                    conn.commit()
+                    reserved_count = conn.execute(
+                        """
+                        SELECT COUNT(1)
+                        FROM event_attempt_reservations
+                        WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                        """,
+                        (user_id, event_id),
+                    ).fetchone()
+                    reserved = int(reserved_count[0] or 0) if reserved_count else 0
+                    return EventAttemptFinalization(
+                        ok=False,
+                        status="free_unavailable",
+                        use_free=use_free,
+                        free_unlocked=free_unlocked,
+                        free_used=free_used,
+                        paid_used=paid_used,
+                        reserved=reserved,
+                    )
+                free_used += 1
+            else:
+                if paid_used >= 10:
+                    conn.commit()
+                    reserved_count = conn.execute(
+                        """
+                        SELECT COUNT(1)
+                        FROM event_attempt_reservations
+                        WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                        """,
+                        (user_id, event_id),
+                    ).fetchone()
+                    reserved = int(reserved_count[0] or 0) if reserved_count else 0
+                    return EventAttemptFinalization(
+                        ok=False,
+                        status="paid_exhausted",
+                        use_free=use_free,
+                        free_unlocked=free_unlocked,
+                        free_used=free_used,
+                        paid_used=paid_used,
+                        reserved=reserved,
+                    )
+                paid_used += 1
+
+            conn.execute(
+                """
+                INSERT INTO event_attempts (
+                    user_id, event_id, free_unlocked, free_used, paid_used, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, event_id) DO UPDATE SET
+                    free_unlocked = excluded.free_unlocked,
+                    free_used = excluded.free_used,
+                    paid_used = excluded.paid_used,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    user_id,
+                    event_id,
+                    1 if free_unlocked else 0,
+                    free_used,
+                    paid_used,
+                    moment.isoformat(),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO event_seen (user_id, event_id, scene_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, event_id, scene_id, moment.isoformat()),
+            )
+            conn.execute(
+                """
+                UPDATE event_attempt_reservations
+                SET status = 'committed', updated_at = ?
+                WHERE user_id = ? AND event_id = ? AND rid = ?
+                """,
+                (moment.isoformat(), user_id, event_id, rid),
+            )
+            conn.commit()
+            reserved_count = conn.execute(
+                """
+                SELECT COUNT(1)
+                FROM event_attempt_reservations
+                WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            reserved = int(reserved_count[0] or 0) if reserved_count else 0
+            return EventAttemptFinalization(
+                ok=True,
+                status="committed",
+                use_free=use_free,
+                free_unlocked=free_unlocked,
+                free_used=free_used,
+                paid_used=paid_used,
+                reserved=reserved,
+            )
+
+    def _rollback_event_attempt_sync(
+        self,
+        user_id: int,
+        event_id: str,
+        rid: str,
+        moment: datetime,
+    ) -> EventAttemptFinalization:
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            reservation = conn.execute(
+                """
+                SELECT status, use_free
+                FROM event_attempt_reservations
+                WHERE user_id = ? AND event_id = ? AND rid = ?
+                """,
+                (user_id, event_id, rid),
+            ).fetchone()
+            row = conn.execute(
+                """
+                SELECT free_unlocked, free_used, paid_used
+                FROM event_attempts
+                WHERE user_id = ? AND event_id = ?
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            if not row:
+                free_unlocked, free_used, paid_used = False, 0, 0
+            else:
+                free_unlocked = bool(row[0])
+                free_used = int(row[1] or 0)
+                paid_used = int(row[2] or 0)
+
+            if not reservation:
+                conn.commit()
+                reserved_count = conn.execute(
+                    """
+                    SELECT COUNT(1)
+                    FROM event_attempt_reservations
+                    WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                    """,
+                    (user_id, event_id),
+                ).fetchone()
+                reserved = int(reserved_count[0] or 0) if reserved_count else 0
+                return EventAttemptFinalization(
+                    ok=False,
+                    status="missing",
+                    use_free=False,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                    reserved=reserved,
+                )
+
+            status = str(reservation[0] or "")
+            use_free = bool(reservation[1])
+            if status == "rolled_back":
+                conn.commit()
+                reserved_count = conn.execute(
+                    """
+                    SELECT COUNT(1)
+                    FROM event_attempt_reservations
+                    WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                    """,
+                    (user_id, event_id),
+                ).fetchone()
+                reserved = int(reserved_count[0] or 0) if reserved_count else 0
+                return EventAttemptFinalization(
+                    ok=True,
+                    status="already_rolled_back",
+                    use_free=use_free,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                    reserved=reserved,
+                )
+            if status == "committed":
+                conn.commit()
+                reserved_count = conn.execute(
+                    """
+                    SELECT COUNT(1)
+                    FROM event_attempt_reservations
+                    WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                    """,
+                    (user_id, event_id),
+                ).fetchone()
+                reserved = int(reserved_count[0] or 0) if reserved_count else 0
+                return EventAttemptFinalization(
+                    ok=False,
+                    status="already_committed",
+                    use_free=use_free,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                    reserved=reserved,
+                )
+            if status != "reserved":
+                conn.commit()
+                reserved_count = conn.execute(
+                    """
+                    SELECT COUNT(1)
+                    FROM event_attempt_reservations
+                    WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                    """,
+                    (user_id, event_id),
+                ).fetchone()
+                reserved = int(reserved_count[0] or 0) if reserved_count else 0
+                return EventAttemptFinalization(
+                    ok=False,
+                    status="invalid_state",
+                    use_free=use_free,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                    reserved=reserved,
+                )
+
+            conn.execute(
+                """
+                UPDATE event_attempt_reservations
+                SET status = 'rolled_back', updated_at = ?
+                WHERE user_id = ? AND event_id = ? AND rid = ?
+                """,
+                (moment.isoformat(), user_id, event_id, rid),
+            )
+            conn.commit()
+            reserved_count = conn.execute(
+                """
+                SELECT COUNT(1)
+                FROM event_attempt_reservations
+                WHERE user_id = ? AND event_id = ? AND status = 'reserved'
+                """,
+                (user_id, event_id),
+            ).fetchone()
+            reserved = int(reserved_count[0] or 0) if reserved_count else 0
+            return EventAttemptFinalization(
+                ok=True,
+                status="rolled_back",
+                use_free=use_free,
+                free_unlocked=free_unlocked,
+                free_used=free_used,
+                paid_used=paid_used,
+                reserved=reserved,
+            )
 
     def _commit_event_success_sync(
         self,
