@@ -373,6 +373,8 @@ EVENT_MORE_CALLBACK = "event_more"
 EVENT_BACK_CALLBACK = "event_wear"
 EVENT_REUSE_PHOTO_CALLBACK = "event_reuse_photo"
 EVENT_NEW_PHOTO_CALLBACK = "event_new_photo"
+EVENT_FAIL_RETRY_CALLBACK = "event_fail_retry"
+EVENT_FAIL_NEW_PHOTO_CALLBACK = "event_fail_new_photo"
 
 
 def contact_request_keyboard() -> InlineKeyboardMarkup:
@@ -533,6 +535,30 @@ def event_phone_bonus_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def event_fail_keyboard(*, allow_retry: bool) -> InlineKeyboardMarkup:
+    """Keyboard shown after an event generation failure."""
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if allow_retry:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=msg.EVENT_FAIL_RETRY_BUTTON,
+                    callback_data=EVENT_FAIL_RETRY_CALLBACK,
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=msg.EVENT_FAIL_NEW_PHOTO_BUTTON,
+                callback_data=EVENT_FAIL_NEW_PHOTO_CALLBACK,
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def reuse_same_photo_keyboard() -> InlineKeyboardMarkup:
