@@ -39,6 +39,8 @@ from app.keyboards import (
     CONTACT_SHARE_CALLBACK,
     CONTACT_SKIP_CALLBACK,
     EVENT_BACK_CALLBACK,
+    EVENT_FAIL_NEW_PHOTO_CALLBACK,
+    EVENT_FAIL_RETRY_CALLBACK,
     EVENT_MORE_CALLBACK,
     EVENT_NEW_PHOTO_CALLBACK,
     EVENT_REUSE_PHOTO_CALLBACK,
@@ -49,6 +51,7 @@ from app.keyboards import (
     contact_share_reply_keyboard,
     event_back_to_wear_keyboard,
     event_attempts_exhausted_keyboard,
+    event_fail_keyboard,
     event_phone_keyboard,
     event_phone_bonus_keyboard,
     event_trigger_keyboard,
@@ -219,6 +222,7 @@ def setup_router(
     EVENT_FREE_LIMIT = 1
     EVENT_PAID_LIMIT = 10
     EVENT_MAX_IN_FLIGHT_PER_USER = 3
+    EVENT_FAIL_RETRY_MAX = 2
     EVENT_INFLIGHT_TTL_SEC = 120
     EVENT_NOTICE_WAIT_TTL_SEC = 25
     EVENT_NOTICE_ATTEMPTS_TTL_SEC = 25
@@ -804,6 +808,55 @@ def setup_router(
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _event_fail_retry_count(data: Mapping[str, Any]) -> int:
+        raw = data.get("event_fail_retry_count")
+        try:
+            value = int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(value, 0)
+
+    def _normalize_gender(value: str | None) -> str:
+        return (value or "").strip().casefold()
+
+    def _allowed_scene_genders(user_gender: str | None) -> set[str] | None:
+        normalized = _normalize_gender(user_gender)
+        if normalized in {"male", "for_who_male", "\u043c\u0443\u0436\u0441\u043a\u043e\u0439"}:
+            return {"\u043c\u0443\u0436\u0441\u043a\u043e\u0439", "\u0443\u043d\u0438\u0441\u0435\u043a\u0441"}
+        if normalized in {"female", "for_who_female", "\u0436\u0435\u043d\u0441\u043a\u0438\u0439"}:
+            return {"\u0436\u0435\u043d\u0441\u043a\u0438\u0439", "\u0443\u043d\u0438\u0441\u0435\u043a\u0441"}
+        if normalized in {"unisex", "for_who_unisex", "\u0443\u043d\u0438\u0441\u0435\u043a\u0441"}:
+            return {"\u0443\u043d\u0438\u0441\u0435\u043a\u0441"}
+        return None
+
+    async def _reset_event_fail_retry_count(state: FSMContext) -> None:
+        await state.update_data(event_fail_retry_count=0)
+
+    async def _send_event_fail_screen(
+        message: Message,
+        state: FSMContext,
+        *,
+        user_id: int,
+        retry_count: int,
+    ) -> None:
+        await _delete_event_aux_message(message, state)
+        allow_retry = retry_count < EVENT_FAIL_RETRY_MAX
+        text = msg.EVENT_FAIL_TEXT if allow_retry else msg.EVENT_FAIL_RETRY_LIMIT_TEXT
+        sent = await message.answer(
+            text,
+            reply_markup=event_fail_keyboard(allow_retry=allow_retry),
+        )
+        await state.update_data(last_event_aux_message_id=sent.message_id)
+        info_domain(
+            "event",
+            "Event fail screen shown",
+            stage="EVENT_FAIL_SCREEN_SHOWN",
+            user_id=user_id,
+            event_id=event_key,
+            retry_count=retry_count,
+            allow_retry=allow_retry,
+        )
 
     def _extract_event_photo_context(
         data: Mapping[str, Any],
@@ -1538,6 +1591,7 @@ def setup_router(
         phone_present: bool | None = None,
         photo_context: dict[str, Any] | None = None,
         event_cycle_id: int | None = None,
+        charge_attempts: bool = True,
     ) -> None:
         if not event_enabled:
             await message.answer(msg.EVENT_DISABLED)
@@ -1546,6 +1600,7 @@ def setup_router(
             await message.answer(msg.EVENT_DISABLED)
             return
         data = await state.get_data()
+        retry_count = _event_fail_retry_count(data)
         if await _is_generation_in_progress(state):
             if _get_active_mode(data) == ACTIVE_MODE_WEAR:
                 await message.answer(msg.GENERATION_BUSY)
@@ -1741,7 +1796,7 @@ def setup_router(
                         max_in_flight=max_in_flight,
                     )
                     return
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
                 return
 
             attempts_left_before = reservation.attempts_left
@@ -1874,7 +1929,7 @@ def setup_router(
                     attempts_not_charged=True,
                 )
                 _event_log_failure("не удалось получить каталог оправ")
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
                 return
             models = [model for model in snapshot.models if model.img_nano_url]
             if not models:
@@ -1890,7 +1945,7 @@ def setup_router(
                     attempts_not_charged=True,
                 )
                 _event_log_failure("нет доступных оправ")
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
                 return
             rng = random.Random()
             rng.shuffle(models)
@@ -1945,7 +2000,7 @@ def setup_router(
                     attempts_not_charged=True,
                 )
                 _event_log_failure("не удалось скачать оправу")
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
                 return
             frame_hash = hashlib.sha256(frame_download.data).hexdigest()[:12]
             if debug_dir and debug_meta:
@@ -1987,7 +2042,7 @@ def setup_router(
                     attempts_not_charged=True,
                 )
                 _event_log_failure("нет доступных сцен")
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
                 return
             try:
                 scenes = await event_scenes.list_scenes()
@@ -2004,8 +2059,26 @@ def setup_router(
                     attempts_not_charged=True,
                 )
                 _event_log_failure("не удалось получить список сцен")
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                await _send_event_fail_screen(
+                    message,
+                    state,
+                    user_id=user_id,
+                    retry_count=retry_count,
+                )
                 return
+            user_gender = data.get("gender")
+            if not user_gender:
+                profile = await repository.ensure_user(user_id)
+                user_gender = profile.gender
+                if user_gender:
+                    await state.update_data(gender=user_gender)
+            allowed_scene_genders = _allowed_scene_genders(user_gender)
+            if allowed_scene_genders:
+                scenes = [
+                    scene
+                    for scene in scenes
+                    if _normalize_gender(scene.gender) in allowed_scene_genders
+                ]
             seen_ids = await repository.list_event_seen_scene_ids(
                 user_id, event_key
             )
@@ -2045,6 +2118,8 @@ def setup_router(
                     event_id=event_key,
                     scene_id=scene.scene_id,
                     url=scene.drive_url,
+                    user_gender=user_gender,
+                    scene_gender=scene.gender,
                     retry_count=idx - 1,
                     repeat=repeated,
                     ok=True,
@@ -2063,7 +2138,7 @@ def setup_router(
                     attempts_not_charged=True,
                 )
                 _event_log_failure("не удалось скачать сцену")
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
                 return
             _event_log_human(
                 (
@@ -2248,7 +2323,7 @@ def setup_router(
                     attempts_not_charged=True,
                 )
                 _event_log_failure("ответ генерации не изображение")
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
                 return
 
             matched_input = None
@@ -2280,7 +2355,7 @@ def setup_router(
                     attempts_not_charged=True,
                 )
                 _event_log_failure("результат совпал с исходным изображением")
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
                 return
 
             saved_bytes = result_bytes
@@ -2316,7 +2391,7 @@ def setup_router(
                     attempts_not_charged=True,
                 )
                 _event_log_failure("результат совпал с исходным изображением")
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
                 return
             results_dir = ensure_dir(Path("./results"))
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -2347,7 +2422,7 @@ def setup_router(
                     attempts_not_charged=True,
                 )
                 _event_log_failure("не удалось сохранить результат")
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
                 return
 
             info_domain(
@@ -2393,55 +2468,71 @@ def setup_router(
                 _write_debug_meta()
             await _delete_progress()
 
-            commit_result = await repository.commit_event_attempt(
-                user_id,
-                event_key,
-                rid,
-                scene_id=chosen_scene.scene_id,
-            )
-            info_domain(
-                "event",
-                "Event attempt commit",
-                stage="EVENT_ATTEMPT_COMMIT",
-                user_id=user_id,
-                event_id=event_key,
-                rid=rid,
-                scene_id=chosen_scene.scene_id,
-                ok=commit_result.ok,
-                status=commit_result.status,
-                use_free=commit_result.use_free,
-                reserved=commit_result.reserved,
-                free_unlocked=commit_result.free_unlocked,
-                free_used=commit_result.free_used,
-                paid_used=commit_result.paid_used,
-            )
-            if not commit_result.ok:
-                _event_log_failure("не удалось списать попытку")
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
-                return
-            attempt_finalized = True
-            attempts_left_after_db = _event_attempts_left(
-                phone_present=phone_present,
-                free_unlocked=commit_result.free_unlocked,
-                free_used=commit_result.free_used,
-                paid_used=commit_result.paid_used,
-            )
-            show_upsell_after = bool(
-                not phone_present
-                and (commit_result.free_used + commit_result.paid_used) == 1
-            )
-            info_domain(
-                "event",
-                "Event commit success",
-                stage="EVENT_COMMIT_SUCCESS",
-                user_id=user_id,
-                event_id=event_key,
-                scene_id=chosen_scene.scene_id,
-                attempts_left_after=attempts_left_after_db,
-                attempts_left_ui=attempts_left_after_db,
-                use_free=commit_result.use_free,
-                rid=rid,
-            )
+            if charge_attempts:
+                commit_result = await repository.commit_event_attempt(
+                    user_id,
+                    event_key,
+                    rid,
+                    scene_id=chosen_scene.scene_id,
+                )
+                info_domain(
+                    "event",
+                    "Event attempt commit",
+                    stage="EVENT_ATTEMPT_COMMIT",
+                    user_id=user_id,
+                    event_id=event_key,
+                    rid=rid,
+                    scene_id=chosen_scene.scene_id,
+                    ok=commit_result.ok,
+                    status=commit_result.status,
+                    use_free=commit_result.use_free,
+                    reserved=commit_result.reserved,
+                    free_unlocked=commit_result.free_unlocked,
+                    free_used=commit_result.free_used,
+                    paid_used=commit_result.paid_used,
+                )
+                if not commit_result.ok:
+                    _event_log_failure("не удалось списать попытку")
+                    await _send_event_fail_screen(
+                        message,
+                        state,
+                        user_id=user_id,
+                        retry_count=retry_count,
+                    )
+                    return
+                attempt_finalized = True
+                attempts_left_after_db = _event_attempts_left(
+                    phone_present=phone_present,
+                    free_unlocked=commit_result.free_unlocked,
+                    free_used=commit_result.free_used,
+                    paid_used=commit_result.paid_used,
+                )
+                show_upsell_after = bool(
+                    not phone_present
+                    and (commit_result.free_used + commit_result.paid_used) == 1
+                )
+                info_domain(
+                    "event",
+                    "Event commit success",
+                    stage="EVENT_COMMIT_SUCCESS",
+                    user_id=user_id,
+                    event_id=event_key,
+                    scene_id=chosen_scene.scene_id,
+                    attempts_left_after=attempts_left_after_db,
+                    attempts_left_ui=attempts_left_after_db,
+                    use_free=commit_result.use_free,
+                    rid=rid,
+                )
+            else:
+                attempts_left_after_db = _event_attempts_left(
+                    phone_present=phone_present,
+                    free_unlocked=free_unlocked,
+                    free_used=free_used,
+                    paid_used=paid_used,
+                )
+                show_upsell_after = bool(
+                    not phone_present and (free_used + paid_used) == 0
+                )
 
             data_for_delivery = await state.get_data()
             active_cycle_id = _normalize_cycle(
@@ -2491,8 +2582,11 @@ def setup_router(
                     attempts_not_charged=False,
                     rid=rid,
                 )
-                _event_log_failure("?? ??????? ????????? ?????????", attempts_charged=True)
-                await message.answer(msg.EVENT_RETRY_MESSAGE)
+                _event_log_failure(
+                    "?? ??????? ????????? ?????????",
+                    attempts_charged=charge_attempts,
+                )
+                await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
                 return
 
             info_domain(
@@ -2544,6 +2638,7 @@ def setup_router(
                 ),
                 user_id=user_id,
             )
+            await _reset_event_fail_retry_count(state)
 
             if show_upsell_after:
                 info_domain(
@@ -2601,7 +2696,7 @@ def setup_router(
             if exc.reason_code:
                 reason = f"ошибка генерации ({exc.reason_code})"
             _event_log_failure(reason)
-            await message.answer(msg.EVENT_RETRY_MESSAGE)
+            await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
         except Exception as exc:  # noqa: BLE001
             info_domain(
                 "event",
@@ -2615,7 +2710,7 @@ def setup_router(
                 attempts_not_charged=True,
             )
             _event_log_failure("неожиданная ошибка")
-            await message.answer(msg.EVENT_RETRY_MESSAGE)
+            await _send_event_fail_screen(message, state, user_id=user_id, retry_count=retry_count)
         finally:
             if (
                 user_photo_path
@@ -4560,6 +4655,7 @@ def setup_router(
                 event_upload_file_id=photo.file_id,
                 event_last_photo_file_id=photo.file_id,
                 event_current_cycle=event_cycle,
+                event_fail_retry_count=0,
             )
             photo_context = {
                 "upload": path,
@@ -6261,6 +6357,138 @@ def setup_router(
             source="command",
             photo_context=photo_context,
             event_cycle_id=new_cycle,
+        )
+
+    @router.callback_query(F.data == EVENT_FAIL_RETRY_CALLBACK)
+    async def event_fail_retry(callback: CallbackQuery, state: FSMContext) -> None:
+        user_id = callback.from_user.id
+        await _safe_answer_callback(callback, user_id=user_id, source="fail_retry")
+        message = callback.message
+        if message is None:
+            return
+        bot_id = message.bot.id
+        if not _log_event_user_id_sanity(
+            user_id=user_id,
+            bot_id=bot_id,
+            chat_id=message.chat.id,
+            from_user_id=callback.from_user.id,
+            source="fail_retry",
+        ):
+            return
+        if not event_enabled or not event_ready:
+            await message.answer(msg.EVENT_DISABLED)
+            return
+        data = await state.get_data()
+        await _cleanup_last_event_result(
+            message,
+            state,
+            user_id=user_id,
+            reason="event_fail_retry",
+            data=data,
+        )
+        await _delete_event_aux_message(message, state, data=data)
+        await _delete_event_exhausted_message(
+            message, state, data=data, user_id=user_id
+        )
+        try:
+            await message.bot.delete_message(message.chat.id, message.message_id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            try:
+                await message.edit_reply_markup(reply_markup=None)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                try:
+                    await message.edit_text(msg.EVENT_STARTING)
+                except (TelegramBadRequest, TelegramForbiddenError):
+                    pass
+        retry_count = _event_fail_retry_count(data)
+        if retry_count >= EVENT_FAIL_RETRY_MAX:
+            await _send_event_fail_screen(
+                message,
+                state,
+                user_id=user_id,
+                retry_count=retry_count,
+            )
+            return
+        next_retry = retry_count + 1
+        await state.update_data(event_fail_retry_count=next_retry)
+        info_domain(
+            "event",
+            "Event fail retry requested",
+            stage="EVENT_FAIL_RETRY",
+            user_id=user_id,
+            event_id=event_key,
+            retry_count=next_retry,
+            attempts_charged=False,
+        )
+        await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="callback")
+        data = await state.get_data()
+        photo_context = _extract_event_photo_context(data)
+        if not _has_photo_context(photo_context):
+            await _prompt_event_photo(message, state, user_id=user_id, source="callback")
+            return
+        new_cycle = await _start_new_event_cycle(state)
+        await _store_event_photo_context(state, photo_context or {}, cycle_id=new_cycle)
+        await state.set_state(TryOnStates.RESULT)
+        await _run_event_generation(
+            message,
+            state,
+            user_id=user_id,
+            source="fail_retry",
+            photo_context=dict(photo_context or {}),
+            event_cycle_id=new_cycle,
+            charge_attempts=False,
+        )
+
+    @router.callback_query(F.data == EVENT_FAIL_NEW_PHOTO_CALLBACK)
+    async def event_fail_new_photo(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        user_id = callback.from_user.id
+        await _safe_answer_callback(callback, user_id=user_id, source="fail_new_photo")
+        message = callback.message
+        if message is None:
+            return
+        bot_id = message.bot.id
+        if not _log_event_user_id_sanity(
+            user_id=user_id,
+            bot_id=bot_id,
+            chat_id=message.chat.id,
+            from_user_id=callback.from_user.id,
+            source="fail_new_photo",
+        ):
+            return
+        if not event_enabled or not event_ready:
+            await message.answer(msg.EVENT_DISABLED)
+            return
+        data = await state.get_data()
+        await _cleanup_last_event_result(
+            message,
+            state,
+            user_id=user_id,
+            reason="event_fail_new_photo",
+            data=data,
+        )
+        await _delete_event_aux_message(message, state, data=data)
+        await _delete_event_exhausted_message(
+            message, state, data=data, user_id=user_id
+        )
+        try:
+            await message.bot.delete_message(message.chat.id, message.message_id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            try:
+                await message.edit_reply_markup(reply_markup=None)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                try:
+                    await message.edit_text(msg.EVENT_NEW_PHOTO_PROMPT)
+                except (TelegramBadRequest, TelegramForbiddenError):
+                    pass
+        await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source="callback")
+        await state.set_state(TryOnStates.AWAITING_PHOTO)
+        await _send_aux_message(
+            message,
+            state,
+            message.answer,
+            msg.EVENT_NEW_PHOTO_PROMPT,
         )
 
     @router.callback_query(F.data == EVENT_REUSE_PHOTO_CALLBACK)

@@ -23,6 +23,7 @@ _CSV_INDICATORS: Final = ("output=csv", "tqx=out:csv", "format=csv")
 class EventScene:
     scene_id: int
     drive_url: str
+    gender: str | None = None
 
 
 class EventScenesService:
@@ -104,6 +105,7 @@ def _parse_scenes(csv_text: str) -> list[EventScene]:
     headers = {name.strip().casefold(): name for name in reader.fieldnames}
     id_key = headers.get("id")
     scene_key = headers.get("\u0441\u044e\u0436\u0435\u0442\u044b") or headers.get("scene")
+    gender_key = headers.get("\u043f\u043e\u043b") or headers.get("gender")
     if not id_key or not scene_key:
         raise RuntimeError("Event scenes CSV must contain id and \u0441\u044e\u0436\u0435\u0442\u044b columns")
     scenes: list[EventScene] = []
@@ -112,11 +114,13 @@ def _parse_scenes(csv_text: str) -> list[EventScene]:
         raw_url = (row.get(scene_key) or "").strip()
         if not raw_id or not raw_url:
             continue
+        raw_gender = (row.get(gender_key) or "").strip() if gender_key else ""
         try:
             scene_id = int(raw_id)
         except ValueError:
             continue
-        scenes.append(EventScene(scene_id=scene_id, drive_url=raw_url))
+        gender = raw_gender or None
+        scenes.append(EventScene(scene_id=scene_id, drive_url=raw_url, gender=gender))
     if not scenes:
         raise RuntimeError("Event scenes CSV is empty")
     return scenes
