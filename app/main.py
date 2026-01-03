@@ -21,11 +21,18 @@ from app.analytics import (
 )
 from app.config import load_config
 from app.fsm import setup_router
-from app.keyboards import reminder_keyboard
+from app.keyboards import event_trigger_keyboard, reminder_keyboard
 from app.services import nanobanana
 from app.services.catalog_google import GoogleCatalogConfig, GoogleSheetCatalog
 from app.services.collage import build_three_tile_collage
 from app.services.contact_export import ContactSheetExporter
+from app.services.event_teaser import (
+    EVENT_TEASER_ALREADY_SENT,
+    EVENT_TEASER_FAILED,
+    EVENT_TEASER_RATE_LIMITED,
+    EVENT_TEASER_SENT,
+    maybe_send_event_teaser,
+)
 from app.services.leads_export import LeadsExporter
 from app.services.repository import Repository
 from app.services.social_ad import SocialAdService
@@ -82,6 +89,100 @@ async def _run_polling(dp: Dispatcher, bot: Bot, logger: Logger) -> None:
             continue
 
 
+async def _broadcast_event_teaser(
+    *,
+    bot: Bot,
+    repository: Repository,
+    logger: Logger,
+    event_id: str,
+    image_path: Path,
+) -> None:
+    if not event_id:
+        return
+    already_done = await repository.has_event_teaser_broadcast(event_id)
+    if already_done:
+        info_domain(
+            "event",
+            "Event teaser broadcast already completed",
+            stage="EVENT_TRIGGER_BROADCAST_SKIPPED",
+            event_id=event_id,
+        )
+        return
+    user_ids = await repository.list_event_teaser_candidates()
+    total = len(user_ids)
+    if total <= 0:
+        await repository.mark_event_teaser_broadcast(event_id)
+        info_domain(
+            "event",
+            "Event teaser broadcast finished",
+            stage="EVENT_TRIGGER_BROADCAST_DONE",
+            event_id=event_id,
+            total=0,
+            sent=0,
+            skipped=0,
+            errors=0,
+        )
+        return
+    if not image_path.exists():
+        logger.warning("Event teaser image missing: %s", image_path)
+    info_domain(
+        "event",
+        "Event teaser broadcast started",
+        stage="EVENT_TRIGGER_BROADCAST_START",
+        event_id=event_id,
+        total=total,
+    )
+    sent = 0
+    skipped = 0
+    errors = 0
+    keyboard = event_trigger_keyboard()
+    for user_id in user_ids:
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                result = await maybe_send_event_teaser(
+                    bot=bot,
+                    repository=repository,
+                    user_id=user_id,
+                    event_id=event_id,
+                    text=msg.EVENT_TRIGGER_TEXT,
+                    reply_markup=keyboard,
+                    image_path=image_path,
+                    send_teaser=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors += 1
+                logger.warning(
+                    "Event teaser broadcast failed for %s: %s", user_id, exc
+                )
+                break
+            if result.status == EVENT_TEASER_RATE_LIMITED and result.retry_after:
+                if attempts >= 3:
+                    errors += 1
+                    break
+                await asyncio.sleep(result.retry_after)
+                continue
+            if result.status == EVENT_TEASER_SENT:
+                sent += 1
+            elif result.status == EVENT_TEASER_ALREADY_SENT:
+                skipped += 1
+            elif result.status == EVENT_TEASER_FAILED:
+                errors += 1
+            break
+    await repository.mark_event_teaser_broadcast(event_id)
+    info_domain(
+        "event",
+        "Event teaser broadcast finished",
+        stage="EVENT_TRIGGER_BROADCAST_DONE",
+        event_id=event_id,
+        total=total,
+        sent=sent,
+        skipped=skipped,
+        errors=errors,
+    )
+
+
 async def main() -> None:
     config = load_config()
     setup_logging()
@@ -133,11 +234,26 @@ async def main() -> None:
     ]
     if config.event_enabled:
         commands.append(BotCommand(command="event", description="🎄 Ивент"))
+        commands.insert(2, commands.pop())
     await bot.set_my_commands(commands)
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     repository_path = (PROJECT_ROOT / "loop.db").resolve()
     repository = Repository(repository_path, config.daily_try_limit)
     await repository.init()
+    event_ready = bool(
+        config.event_enabled
+        and config.event_id
+        and config.event_scenes_sheet
+        and config.event_prompt_json
+    )
+    if config.event_enabled and event_ready:
+        await _broadcast_event_teaser(
+            bot=bot,
+            repository=repository,
+            logger=logger,
+            event_id=config.event_id,
+            image_path=PROJECT_ROOT / "images" / "event_new_year.jpg",
+        )
 
     dp = Dispatcher()
     dp.update.middleware(LoggingMiddleware())

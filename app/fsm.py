@@ -79,6 +79,13 @@ from app.services.collage import (
 )
 from app.services.contact_export import ContactRecord, ContactSheetExporter
 from app.services.event_scenes import EventScenesService
+from app.services.event_teaser import (
+    EVENT_TEASER_ALREADY_SENT,
+    EVENT_TEASER_SENT,
+    EVENT_TEASER_SKIPPED,
+    EventTeaserResult,
+    maybe_send_event_teaser,
+)
 from app.services.leads_export import LeadPayload, LeadsExporter
 from app.services.repository import Repository
 from app.infrastructure.concurrency import with_generation_slot
@@ -1374,8 +1381,19 @@ def setup_router(
     ) -> None:
         if not event_key:
             return
-        unlocked = await repository.unlock_event_access(user_id, event_key)
-        if unlocked:
+        result = await _maybe_send_event_teaser(
+            message,
+            user_id,
+            generation_cycle=generation_cycle,
+            generation_id=generation_id,
+            source_message_id=source_message_id,
+            result_message_id=result_message_id,
+            photo_file_id=photo_file_id,
+            model_id=model_id,
+            source=source,
+            send_teaser=event_ready,
+        )
+        if result.unlocked:
             info_domain(
                 "event",
                 "Event access unlocked after wear success",
@@ -1404,19 +1422,8 @@ def setup_router(
                 model_id=model_id,
                 source=source,
             )
-        await _maybe_show_event_trigger(
-            message,
-            user_id,
-            generation_cycle=generation_cycle,
-            generation_id=generation_id,
-            source_message_id=source_message_id,
-            result_message_id=result_message_id,
-            photo_file_id=photo_file_id,
-            model_id=model_id,
-            source=source,
-        )
 
-    async def _maybe_show_event_trigger(
+    async def _maybe_send_event_teaser(
         message: Message,
         user_id: int,
         *,
@@ -1427,10 +1434,14 @@ def setup_router(
         photo_file_id: str | None = None,
         model_id: str | None = None,
         source: str | None = None,
-    ) -> None:
-        if not event_ready:
-            return
-        claimed = await repository.claim_event_trigger(user_id, event_key)
+        send_teaser: bool = True,
+    ) -> EventTeaserResult:
+        if not event_key:
+            return EventTeaserResult(
+                status=EVENT_TEASER_SKIPPED,
+                claimed=False,
+                unlocked=False,
+            )
         payload = {
             "generation_cycle": generation_cycle,
             "generation_id": generation_id,
@@ -1440,7 +1451,21 @@ def setup_router(
             "model_id": model_id,
             "source": source,
         }
-        if not claimed:
+        result = await maybe_send_event_teaser(
+            bot=message.bot,
+            repository=repository,
+            user_id=user_id,
+            chat_id=message.chat.id,
+            event_id=event_key,
+            text=msg.EVENT_TRIGGER_TEXT,
+            reply_markup=event_trigger_keyboard(),
+            image_path=EVENT_TRIGGER_IMAGE_PATH,
+            send_teaser=send_teaser,
+            logger=logger,
+        )
+        if result.status == EVENT_TEASER_SKIPPED:
+            return result
+        if result.status == EVENT_TEASER_ALREADY_SENT:
             info_domain(
                 "event",
                 "Event trigger skipped",
@@ -1450,7 +1475,7 @@ def setup_router(
                 reason="already_shown",
                 **payload,
             )
-            return
+            return result
         info_domain(
             "event",
             "Event trigger attempt",
@@ -1459,49 +1484,7 @@ def setup_router(
             event_id=event_key,
             **payload,
         )
-        sent = False
-        if EVENT_TRIGGER_IMAGE_PATH.exists():
-            try:
-                await message.answer_photo(
-                    FSInputFile(EVENT_TRIGGER_IMAGE_PATH),
-                    caption=msg.EVENT_TRIGGER_TEXT,
-                    reply_markup=event_trigger_keyboard(),
-                )
-                sent = True
-            except (OSError, TelegramBadRequest, TelegramForbiddenError) as exc:
-                logger.warning(
-                    "Failed to send event trigger image %s: %s",
-                    EVENT_TRIGGER_IMAGE_PATH,
-                    exc,
-                    extra={"stage": "EVENT_TRIGGER_IMAGE_FAILED"},
-                )
-        else:
-            logger.warning(
-                "Event trigger image missing: %s",
-                EVENT_TRIGGER_IMAGE_PATH,
-                extra={"stage": "EVENT_TRIGGER_IMAGE_MISSING"},
-            )
-        if not sent:
-            try:
-                await message.answer(
-                    msg.EVENT_TRIGGER_TEXT,
-                    reply_markup=event_trigger_keyboard(),
-                )
-                sent = True
-            except (TelegramBadRequest, TelegramForbiddenError) as exc:
-                logger.debug("Failed to send event trigger: %s", exc)
-                await repository.release_event_trigger(user_id, event_key)
-                info_domain(
-                    "event",
-                    "Event trigger failed",
-                    stage="EVENT_TRIGGER_FAILED",
-                    user_id=user_id,
-                    event_id=event_key,
-                    error_type=exc.__class__.__name__,
-                    **payload,
-                )
-                return
-        if sent:
+        if result.status == EVENT_TEASER_SENT:
             info_domain(
                 "event",
                 "Event trigger shown",
@@ -1510,6 +1493,18 @@ def setup_router(
                 event_id=event_key,
                 **payload,
             )
+            return result
+        info_domain(
+            "event",
+            "Event trigger failed",
+            stage="EVENT_TRIGGER_FAILED",
+            user_id=user_id,
+            event_id=event_key,
+            error_type=result.error_type or "unknown",
+            retry_after=result.retry_after,
+            **payload,
+        )
+        return result
 
     async def _send_event_phone_prompt(
         message: Message, state: FSMContext, user_id: int
@@ -1573,11 +1568,12 @@ def setup_router(
         *,
         user_id: int,
         source: str,
+        text: str | None = None,
     ) -> None:
         await _set_active_mode(state, user_id, ACTIVE_MODE_EVENT, source=source)
         await state.set_state(TryOnStates.AWAITING_PHOTO)
         await message.answer(
-            msg.EVENT_NEED_PHOTO,
+            text or msg.EVENT_NEED_PHOTO,
             reply_markup=event_back_to_wear_keyboard(),
         )
 
@@ -1592,6 +1588,7 @@ def setup_router(
         photo_context: dict[str, Any] | None = None,
         event_cycle_id: int | None = None,
         charge_attempts: bool = True,
+        photo_prompt_text: str | None = None,
     ) -> None:
         if not event_enabled:
             await message.answer(msg.EVENT_DISABLED)
@@ -1663,7 +1660,13 @@ def setup_router(
             dict(photo_context) if photo_context else _extract_event_photo_context(data)
         )
         if not _has_photo_context(resolved_context):
-            await _prompt_event_photo(message, state, user_id=user_id, source=source)
+            await _prompt_event_photo(
+                message,
+                state,
+                user_id=user_id,
+                source=source,
+                text=photo_prompt_text,
+            )
             return
         resolved_cycle = event_cycle_id
         if resolved_cycle is None:
@@ -1849,7 +1852,11 @@ def setup_router(
                 user_photo_path = Path(downloaded)
             else:
                 await _prompt_event_photo(
-                    message, state, user_id=user_id, source=source
+                    message,
+                    state,
+                    user_id=user_id,
+                    source=source,
+                    text=photo_prompt_text,
                 )
                 info_domain(
                     "event",
@@ -1866,7 +1873,11 @@ def setup_router(
             face_mime = _event_mime_from_path(user_photo_path)
             if not face_bytes:
                 await _prompt_event_photo(
-                    message, state, user_id=user_id, source=source
+                    message,
+                    state,
+                    user_id=user_id,
+                    source=source,
+                    text=photo_prompt_text,
                 )
                 info_domain(
                     "event",
@@ -6174,6 +6185,15 @@ def setup_router(
         await _delete_event_exhausted_message(
             message, state, data=data, user_id=user_id
         )
+        teaser_result = await _maybe_send_event_teaser(
+            message,
+            user_id,
+            source="command",
+            send_teaser=True,
+        )
+        prompt_text = None
+        if teaser_result.status != EVENT_TEASER_ALREADY_SENT:
+            prompt_text = msg.EVENT_NEED_PHOTO_FROM_TEASER
         seeded_context, _ = await _seed_event_photo_from_wear(
             state, user_id=user_id
         )
@@ -6185,6 +6205,7 @@ def setup_router(
             source="command",
             photo_context=seeded_context,
             event_cycle_id=new_cycle,
+            photo_prompt_text=prompt_text,
         )
 
     @router.callback_query(F.data == EVENT_TRY_CALLBACK)
@@ -6236,7 +6257,6 @@ def setup_router(
             event_id=event_key,
             source="trigger",
         )
-        await repository.unlock_event_free_attempt(user_id, event_key)
         phone_present = await _event_phone_present(user_id)
         attempts_snapshot = await _event_attempts_snapshot(user_id, phone_present)
         free_unlocked, free_used, paid_used, _, _, attempts_left = attempts_snapshot
@@ -6285,6 +6305,7 @@ def setup_router(
             phone_present=phone_present,
             photo_context=seeded_context,
             event_cycle_id=new_cycle,
+            photo_prompt_text=msg.EVENT_NEED_PHOTO_FROM_TEASER,
         )
 
     @router.callback_query(F.data == EVENT_MORE_CALLBACK)

@@ -299,6 +299,20 @@ class Repository:
     async def release_event_trigger(self, user_id: int, event_id: str) -> None:
         await asyncio.to_thread(self._release_event_trigger_sync, user_id, event_id)
 
+    async def list_event_teaser_candidates(self) -> list[int]:
+        return await asyncio.to_thread(self._list_event_teaser_candidates_sync)
+
+    async def has_event_teaser_broadcast(self, event_id: str) -> bool:
+        return await asyncio.to_thread(self._has_event_teaser_broadcast_sync, event_id)
+
+    async def mark_event_teaser_broadcast(
+        self, event_id: str, *, broadcast_at: Optional[datetime] = None
+    ) -> None:
+        moment = broadcast_at or datetime.now(timezone.utc)
+        await asyncio.to_thread(
+            self._mark_event_teaser_broadcast_sync, event_id, moment
+        )
+
     async def unlock_event_access(
         self, user_id: int, event_id: str, *, unlocked_at: Optional[datetime] = None
     ) -> bool:
@@ -1477,6 +1491,15 @@ class Repository:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS event_broadcasts (
+                event_id TEXT NOT NULL,
+                broadcast_at TEXT NOT NULL,
+                PRIMARY KEY (event_id)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS event_attempts (
                 user_id INTEGER NOT NULL,
                 event_id TEXT NOT NULL,
@@ -1561,6 +1584,40 @@ class Repository:
             conn.execute(
                 "DELETE FROM event_triggers WHERE user_id = ? AND event_id = ?",
                 (user_id, event_id),
+            )
+            conn.commit()
+
+    def _list_event_teaser_candidates_sync(self) -> list[int]:
+        with self._connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT user_id
+                FROM users
+                WHERE gender IS NOT NULL
+                  AND LOWER(gender) IN ('male', 'female')
+                """
+            )
+            rows = cur.fetchall()
+        return [int(row[0]) for row in rows]
+
+    def _has_event_teaser_broadcast_sync(self, event_id: str) -> bool:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM event_broadcasts WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            return row is not None
+
+    def _mark_event_teaser_broadcast_sync(
+        self, event_id: str, moment: datetime
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO event_broadcasts (event_id, broadcast_at)
+                VALUES (?, ?)
+                """,
+                (event_id, moment.isoformat()),
             )
             conn.commit()
 
