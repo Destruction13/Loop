@@ -138,6 +138,18 @@ class Repository:
     async def mark_idle_reminder_sent(self, user_id: int) -> None:
         await asyncio.to_thread(self._mark_idle_reminder_sent_sync, user_id)
 
+    async def increment_site_clicks(self, user_id: int) -> None:
+        """Increment the site clicks counter for a user."""
+        await asyncio.to_thread(self._increment_site_clicks_sync, user_id)
+
+    def _increment_site_clicks_sync(self, user_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE users SET site_clicks = COALESCE(site_clicks, 0) + 1 WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
+
     async def mark_cycle_nudge_sent(self, user_id: int) -> None:
         await asyncio.to_thread(self._set_nudge_flag_sync, user_id, True)
 
@@ -1412,6 +1424,10 @@ class Repository:
         if "last_activity_ts" not in columns:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN last_activity_ts INTEGER NOT NULL DEFAULT 0"
+            )
+        if "site_clicks" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN site_clicks INTEGER NOT NULL DEFAULT 0"
             )
         if "idle_reminder_sent" not in columns:
             conn.execute(

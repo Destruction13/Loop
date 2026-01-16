@@ -106,7 +106,7 @@ def list_admin_users(
     with _open_readonly(db_path) as conn:
         has_contacts = _table_exists(conn, "user_contacts")
         has_analytics = _table_exists(conn, "analytics_events")
-        has_event_attempts = _table_exists(conn, "event_user_attempts")
+        has_event_attempts = _table_exists(conn, "event_attempts")
         user_columns = _table_columns(conn, "users")
         has_username = "username" in user_columns
         has_full_name = "full_name" in user_columns
@@ -148,17 +148,15 @@ def list_admin_users(
         else:
             select_fields.append("NULL AS phone")
 
+        # Site clicks - read directly from users table (more reliable)
+        has_site_clicks = "site_clicks" in user_columns
+        if has_site_clicks:
+            select_fields.append("COALESCE(u.site_clicks, 0) AS site_clicks")
+        else:
+            select_fields.append("0 AS site_clicks")
+        
+        # Social clicks from analytics (if available)
         if has_analytics:
-            joins.append(
-                """
-                LEFT JOIN (
-                    SELECT user_id, COUNT(1) AS cnt
-                    FROM analytics_events
-                    WHERE event = 'cta_book_opened'
-                    GROUP BY user_id
-                ) site_counts ON site_counts.user_id = CAST(u.user_id AS TEXT)
-                """
-            )
             joins.append(
                 """
                 LEFT JOIN (
@@ -169,10 +167,8 @@ def list_admin_users(
                 ) social_counts ON social_counts.user_id = CAST(u.user_id AS TEXT)
                 """
             )
-            select_fields.append("COALESCE(site_counts.cnt, 0) AS site_clicks")
             select_fields.append("COALESCE(social_counts.cnt, 0) AS social_clicks")
         else:
-            select_fields.append("0 AS site_clicks")
             select_fields.append("0 AS social_clicks")
 
         # Event attempts aggregation (only paid, free not counted per user request)
@@ -184,7 +180,7 @@ def list_admin_users(
                            SUM(paid_used) AS total_paid_used,
                            MAX(event_id) AS latest_event_id,
                            1 AS has_record
-                    FROM event_user_attempts
+                    FROM event_attempts
                     GROUP BY user_id
                 ) event_stats ON event_stats.user_id = u.user_id
                 """
@@ -360,14 +356,14 @@ def update_event_tries(
     If event_id is None or 'default', will try to find user's existing event record.
     """
     with _open_readwrite(db_path) as conn:
-        if not _table_exists(conn, "event_user_attempts"):
+        if not _table_exists(conn, "event_attempts"):
             return False
         
         # If event_id is not specified or is 'default', find the user's actual event
         actual_event_id = event_id
         if not event_id or event_id == "default":
             cur = conn.execute(
-                "SELECT event_id FROM event_user_attempts WHERE user_id = ? LIMIT 1",
+                "SELECT event_id FROM event_attempts WHERE user_id = ? LIMIT 1",
                 (user_id,),
             )
             row = cur.fetchone()
@@ -378,7 +374,7 @@ def update_event_tries(
                 return False
         
         cur = conn.execute(
-            "SELECT paid_used FROM event_user_attempts WHERE user_id = ? AND event_id = ?",
+            "SELECT paid_used FROM event_attempts WHERE user_id = ? AND event_id = ?",
             (user_id, actual_event_id),
         )
         row = cur.fetchone()
@@ -388,7 +384,7 @@ def update_event_tries(
         new_paid = paid_used if paid_used is not None else row["paid_used"]
         
         conn.execute(
-            "UPDATE event_user_attempts SET paid_used = ? WHERE user_id = ? AND event_id = ?",
+            "UPDATE event_attempts SET paid_used = ? WHERE user_id = ? AND event_id = ?",
             (new_paid, user_id, actual_event_id),
         )
         conn.commit()
@@ -421,9 +417,9 @@ def get_stats(db_path: Path) -> dict[str, Any]:
             stats["users_with_phone"] = 0
         
         # Event stats (only paid, free not counted per user request)
-        if _table_exists(conn, "event_user_attempts"):
+        if _table_exists(conn, "event_attempts"):
             event_stats = conn.execute(
-                "SELECT SUM(paid_used) as paid, COUNT(DISTINCT user_id) as users FROM event_user_attempts"
+                "SELECT SUM(paid_used) as paid, COUNT(DISTINCT user_id) as users FROM event_attempts"
             ).fetchone()
             stats["event_paid_used"] = event_stats["paid"] or 0
             stats["event_users"] = event_stats["users"] or 0

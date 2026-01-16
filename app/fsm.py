@@ -6786,6 +6786,8 @@ def setup_router(
     @router.callback_query(F.data == "cta_book")
     async def handle_cta(callback: CallbackQuery) -> None:
         await track_event(str(callback.from_user.id), "cta_book_opened")
+        # Increment site clicks counter in users table
+        await repository.increment_site_clicks(callback.from_user.id)
         sanitized = (site_url or "").strip()
         if not sanitized:
             await callback.answer(msg.BOOKING_LINK_UNAVAILABLE, show_alert=True)
