@@ -159,8 +159,8 @@ def generation_result_keyboard(
                     ),
                 ]
             )
-    # Use callback to track clicks, then show URL popup
-    rows.append([_booking_button(site_url, as_callback=True)])
+    # "Подробнее о модели" - use callback to track clicks, then redirect to site
+    rows.append([InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, callback_data="details_click")])
     if show_more and remaining > 0:
         rows.append(
             [

@@ -6783,6 +6783,23 @@ def setup_router(
         await callback.answer()
         logger.debug("Scheduled reminder for user %s", user_id)
 
+    @router.callback_query(F.data == "details_click")
+    async def handle_details_click(callback: CallbackQuery) -> None:
+        """Handle click on 'Подробнее о модели' button - track click and show site link."""
+        await track_event(str(callback.from_user.id), "details_click")
+        # Increment site clicks counter in users table
+        await repository.increment_site_clicks(callback.from_user.id)
+        sanitized = (site_url or "").strip()
+        if not sanitized:
+            await callback.answer("Ссылка недоступна", show_alert=True)
+            return
+        # Show button with direct link to the site
+        follow_markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, url=sanitized)]]
+        )
+        await callback.message.answer("🔗 Перейти на сайт:", reply_markup=follow_markup)
+        await callback.answer()
+
     @router.callback_query(F.data == "cta_book")
     async def handle_cta(callback: CallbackQuery) -> None:
         await track_event(str(callback.from_user.id), "cta_book_opened")
