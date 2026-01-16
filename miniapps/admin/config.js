@@ -1,3 +1,5 @@
 window.ADMIN_CONFIG = {
-  apiBaseUrl: "https://flights-adoption-historic-cast.trycloudflare.com",
+  // This URL is automatically updated when the bot starts with Cloudflare Tunnel
+  // DO NOT commit changes to this file - it's updated at runtime
+  apiBaseUrl: "",
 };

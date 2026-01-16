@@ -1,72 +1,134 @@
-# Admin Mini App (Telegram + Cloudflare Pages)
+# Admin Mini App
 
-This repo includes a minimal admin dashboard that is opened from the bot using `/admin`. The UI is a static Mini App hosted on Cloudflare Pages and pulls data from a lightweight API.
+Админ-панель для бота LOOV с **автоматической** интеграцией Cloudflare Tunnel.
 
-## 1) Configure access
+## 🚀 Быстрый старт
 
-- Update `app/admin/security.py` and set your real Telegram user IDs in `ADMIN_WHITELIST`.
-- `/admin` is intentionally **not** added to the bot command menu.
+### 1. Установите cloudflared
 
-## 2) Environment variables
-
-Add these to `.env` (they are already in `.env.example`):
-
-```
-ADMIN_WEBAPP_URL=https://your-project.pages.dev
-ADMIN_API_BASE_URL=https://your-api-host
+**Ubuntu/Debian:**
+```bash
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+sudo dpkg -i cloudflared.deb
 ```
 
-- `ADMIN_WEBAPP_URL` is used by the bot to open the Mini App.
-- `ADMIN_API_BASE_URL` is used by the frontend config (see below).
-
-## 3) Run the admin API
-
-The API is a small aiohttp server:
-
-```
-python manage.py admin-api
+**macOS:**
+```bash
+brew install cloudflared
 ```
 
-Optional overrides:
+**Windows:**
+Скачайте с https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+
+### 2. Добавьте свой Telegram ID в список админов
+
+Отредактируйте `app/admin/security.py`:
+```python
+ADMIN_WHITELIST: set[int] = {ВАШ_TELEGRAM_ID}
+```
+*(Узнать ID можно через бота @userinfobot)*
+
+### 3. Установите URL админ-панели в `.env`
 
 ```
-ADMIN_API_HOST=0.0.0.0
-ADMIN_API_PORT=8080
+ADMIN_WEBAPP_URL=https://loov.pages.dev
 ```
 
-The endpoint is:
+### 4. Запустите бота
 
-```
-GET /admin/api/users?offset=&limit=&sort=&order=
-```
-
-It requires `X-Telegram-Init-Data` and checks the admin whitelist.
-
-## 4) Configure the Mini App frontend
-
-Edit `miniapps/admin/config.js` and set:
-
-```
-window.ADMIN_CONFIG = {
-  apiBaseUrl: "https://your-api-host",
-};
+```bash
+python manage.py run
 ```
 
-If the API is served from the same origin as the Mini App, `apiBaseUrl` can be empty.
+### 5. Готово!
 
-## 5) Cloudflare Pages deploy (static)
+При запуске бота вы увидите в логах:
+```
+🔐 Admin панель доступна: https://xxx-xxx-xxx.trycloudflare.com/admin
+```
 
-1. Create a new Pages project from this repo.
-2. **Root directory**: `miniapps/admin`
-3. **Build command**: leave empty
-4. **Build output directory**: `.`
-5. Deploy, then copy the Pages URL into `ADMIN_WEBAPP_URL`.
+Отправьте `/admin` боту в Telegram — появится кнопка для открытия панели.
 
-No `wrangler.toml` is required for this static build.
+## Как это работает
 
-## 6) Manual checks
+```
+┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────────────────┐
+│   Telegram      │────▶│  loov.pages.dev      │────▶│  Cloudflare Tunnel (HTTPS)  │
+│   WebApp        │     │  (Frontend)          │     │  xxx.trycloudflare.com      │
+│                 │     │                      │     │           │                 │
+│                 │     │  config.js ──────────┼─────┼───────────┘                 │
+└─────────────────┘     └──────────────────────┘     │                             │
+                                                     ▼                             │
+                                               ┌───────────┐                       │
+                                               │ VPS:8080  │◀──────────────────────┘
+                                               │ Admin API │
+                                               └───────────┘
+```
 
-- Non-admin `/admin` -> no hints or response.
-- Admin `/admin` -> button opens the Mini App.
-- Mini App inside Telegram loads the table.
-- Opening the Mini App URL in a browser works, but API returns `403` without initData.
+1. **Бот запускается** → запускает Admin API на порту 8080
+2. **Cloudflare Tunnel стартует автоматически** → создаёт HTTPS URL
+3. **config.js обновляется** с новым URL туннеля
+4. **Telegram WebApp** загружает фронтенд с loov.pages.dev
+5. **Фронтенд** обращается к API через туннель
+
+## Важно: Деплой на Cloudflare Pages
+
+После первого запуска бота, **закоммитьте и запушьте** изменения в `miniapps/admin/config.js`:
+
+```bash
+git add miniapps/admin/config.js
+git commit -m "Update admin API URL"
+git push
+```
+
+Cloudflare Pages автоматически задеплоит обновлённый фронтенд.
+
+> **Примечание:** URL туннеля меняется при каждом перезапуске бота. После перезапуска нужно снова запушить изменения.
+
+## Конфигурация
+
+### Переменные окружения
+
+| Переменная | Описание | По умолчанию |
+|------------|----------|--------------|
+| `ADMIN_WEBAPP_URL` | URL фронтенда (Cloudflare Pages) | Обязательно |
+| `ADMIN_API_HOST` | Хост для API сервера | `0.0.0.0` |
+| `ADMIN_API_PORT` | Порт для API сервера | `8080` |
+
+### Список админов
+
+Редактируйте `app/admin/security.py`:
+```python
+ADMIN_WHITELIST: set[int] = {123456789, 987654321}
+```
+
+## Эндпоинты API
+
+| Эндпоинт | Описание |
+|----------|----------|
+| `GET /admin` | UI админ-панели |
+| `GET /admin/api/users` | API данных (требует `X-Telegram-Init-Data`) |
+
+## Безопасность
+
+- Команда `/admin` не показывается в меню бота
+- Не-админы не получают ответа на `/admin`
+- API требует валидный Telegram `initData`
+- CORS включён для совместимости с Telegram WebApp
+
+## Решение проблем
+
+### "Init data missing" / "Open inside Telegram"
+- Админ-панель должна открываться **только через Telegram** (кнопка WebApp)
+- Открытие URL в обычном браузере не работает
+
+### Нет ответа на команду `/admin`
+- Добавьте свой Telegram ID в `ADMIN_WHITELIST`
+
+### "Unable to load data" / Сервер недоступен
+1. Проверьте, что бот запущен
+2. Проверьте логи на наличие `TUNNEL_STARTED`
+3. Убедитесь, что `config.js` обновлён и задеплоен на Pages
+
+### Пустой список пользователей
+- База данных может быть пуста, если никто ещё не использовал бота
