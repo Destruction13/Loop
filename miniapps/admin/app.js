@@ -141,14 +141,24 @@ function renderStats() {
 
 function renderUserCard(user) {
   const hasPhone = user.phone ? '<span class="user-phone">📱</span>' : '';
+  const hasEvent = user.has_event_record ? '<span class="user-event-badge">🎄</span>' : '';
   const triesClass = user.tries_remaining > 0 ? 'success' : 'warning';
-  const eventClass = user.event_paid_remaining > 0 ? 'success' : 'warning';
+  
+  // Event stats - only show real values if user has event record
+  let eventDisplay, eventClass;
+  if (user.has_event_record) {
+    eventDisplay = `${user.event_paid_remaining}/${user.event_paid_limit}`;
+    eventClass = user.event_paid_remaining > 0 ? 'success' : 'warning';
+  } else {
+    eventDisplay = '—';
+    eventClass = '';
+  }
   
   return `
     <div class="user-card" data-user-id="${user.user_id}">
       <div class="user-header">
         <div class="user-info">
-          <div class="user-name">${formatUserName(user)}${hasPhone}</div>
+          <div class="user-name">${formatUserName(user)}${hasPhone}${hasEvent}</div>
           <div class="user-id">ID: ${user.user_id}${user.username ? ` · @${user.username}` : ''}</div>
         </div>
       </div>
@@ -162,7 +172,7 @@ function renderUserCard(user) {
           <div class="user-stat-label">Попыток</div>
         </div>
         <div class="user-stat ${eventClass}">
-          <div class="user-stat-value">${user.event_paid_remaining}/${user.event_paid_limit}</div>
+          <div class="user-stat-value">${eventDisplay}</div>
           <div class="user-stat-label">Ивент</div>
         </div>
         <div class="user-stat">
@@ -228,12 +238,41 @@ function filterUsers(users) {
 function openUserModal(user) {
   elements.modalTitle.textContent = formatUserName(user);
   const usernameDisplay = user.username ? `@${user.username}` : '';
+  const eventBadge = user.has_event_record ? ' 🎄' : '';
+  
+  // Event section - only show if user has event record
+  let eventSection = '';
+  if (user.has_event_record) {
+    eventSection = `
+    <div class="section-title">Ивент попытки 🎄</div>
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Осталось попыток</label>
+        <input type="number" class="form-input" id="inputEventRemaining" value="${user.event_paid_remaining}" min="0" max="${user.event_paid_limit}" />
+        <div class="form-hint">Использовано: ${user.event_paid_used} из ${user.event_paid_limit}</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Лимит попыток</label>
+        <input type="number" class="form-input" id="inputEventLimit" value="${user.event_paid_limit}" disabled />
+        <div class="form-hint">Фиксированный лимит</div>
+      </div>
+    </div>
+    <button class="btn btn-secondary" id="saveEventTriesBtn" style="width: 100%;">Сохранить ивент попытки</button>
+    `;
+  } else {
+    eventSection = `
+    <div class="section-title">Ивент попытки</div>
+    <div class="form-hint" style="text-align: center; padding: 16px; background: var(--bg-secondary); border-radius: var(--radius-md);">
+      Пользователь ещё не заходил в ивент
+    </div>
+    `;
+  }
   
   elements.modalBody.innerHTML = `
     <div class="user-detail-header">
       <div class="user-avatar">${getInitials(user)}</div>
       <div class="user-detail-info">
-        <h3>${formatUserName(user)}</h3>
+        <h3>${formatUserName(user)}${eventBadge}</h3>
         <p>ID: ${user.user_id}${usernameDisplay ? ` · ${usernameDisplay}` : ''}</p>
         <p><a href="${user.telegram_link}" target="_blank">Открыть профиль в Telegram</a></p>
         ${user.phone ? `<p>📱 ${user.phone}</p>` : ''}
@@ -254,20 +293,7 @@ function openUserModal(user) {
     </div>
     <button class="btn btn-primary" id="saveTriesBtn" style="width: 100%;">Сохранить попытки</button>
     
-    <div class="section-title">Ивент попытки</div>
-    <div class="form-row">
-      <div class="form-group">
-        <label class="form-label">Осталось попыток</label>
-        <input type="number" class="form-input" id="inputEventRemaining" value="${user.event_paid_remaining}" min="0" max="${user.event_paid_limit}" />
-        <div class="form-hint">Использовано: ${user.event_paid_used} из ${user.event_paid_limit}</div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Лимит попыток</label>
-        <input type="number" class="form-input" id="inputEventLimit" value="${user.event_paid_limit}" disabled />
-        <div class="form-hint">Фиксированный лимит</div>
-      </div>
-    </div>
-    <button class="btn btn-secondary" id="saveEventTriesBtn" style="width: 100%;">Сохранить ивент попытки</button>
+    ${eventSection}
     
     <div class="section-title">Статистика</div>
     <div class="user-stats" style="margin-bottom: 12px;">
@@ -297,7 +323,9 @@ function openUserModal(user) {
   
   // Attach handlers
   document.getElementById("saveTriesBtn").addEventListener("click", () => saveUserTries(user.user_id));
-  document.getElementById("saveEventTriesBtn").addEventListener("click", () => saveEventTries(user.user_id, user.event_paid_limit));
+  if (user.has_event_record) {
+    document.getElementById("saveEventTriesBtn").addEventListener("click", () => saveEventTries(user.user_id, user.event_paid_limit));
+  }
   document.getElementById("deleteUserBtn").addEventListener("click", () => confirmDeleteUser(user));
   
   elements.modalOverlay.classList.remove("hidden");

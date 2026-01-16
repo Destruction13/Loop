@@ -25,6 +25,9 @@ class AdminUserRow:
     # Event attempts: paid only (free not counted per user request)
     event_paid_used: int
     event_paid_limit: int = 10
+    # Whether user has interacted with event
+    has_event_record: bool = False
+    event_id: str | None = None
     
     @property
     def event_paid_remaining(self) -> int:
@@ -178,15 +181,21 @@ def list_admin_users(
                 """
                 LEFT JOIN (
                     SELECT user_id, 
-                           SUM(paid_used) AS total_paid_used
+                           SUM(paid_used) AS total_paid_used,
+                           MAX(event_id) AS latest_event_id,
+                           1 AS has_record
                     FROM event_user_attempts
                     GROUP BY user_id
                 ) event_stats ON event_stats.user_id = u.user_id
                 """
             )
             select_fields.append("COALESCE(event_stats.total_paid_used, 0) AS event_paid_used")
+            select_fields.append("event_stats.latest_event_id AS event_id")
+            select_fields.append("COALESCE(event_stats.has_record, 0) AS has_event_record")
         else:
             select_fields.append("0 AS event_paid_used")
+            select_fields.append("NULL AS event_id")
+            select_fields.append("0 AS has_event_record")
 
         query = f"""
             SELECT {", ".join(select_fields)}
@@ -221,6 +230,8 @@ def list_admin_users(
                 social_clicks=int(row["social_clicks"] or 0),
                 phone=(row["phone"] or "").strip() or None,
                 event_paid_used=int(row["event_paid_used"] or 0),
+                has_event_record=bool(row["has_event_record"]),
+                event_id=(row["event_id"] or "").strip() or None,
             )
         )
     return items, int(total or 0)
@@ -340,30 +351,45 @@ def update_user_tries(
 def update_event_tries(
     db_path: Path,
     user_id: int,
-    event_id: str,
+    event_id: str | None = None,
     *,
-    free_used: int | None = None,
     paid_used: int | None = None,
 ) -> bool:
-    """Update user's event attempts."""
+    """Update user's event attempts.
+    
+    If event_id is None or 'default', will try to find user's existing event record.
+    """
     with _open_readwrite(db_path) as conn:
         if not _table_exists(conn, "event_user_attempts"):
             return False
         
+        # If event_id is not specified or is 'default', find the user's actual event
+        actual_event_id = event_id
+        if not event_id or event_id == "default":
+            cur = conn.execute(
+                "SELECT event_id FROM event_user_attempts WHERE user_id = ? LIMIT 1",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                actual_event_id = row[0]
+            else:
+                # No event record exists for this user
+                return False
+        
         cur = conn.execute(
-            "SELECT free_used, paid_used FROM event_user_attempts WHERE user_id = ? AND event_id = ?",
-            (user_id, event_id),
+            "SELECT paid_used FROM event_user_attempts WHERE user_id = ? AND event_id = ?",
+            (user_id, actual_event_id),
         )
         row = cur.fetchone()
         if not row:
             return False
         
-        new_free = free_used if free_used is not None else row["free_used"]
         new_paid = paid_used if paid_used is not None else row["paid_used"]
         
         conn.execute(
-            "UPDATE event_user_attempts SET free_used = ?, paid_used = ? WHERE user_id = ? AND event_id = ?",
-            (new_free, new_paid, user_id, event_id),
+            "UPDATE event_user_attempts SET paid_used = ? WHERE user_id = ? AND event_id = ?",
+            (new_paid, user_id, actual_event_id),
         )
         conn.commit()
         return True

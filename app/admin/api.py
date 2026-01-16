@@ -95,6 +95,8 @@ async def handle_users(request: web.Request) -> web.Response:
                 "event_paid_used": row.event_paid_used,
                 "event_paid_limit": row.event_paid_limit,
                 "event_paid_remaining": row.event_paid_remaining,
+                "has_event_record": row.has_event_record,
+                "event_id": row.event_id,
             }
         )
 
