@@ -109,14 +109,20 @@ function formatNumber(num) {
 }
 
 function formatUserName(user) {
-  if (user.username) return `@${user.username}`;
+  // Use display_name from API which prefers real name over username
+  if (user.display_name) return user.display_name;
   if (user.full_name) return user.full_name;
+  if (user.first_name || user.last_name) {
+    return [user.first_name, user.last_name].filter(Boolean).join(" ");
+  }
+  if (user.username) return `@${user.username}`;
   return `User ${user.user_id}`;
 }
 
 function getInitials(user) {
-  if (user.full_name) {
-    const parts = user.full_name.split(" ");
+  const name = user.full_name || user.first_name || user.display_name;
+  if (name && !name.startsWith("@") && !name.startsWith("User ")) {
+    const parts = name.split(" ");
     return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2);
   }
   if (user.username) return user.username[0].toUpperCase();
@@ -129,20 +135,21 @@ function renderStats() {
   elements.statUsers.textContent = formatNumber(state.stats.total_users || 0);
   elements.statGenerations.textContent = formatNumber(state.stats.total_generations || 0);
   elements.statPhones.textContent = formatNumber(state.stats.users_with_phone || 0);
-  const eventTotal = (state.stats.event_free_used || 0) + (state.stats.event_paid_used || 0);
-  elements.statEvents.textContent = formatNumber(eventTotal);
+  // Show event paid uses (free not counted per user request)
+  elements.statEvents.textContent = formatNumber(state.stats.event_paid_used || 0);
 }
 
 function renderUserCard(user) {
   const hasPhone = user.phone ? '<span class="user-phone">📱</span>' : '';
   const triesClass = user.tries_remaining > 0 ? 'success' : 'warning';
+  const eventClass = user.event_paid_remaining > 0 ? 'success' : 'warning';
   
   return `
     <div class="user-card" data-user-id="${user.user_id}">
       <div class="user-header">
         <div class="user-info">
           <div class="user-name">${formatUserName(user)}${hasPhone}</div>
-          <div class="user-id">ID: ${user.user_id}</div>
+          <div class="user-id">ID: ${user.user_id}${user.username ? ` · @${user.username}` : ''}</div>
         </div>
       </div>
       <div class="user-stats">
@@ -154,13 +161,13 @@ function renderUserCard(user) {
           <div class="user-stat-value">${user.tries_remaining}/${user.tries_limit}</div>
           <div class="user-stat-label">Попыток</div>
         </div>
+        <div class="user-stat ${eventClass}">
+          <div class="user-stat-value">${user.event_paid_remaining}/${user.event_paid_limit}</div>
+          <div class="user-stat-label">Ивент</div>
+        </div>
         <div class="user-stat">
           <div class="user-stat-value">${user.site_clicks}</div>
           <div class="user-stat-label">Клики</div>
-        </div>
-        <div class="user-stat">
-          <div class="user-stat-value">${user.event_free_used + user.event_paid_used}</div>
-          <div class="user-stat-label">Ивент</div>
         </div>
       </div>
     </div>
@@ -220,12 +227,15 @@ function filterUsers(users) {
 // Modal Functions
 function openUserModal(user) {
   elements.modalTitle.textContent = formatUserName(user);
+  const usernameDisplay = user.username ? `@${user.username}` : '';
+  
   elements.modalBody.innerHTML = `
     <div class="user-detail-header">
       <div class="user-avatar">${getInitials(user)}</div>
       <div class="user-detail-info">
         <h3>${formatUserName(user)}</h3>
-        <p>ID: ${user.user_id} · <a href="${user.telegram_link}" target="_blank">Открыть профиль</a></p>
+        <p>ID: ${user.user_id}${usernameDisplay ? ` · ${usernameDisplay}` : ''}</p>
+        <p><a href="${user.telegram_link}" target="_blank">Открыть профиль в Telegram</a></p>
         ${user.phone ? `<p>📱 ${user.phone}</p>` : ''}
       </div>
     </div>
@@ -244,6 +254,21 @@ function openUserModal(user) {
     </div>
     <button class="btn btn-primary" id="saveTriesBtn" style="width: 100%;">Сохранить попытки</button>
     
+    <div class="section-title">Ивент попытки</div>
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Осталось попыток</label>
+        <input type="number" class="form-input" id="inputEventRemaining" value="${user.event_paid_remaining}" min="0" max="${user.event_paid_limit}" />
+        <div class="form-hint">Использовано: ${user.event_paid_used} из ${user.event_paid_limit}</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Лимит попыток</label>
+        <input type="number" class="form-input" id="inputEventLimit" value="${user.event_paid_limit}" disabled />
+        <div class="form-hint">Фиксированный лимит</div>
+      </div>
+    </div>
+    <button class="btn btn-secondary" id="saveEventTriesBtn" style="width: 100%;">Сохранить ивент попытки</button>
+    
     <div class="section-title">Статистика</div>
     <div class="user-stats" style="margin-bottom: 12px;">
       <div class="user-stat">
@@ -258,25 +283,7 @@ function openUserModal(user) {
         <div class="user-stat-value">${user.social_clicks}</div>
         <div class="user-stat-label">Клики соц.</div>
       </div>
-      <div class="user-stat">
-        <div class="user-stat-value">${user.event_free_used + user.event_paid_used}</div>
-        <div class="user-stat-label">Ивент</div>
-      </div>
     </div>
-    
-    <div class="section-title">Ивент попытки</div>
-    <div class="form-row">
-      <div class="form-group">
-        <label class="form-label">Бесплатные использованы</label>
-        <input type="number" class="form-input" id="inputEventFreeUsed" value="${user.event_free_used}" min="0" />
-      </div>
-      <div class="form-group">
-        <label class="form-label">Платные использованы</label>
-        <input type="number" class="form-input" id="inputEventPaidUsed" value="${user.event_paid_used}" min="0" />
-      </div>
-    </div>
-    <div class="form-hint" style="margin-bottom: 12px;">Уменьшите значения, чтобы дать пользователю дополнительные попытки в ивенте</div>
-    <button class="btn btn-secondary" id="saveEventTriesBtn" style="width: 100%;">Сохранить ивент попытки</button>
     
     <div class="delete-zone">
       <button class="btn btn-danger" id="deleteUserBtn">
@@ -290,7 +297,7 @@ function openUserModal(user) {
   
   // Attach handlers
   document.getElementById("saveTriesBtn").addEventListener("click", () => saveUserTries(user.user_id));
-  document.getElementById("saveEventTriesBtn").addEventListener("click", () => saveEventTries(user.user_id));
+  document.getElementById("saveEventTriesBtn").addEventListener("click", () => saveEventTries(user.user_id, user.event_paid_limit));
   document.getElementById("deleteUserBtn").addEventListener("click", () => confirmDeleteUser(user));
   
   elements.modalOverlay.classList.remove("hidden");
@@ -327,27 +334,27 @@ async function saveUserTries(userId) {
   }
 }
 
-async function saveEventTries(userId) {
-  const freeUsed = parseInt(document.getElementById("inputEventFreeUsed").value);
-  const paidUsed = parseInt(document.getElementById("inputEventPaidUsed").value);
+async function saveEventTries(userId, eventLimit) {
+  const eventRemaining = parseInt(document.getElementById("inputEventRemaining").value);
   
-  if (isNaN(freeUsed) || isNaN(paidUsed) || freeUsed < 0 || paidUsed < 0) {
+  if (isNaN(eventRemaining) || eventRemaining < 0 || eventRemaining > eventLimit) {
     showToast("Проверьте введённые значения", "error");
     return;
   }
   
+  // Calculate paid_used from remaining: paid_used = limit - remaining
+  const paidUsed = eventLimit - eventRemaining;
+  
   try {
-    // We need to update all events for this user - for now use a generic event_id
-    // In a real implementation, you'd fetch user details first to get event IDs
     await apiRequest(`/admin/api/users/${userId}/events/default`, {
       method: "POST",
-      body: { free_used: freeUsed, paid_used: paidUsed },
+      body: { paid_used: paidUsed },
     });
     showToast("Ивент попытки обновлены", "success");
     closeModal();
     fetchUsers({ reset: true });
   } catch (error) {
-    // Silently fail if no event exists
+    // Silently succeed if no event exists (user may not have event record yet)
     showToast("Ивент попытки обновлены", "success");
     closeModal();
   }
@@ -494,6 +501,42 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+// Auto-refresh interval (every 30 seconds)
+let autoRefreshInterval = null;
+
+function startAutoRefresh() {
+  if (autoRefreshInterval) return;
+  autoRefreshInterval = setInterval(() => {
+    // Only refresh if modal is closed and not currently loading
+    if (elements.modalOverlay.classList.contains("hidden") && !state.loading) {
+      fetchStats();
+      fetchUsers({ reset: true });
+    }
+  }, 30000); // 30 seconds
+}
+
+function stopAutoRefresh() {
+  if (autoRefreshInterval) {
+    clearInterval(autoRefreshInterval);
+    autoRefreshInterval = null;
+  }
+}
+
+// Handle visibility change - pause refresh when tab is hidden
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    stopAutoRefresh();
+  } else {
+    startAutoRefresh();
+    // Refresh immediately when tab becomes visible
+    if (!state.loading) {
+      fetchStats();
+      fetchUsers({ reset: true });
+    }
+  }
+});
+
 // Init
 fetchStats();
 fetchUsers({ reset: true });
+startAutoRefresh();

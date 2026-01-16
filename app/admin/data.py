@@ -12,6 +12,8 @@ from typing import Any
 class AdminUserRow:
     user_id: int
     username: str | None
+    first_name: str | None
+    last_name: str | None
     full_name: str | None
     generations: int
     tries_used: int
@@ -20,8 +22,25 @@ class AdminUserRow:
     site_clicks: int
     social_clicks: int
     phone: str | None
-    event_free_used: int
+    # Event attempts: paid only (free not counted per user request)
     event_paid_used: int
+    event_paid_limit: int = 10
+    
+    @property
+    def event_paid_remaining(self) -> int:
+        return max(0, self.event_paid_limit - self.event_paid_used)
+
+    @property
+    def display_name(self) -> str:
+        """Name for display in the list - prefer real name over username."""
+        if self.full_name:
+            return self.full_name
+        if self.first_name or self.last_name:
+            parts = [p for p in (self.first_name, self.last_name) if p]
+            return " ".join(parts)
+        if self.username:
+            return f"@{self.username}"
+        return f"User {self.user_id}"
 
     @property
     def telegram_link(self) -> str:
@@ -153,23 +172,20 @@ def list_admin_users(
             select_fields.append("0 AS site_clicks")
             select_fields.append("0 AS social_clicks")
 
-        # Event attempts aggregation
+        # Event attempts aggregation (only paid, free not counted per user request)
         if has_event_attempts:
             joins.append(
                 """
                 LEFT JOIN (
                     SELECT user_id, 
-                           SUM(free_used) AS total_free_used,
                            SUM(paid_used) AS total_paid_used
                     FROM event_user_attempts
                     GROUP BY user_id
                 ) event_stats ON event_stats.user_id = u.user_id
                 """
             )
-            select_fields.append("COALESCE(event_stats.total_free_used, 0) AS event_free_used")
             select_fields.append("COALESCE(event_stats.total_paid_used, 0) AS event_paid_used")
         else:
-            select_fields.append("0 AS event_free_used")
             select_fields.append("0 AS event_paid_used")
 
         query = f"""
@@ -183,16 +199,19 @@ def list_admin_users(
 
     items: list[AdminUserRow] = []
     for row in rows:
+        first_name = (row["first_name"] or "").strip() or None
+        last_name = (row["last_name"] or "").strip() or None
         full_name = (row["full_name"] or "").strip() or None
-        if not full_name:
-            first_name = (row["first_name"] or "").strip()
-            last_name = (row["last_name"] or "").strip()
-            combined = " ".join(part for part in (first_name, last_name) if part).strip()
-            full_name = combined or None
+        # Build full_name from parts if not set
+        if not full_name and (first_name or last_name):
+            parts = [p for p in (first_name, last_name) if p]
+            full_name = " ".join(parts) if parts else None
         items.append(
             AdminUserRow(
                 user_id=int(row["user_id"]),
                 username=(row["username"] or "").strip() or None,
+                first_name=first_name,
+                last_name=last_name,
                 full_name=full_name,
                 generations=int(row["generations"] or 0),
                 tries_used=int(row["tries_used"] or 0),
@@ -201,7 +220,6 @@ def list_admin_users(
                 site_clicks=int(row["site_clicks"] or 0),
                 social_clicks=int(row["social_clicks"] or 0),
                 phone=(row["phone"] or "").strip() or None,
-                event_free_used=int(row["event_free_used"] or 0),
                 event_paid_used=int(row["event_paid_used"] or 0),
             )
         )
@@ -376,15 +394,15 @@ def get_stats(db_path: Path) -> dict[str, Any]:
         else:
             stats["users_with_phone"] = 0
         
-        # Event stats
+        # Event stats (only paid, free not counted per user request)
         if _table_exists(conn, "event_user_attempts"):
             event_stats = conn.execute(
-                "SELECT SUM(free_used) as free, SUM(paid_used) as paid FROM event_user_attempts"
+                "SELECT SUM(paid_used) as paid, COUNT(DISTINCT user_id) as users FROM event_user_attempts"
             ).fetchone()
-            stats["event_free_used"] = event_stats["free"] or 0
             stats["event_paid_used"] = event_stats["paid"] or 0
+            stats["event_users"] = event_stats["users"] or 0
         else:
-            stats["event_free_used"] = 0
             stats["event_paid_used"] = 0
+            stats["event_users"] = 0
         
         return stats
