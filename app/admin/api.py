@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from aiohttp import web
 
@@ -306,6 +308,49 @@ async def handle_admin_root(request: web.Request) -> web.Response:
     return web.FileResponse(index_path, headers={"Content-Type": "text/html"})
 
 
+async def handle_redirect(request: web.Request) -> web.Response:
+    """Handle redirect with click tracking.
+    
+    URL format: /r/{user_id}?url={encoded_target_url}
+    
+    This endpoint:
+    1. Increments the site_clicks counter for the user in the database
+    2. Redirects the user to the target URL
+    """
+    user_id_str = request.match_info.get("user_id", "")
+    target_url = request.rel_url.query.get("url", "")
+    
+    # Decode URL if it was encoded
+    if target_url:
+        target_url = unquote(target_url)
+    
+    # Validate user_id
+    try:
+        user_id = int(user_id_str)
+    except (ValueError, TypeError):
+        user_id = None
+    
+    # Increment site_clicks if user_id is valid
+    if user_id is not None:
+        db_path: Path = request.app["db_path"]
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE users SET site_clicks = COALESCE(site_clicks, 0) + 1 WHERE user_id = ?",
+                    (user_id,),
+                )
+                conn.commit()
+        except Exception:
+            pass  # Don't fail redirect if DB update fails
+    
+    # Redirect to target URL or fallback
+    if not target_url:
+        # Fallback to a default URL if none provided
+        target_url = "https://loov.ru"
+    
+    raise web.HTTPFound(location=target_url)
+
+
 def create_app(config: Config | None = None, db_path: Path | None = None) -> web.Application:
     """Create the admin API aiohttp application.
     
@@ -337,6 +382,9 @@ def create_app(config: Config | None = None, db_path: Path | None = None) -> web
     app.router.add_get("/admin/", handle_admin_root)
     app.router.add_get("/admin/config.js", handle_config_js)
     app.router.add_get("/admin/{filename}", handle_static_file)
+    
+    # Redirect endpoint for tracking clicks on "Подробнее о модели" button
+    app.router.add_get("/r/{user_id}", handle_redirect)
     
     return app
 

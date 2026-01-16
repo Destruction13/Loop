@@ -207,6 +207,9 @@ def setup_router(
     router = Router()
     # Store admin_webapp_url as router attribute so it can be updated dynamically
     router.admin_webapp_url = admin_webapp_url
+    # Store tracking_url for click tracking on "Подробнее о модели" button
+    # This will be updated when the Cloudflare tunnel starts
+    router.tracking_url = None
     logger = get_logger("bot.handlers")
 
     idle_delay = max(int(idle_nudge_seconds), 0)
@@ -5571,6 +5574,8 @@ def setup_router(
                 0,
                 show_more=False,
                 vote_payload=vote_payload,
+                tracking_base_url=router.tracking_url,
+                user_id=user_id,
             )
             info_domain(
                 "bot.handlers",
@@ -5640,6 +5645,8 @@ def setup_router(
             keyboard_remaining,
             show_more=result_has_more,
             vote_payload=vote_payload,
+            tracking_base_url=router.tracking_url,
+            user_id=user_id,
         )
         await _deactivate_previous_more_button(message.bot, user_id)
         info_domain(
@@ -6785,20 +6792,55 @@ def setup_router(
 
     @router.callback_query(F.data == "details_click")
     async def handle_details_click(callback: CallbackQuery) -> None:
-        """Handle click on 'Подробнее о модели' button - track click and show site link."""
+        """Handle click on 'Подробнее о модели' button - track click and update button to URL.
+        
+        This handler exists for backward compatibility with old messages that still have
+        callback buttons. New messages use URL buttons directly.
+        """
         await track_event(str(callback.from_user.id), "details_click")
         # Increment site clicks counter in users table
         await repository.increment_site_clicks(callback.from_user.id)
-        sanitized = (site_url or "").strip()
-        if not sanitized:
+        
+        # Try to find the model URL from the message's existing markup
+        model_url: str | None = None
+        if callback.message and callback.message.reply_markup:
+            for row in callback.message.reply_markup.inline_keyboard:
+                for button in row:
+                    if button.url and button.url.strip():
+                        model_url = button.url.strip()
+                        break
+                if model_url:
+                    break
+        
+        # Fallback to site_url if no model URL found
+        target_url = model_url or (site_url or "").strip()
+        
+        if not target_url:
             await callback.answer("Ссылка недоступна", show_alert=True)
             return
-        # Show button with direct link to the site
-        follow_markup = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, url=sanitized)]]
-        )
-        await callback.message.answer("🔗 Перейти на сайт:", reply_markup=follow_markup)
-        await callback.answer()
+        
+        # Replace the callback button with a URL button in the existing message
+        if callback.message and callback.message.reply_markup:
+            new_rows: list[list[InlineKeyboardButton]] = []
+            for row in callback.message.reply_markup.inline_keyboard:
+                new_row: list[InlineKeyboardButton] = []
+                for button in row:
+                    if button.callback_data == "details_click":
+                        # Replace callback button with URL button
+                        new_row.append(InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, url=target_url))
+                    else:
+                        new_row.append(button)
+                new_row_clean = [b for b in new_row if b is not None]
+                if new_row_clean:
+                    new_rows.append(new_row_clean)
+            
+            new_markup = InlineKeyboardMarkup(inline_keyboard=new_rows) if new_rows else None
+            try:
+                await callback.message.edit_reply_markup(reply_markup=new_markup)
+            except TelegramBadRequest:
+                pass  # Message might be too old to edit
+        
+        await callback.answer("Нажмите кнопку ещё раз для перехода на сайт")
 
     @router.callback_query(F.data == "cta_book")
     async def handle_cta(callback: CallbackQuery) -> None:

@@ -441,6 +441,14 @@ async def main() -> None:
                 )
                 # Update the router with the new admin URL
                 router.admin_webapp_url = admin_webapp_url_override
+                # Update tracking URL for click tracking on "Подробнее о модели" button
+                router.tracking_url = tunnel_url
+                info_domain(
+                    "bot.start",
+                    f"📊 Tracking URL установлен: {tunnel_url}",
+                    stage="TRACKING_URL_SET",
+                    tracking_url=tunnel_url,
+                )
             else:
                 logger.warning(
                     "Не удалось запустить Cloudflare Tunnel. "

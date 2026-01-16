@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
+from urllib.parse import quote, urljoin
 
 from aiogram.types import (
     InlineKeyboardButton,
@@ -12,6 +13,30 @@ from aiogram.types import (
 )
 
 from app.texts import messages as msg
+
+
+def build_tracking_url(
+    base_url: str,
+    user_id: int,
+    target_url: str,
+) -> str:
+    """Build a tracking redirect URL.
+    
+    Args:
+        base_url: The base URL of the admin API (e.g., tunnel URL)
+        user_id: The Telegram user ID for tracking
+        target_url: The final destination URL
+        
+    Returns:
+        A URL like: {base_url}/r/{user_id}?url={encoded_target_url}
+    """
+    if not base_url or not target_url:
+        return target_url or ""
+    
+    # Ensure base_url ends without slash for consistent joining
+    base = base_url.rstrip("/")
+    encoded_target = quote(target_url, safe="")
+    return f"{base}/r/{user_id}?url={encoded_target}"
 
 
 def _booking_button(site_url: str, *, as_callback: bool) -> InlineKeyboardButton:
@@ -128,8 +153,19 @@ def generation_result_keyboard(
     *,
     show_more: bool = True,
     vote_payload: Mapping[str, str] | None = None,
+    tracking_base_url: str | None = None,
+    user_id: int | None = None,
 ) -> InlineKeyboardMarkup:
-    """Keyboard attached to the generation result message."""
+    """Keyboard attached to the generation result message.
+    
+    Args:
+        site_url: The model's site URL (from catalog)
+        remaining: Number of remaining tries
+        show_more: Whether to show "More variants" button
+        vote_payload: Payload for vote buttons
+        tracking_base_url: Base URL for click tracking (e.g., tunnel URL)
+        user_id: User ID for click tracking
+    """
 
     rows: list[list[InlineKeyboardButton]] = []
     if vote_payload:
@@ -159,8 +195,15 @@ def generation_result_keyboard(
                     ),
                 ]
             )
-    # "Подробнее о модели" - use callback to track clicks, then redirect to site
-    rows.append([InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, callback_data="details_click")])
+    # "Подробнее о модели" - URL button that opens the model's site directly
+    # If tracking is enabled, use redirect URL to track clicks
+    sanitized_url = (site_url or "").strip()
+    if sanitized_url:
+        if tracking_base_url and user_id is not None:
+            button_url = build_tracking_url(tracking_base_url, user_id, sanitized_url)
+        else:
+            button_url = sanitized_url
+        rows.append([InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, url=button_url)])
     if show_more and remaining > 0:
         rows.append(
             [
