@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import time
 from contextlib import suppress
@@ -42,6 +43,7 @@ from app.utils.paths import ensure_dir
 from app.recommender import StyleRecommender
 from app.infrastructure.logging_middleware import LoggingMiddleware
 from app.infrastructure.identity_middleware import UserIdentityMiddleware
+from app.admin.api import start_admin_api, stop_admin_api
 from logger import get_logger, info_domain, log_event, setup_logging
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -382,6 +384,27 @@ async def main() -> None:
         )
         social_ad.start()
 
+    # Start embedded Admin API server
+    admin_api_runner = None
+    admin_api_port = int(os.getenv("ADMIN_API_PORT", "8080"))
+    try:
+        admin_api_runner, _ = await start_admin_api(
+            config=config,
+            db_path=repository_path,
+        )
+        info_domain(
+            "bot.start",
+            f"Admin API запущен на порту {admin_api_port}",
+            stage="ADMIN_API_STARTED",
+            port=admin_api_port,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Не удалось запустить Admin API: %s",
+            exc,
+            extra={"stage": "ADMIN_API_FAILED"},
+        )
+
     info_domain("bot.start", "Бот запущен", stage="BOT_STARTED")
     try:
         await _run_polling(dp, bot, logger)
@@ -391,6 +414,8 @@ async def main() -> None:
             await social_ad.stop()
         if analytics_exporter is not None:
             await analytics_exporter.stop()
+        if admin_api_runner is not None:
+            await stop_admin_api(admin_api_runner)
         await catalog_service.aclose()
         await bot.session.close()
 
