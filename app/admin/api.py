@@ -236,14 +236,7 @@ async def handle_update_event_tries(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "invalid_json"}, status=400)
 
-    free_used = body.get("free_used")
     paid_used = body.get("paid_used")
-
-    if free_used is not None:
-        try:
-            free_used = int(free_used)
-        except (TypeError, ValueError):
-            return web.json_response({"error": "invalid_free_used"}, status=400)
 
     if paid_used is not None:
         try:
@@ -255,7 +248,6 @@ async def handle_update_event_tries(request: web.Request) -> web.Response:
         request.app["db_path"],
         user_id,
         event_id,
-        free_used=free_used,
         paid_used=paid_used,
     )
     if not success:

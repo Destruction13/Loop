@@ -368,7 +368,7 @@ def update_event_tries(
             )
             row = cur.fetchone()
             if row:
-                actual_event_id = row[0]
+                actual_event_id = row["event_id"]
             else:
                 # No event record exists for this user
                 return False
@@ -384,7 +384,7 @@ def update_event_tries(
         new_paid = paid_used if paid_used is not None else row["paid_used"]
         
         conn.execute(
-            "UPDATE event_attempts SET paid_used = ? WHERE user_id = ? AND event_id = ?",
+            "UPDATE event_attempts SET paid_used = ?, updated_at = datetime('now') WHERE user_id = ? AND event_id = ?",
             (new_paid, user_id, actual_event_id),
         )
         conn.commit()

@@ -159,7 +159,8 @@ def generation_result_keyboard(
                     ),
                 ]
             )
-    rows.append([InlineKeyboardButton(text=msg.DETAILS_BUTTON_TEXT, url=site_url)])
+    # Use callback to track clicks, then show URL popup
+    rows.append([_booking_button(site_url, as_callback=True)])
     if show_more and remaining > 0:
         rows.append(
             [

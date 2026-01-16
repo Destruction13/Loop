@@ -382,9 +382,7 @@ async function saveEventTries(userId, eventLimit) {
     closeModal();
     fetchUsers({ reset: true });
   } catch (error) {
-    // Silently succeed if no event exists (user may not have event record yet)
-    showToast("Ивент попытки обновлены", "success");
-    closeModal();
+    showToast(`Ошибка: ${error.message}`, "error");
   }
 }
 
