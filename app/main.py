@@ -412,6 +412,7 @@ async def main() -> None:
     # Start Cloudflare Tunnel for HTTPS access to Admin API
     tunnel: CloudflareTunnel | None = None
     tunnel_url: str | None = None
+    admin_webapp_url_override: str | None = None
     if admin_api_runner is not None:
         if CloudflareTunnel.is_available():
             info_domain(
@@ -430,14 +431,16 @@ async def main() -> None:
                     stage="TUNNEL_STARTED",
                     tunnel_url=tunnel_url,
                 )
-                # Log the admin panel URL for easy access
-                admin_panel_url = f"{tunnel_url}/admin"
+                # Use tunnel URL for admin panel (serves both frontend and API)
+                admin_webapp_url_override = f"{tunnel_url}/admin"
                 info_domain(
                     "bot.start",
-                    f"🔐 Admin панель доступна: {admin_panel_url}",
+                    f"🔐 Admin панель доступна: {admin_webapp_url_override}",
                     stage="ADMIN_PANEL_URL",
-                    admin_url=admin_panel_url,
+                    admin_url=admin_webapp_url_override,
                 )
+                # Update the router with the new admin URL
+                router.admin_webapp_url = admin_webapp_url_override
             else:
                 logger.warning(
                     "Не удалось запустить Cloudflare Tunnel. "

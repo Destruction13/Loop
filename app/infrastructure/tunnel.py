@@ -210,7 +210,10 @@ async def start_tunnel_and_update_config(
     local_port: int = 8080,
     timeout: float = 30.0,
 ) -> tuple[CloudflareTunnel | None, str | None]:
-    """Convenience function to start tunnel and update config.js.
+    """Convenience function to start tunnel.
+
+    Note: config.js update is no longer needed because the frontend is now
+    served from the tunnel itself, so apiBaseUrl can remain empty (same origin).
 
     Args:
         local_port: Local port where Admin API is running
@@ -231,7 +234,6 @@ async def start_tunnel_and_update_config(
     url = await tunnel.start(timeout=timeout)
 
     if url:
-        update_admin_config_js(url)
         return tunnel, url
 
     return None, None

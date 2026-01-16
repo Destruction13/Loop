@@ -205,6 +205,8 @@ def setup_router(
     event_model_name: str | None = None,
 ) -> Router:
     router = Router()
+    # Store admin_webapp_url as router attribute so it can be updated dynamically
+    router.admin_webapp_url = admin_webapp_url
     logger = get_logger("bot.handlers")
 
     idle_delay = max(int(idle_nudge_seconds), 0)
@@ -6673,7 +6675,7 @@ def setup_router(
         user_id = message.from_user.id if message.from_user else None
         if not is_admin(user_id):
             return
-        url = (admin_webapp_url or "").strip()
+        url = (router.admin_webapp_url or "").strip()
         if not url:
             await message.answer("Admin panel is not configured.")
             return
@@ -6845,32 +6847,4 @@ def setup_router(
             msg.PHOTO_INSTRUCTION,
         )
         await callback.answer()
-    # -------------------------------------------------------------------------
-    # Admin command handler
-    # -------------------------------------------------------------------------
-    @router.message(Command("admin"))
-    async def cmd_admin(message: Message) -> None:
-        """Open admin dashboard for whitelisted users."""
-        user_id = message.from_user.id if message.from_user else None
-        if not user_id or not is_admin(user_id):
-            # Silently ignore for non-admins (no hints)
-            return
-        if not admin_webapp_url:
-            await message.answer("Admin panel URL is not configured.")
-            return
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="?? Open Admin Dashboard",
-                        web_app=WebAppInfo(url=admin_webapp_url),
-                    )
-                ]
-            ]
-        )
-        await message.answer(
-            "?? <b>Admin Dashboard</b>\n\nClick the button below to open the admin panel.",
-            reply_markup=keyboard,
-        )
-
     return router
