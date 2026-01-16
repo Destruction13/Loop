@@ -39,14 +39,18 @@ const apiBase = (() => {
 })();
 
 function buildUrl() {
-  const base = apiBase || "";
   const params = new URLSearchParams({
     offset: String(state.offset),
     limit: String(state.limit),
     sort: state.sort,
     order: state.order,
   });
-  return `${base}/admin/api/users?${params.toString()}`;
+  // Use absolute path to avoid issues with <base href>
+  // If apiBase is set, use it; otherwise use absolute path from root
+  if (apiBase) {
+    return `${apiBase}/admin/api/users?${params.toString()}`;
+  }
+  return `/admin/api/users?${params.toString()}`;
 }
 
 function setStatus(text, mode) {
