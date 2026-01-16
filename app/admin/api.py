@@ -9,7 +9,14 @@ from typing import Any
 
 from aiohttp import web
 
-from app.admin.data import list_admin_users
+from app.admin.data import (
+    delete_user,
+    get_stats,
+    get_user_details,
+    list_admin_users,
+    update_event_tries,
+    update_user_tries,
+)
 from app.admin.init_data import verify_init_data
 from app.admin.security import is_admin
 from app.config import Config, load_config
@@ -25,7 +32,7 @@ async def cors_middleware(request: web.Request, handler) -> web.StreamResponse:
     else:
         response = await handler(request)
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
     response.headers["Access-Control-Max-Age"] = "86400"
     return response
@@ -76,9 +83,14 @@ async def handle_users(request: web.Request) -> web.Response:
                 "full_name": row.full_name,
                 "telegram_link": row.telegram_link,
                 "generations": row.generations,
+                "tries_used": row.tries_used,
+                "tries_limit": row.tries_limit,
+                "tries_remaining": row.tries_remaining,
                 "site_clicks": row.site_clicks,
                 "social_clicks": row.social_clicks,
                 "phone": row.phone,
+                "event_free_used": row.event_free_used,
+                "event_paid_used": row.event_paid_used,
             }
         )
 
@@ -90,6 +102,160 @@ async def handle_users(request: web.Request) -> web.Response:
             "limit": limit,
         }
     )
+
+
+async def handle_stats(request: web.Request) -> web.Response:
+    """Get overall statistics."""
+    init_data = _extract_init_data(request)
+    config = request.app["config"]
+    if not init_data:
+        return web.json_response({"error": "init_data_required"}, status=403)
+    verified = verify_init_data(init_data, config.bot_token)
+    if verified is None or not is_admin(verified.user_id):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    stats = get_stats(request.app["db_path"])
+    return web.json_response(stats)
+
+
+async def handle_user_details(request: web.Request) -> web.Response:
+    """Get detailed info about a single user."""
+    init_data = _extract_init_data(request)
+    config = request.app["config"]
+    if not init_data:
+        return web.json_response({"error": "init_data_required"}, status=403)
+    verified = verify_init_data(init_data, config.bot_token)
+    if verified is None or not is_admin(verified.user_id):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    try:
+        user_id = int(request.match_info["user_id"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "invalid_user_id"}, status=400)
+
+    details = get_user_details(request.app["db_path"], user_id)
+    if details is None:
+        return web.json_response({"error": "user_not_found"}, status=404)
+
+    return web.json_response(details)
+
+
+async def handle_delete_user(request: web.Request) -> web.Response:
+    """Delete a user completely."""
+    init_data = _extract_init_data(request)
+    config = request.app["config"]
+    if not init_data:
+        return web.json_response({"error": "init_data_required"}, status=403)
+    verified = verify_init_data(init_data, config.bot_token)
+    if verified is None or not is_admin(verified.user_id):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    try:
+        user_id = int(request.match_info["user_id"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "invalid_user_id"}, status=400)
+
+    success = delete_user(request.app["db_path"], user_id)
+    if not success:
+        return web.json_response({"error": "user_not_found"}, status=404)
+
+    return web.json_response({"ok": True, "deleted_user_id": user_id})
+
+
+async def handle_update_tries(request: web.Request) -> web.Response:
+    """Update user's tries (remaining or limit)."""
+    init_data = _extract_init_data(request)
+    config = request.app["config"]
+    if not init_data:
+        return web.json_response({"error": "init_data_required"}, status=403)
+    verified = verify_init_data(init_data, config.bot_token)
+    if verified is None or not is_admin(verified.user_id):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    try:
+        user_id = int(request.match_info["user_id"])
+    except (KeyError, ValueError):
+        return web.json_response({"error": "invalid_user_id"}, status=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    tries_remaining = body.get("tries_remaining")
+    tries_limit = body.get("tries_limit")
+
+    if tries_remaining is not None:
+        try:
+            tries_remaining = int(tries_remaining)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid_tries_remaining"}, status=400)
+
+    if tries_limit is not None:
+        try:
+            tries_limit = int(tries_limit)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid_tries_limit"}, status=400)
+
+    success = update_user_tries(
+        request.app["db_path"],
+        user_id,
+        tries_remaining=tries_remaining,
+        tries_limit=tries_limit,
+    )
+    if not success:
+        return web.json_response({"error": "update_failed"}, status=400)
+
+    return web.json_response({"ok": True})
+
+
+async def handle_update_event_tries(request: web.Request) -> web.Response:
+    """Update user's event attempts."""
+    init_data = _extract_init_data(request)
+    config = request.app["config"]
+    if not init_data:
+        return web.json_response({"error": "init_data_required"}, status=403)
+    verified = verify_init_data(init_data, config.bot_token)
+    if verified is None or not is_admin(verified.user_id):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    try:
+        user_id = int(request.match_info["user_id"])
+        event_id = request.match_info["event_id"]
+    except (KeyError, ValueError):
+        return web.json_response({"error": "invalid_parameters"}, status=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    free_used = body.get("free_used")
+    paid_used = body.get("paid_used")
+
+    if free_used is not None:
+        try:
+            free_used = int(free_used)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid_free_used"}, status=400)
+
+    if paid_used is not None:
+        try:
+            paid_used = int(paid_used)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid_paid_used"}, status=400)
+
+    success = update_event_tries(
+        request.app["db_path"],
+        user_id,
+        event_id,
+        free_used=free_used,
+        paid_used=paid_used,
+    )
+    if not success:
+        return web.json_response({"error": "update_failed"}, status=400)
+
+    return web.json_response({"ok": True})
 
 
 async def handle_config_js(request: web.Request) -> web.Response:
@@ -158,6 +324,15 @@ def create_app(config: Config | None = None, db_path: Path | None = None) -> web
     # API endpoints
     app.router.add_route("GET", "/admin/api/users", handle_users)
     app.router.add_route("OPTIONS", "/admin/api/users", handle_users)
+    app.router.add_route("GET", "/admin/api/stats", handle_stats)
+    app.router.add_route("OPTIONS", "/admin/api/stats", handle_stats)
+    app.router.add_route("GET", "/admin/api/users/{user_id}", handle_user_details)
+    app.router.add_route("OPTIONS", "/admin/api/users/{user_id}", handle_user_details)
+    app.router.add_route("DELETE", "/admin/api/users/{user_id}", handle_delete_user)
+    app.router.add_route("POST", "/admin/api/users/{user_id}/tries", handle_update_tries)
+    app.router.add_route("OPTIONS", "/admin/api/users/{user_id}/tries", handle_update_tries)
+    app.router.add_route("POST", "/admin/api/users/{user_id}/events/{event_id}", handle_update_event_tries)
+    app.router.add_route("OPTIONS", "/admin/api/users/{user_id}/events/{event_id}", handle_update_event_tries)
     
     # Static files for admin panel (served from same origin)
     app.router.add_get("/admin", handle_admin_root)

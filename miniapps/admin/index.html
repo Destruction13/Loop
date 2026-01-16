@@ -1,87 +1,142 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
   <head>
     <meta charset="utf-8" />
-    <meta
-      name="viewport"
-      content="width=device-width, initial-scale=1, viewport-fit=cover"
-    />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <base href="/admin/" />
     <title>LOOV Admin</title>
-    <meta name="color-scheme" content="light" />
+    <meta name="color-scheme" content="light dark" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap"
-      rel="stylesheet"
-    />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="styles.css" />
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
   </head>
   <body>
     <div class="app">
-      <header class="topbar">
-        <div>
-          <div class="eyebrow">LOOV</div>
-          <h1>Admin Dashboard</h1>
+      <!-- Header -->
+      <header class="header">
+        <div class="header-top">
+          <h1 class="logo">LOOV Admin</h1>
+          <div class="status-badge" id="statusBadge">
+            <span class="status-dot"></span>
+            <span class="status-text">Загрузка...</span>
+          </div>
         </div>
-        <div class="status">
-          <span id="statusDot" class="status-dot idle"></span>
-          <span id="statusText">Waiting for data</span>
+        
+        <!-- Stats Cards -->
+        <div class="stats-grid" id="statsGrid">
+          <div class="stat-card">
+            <div class="stat-value" id="statUsers">-</div>
+            <div class="stat-label">Пользователей</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="statGenerations">-</div>
+            <div class="stat-label">Генераций</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="statPhones">-</div>
+            <div class="stat-label">С телефоном</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="statEvents">-</div>
+            <div class="stat-label">Ивент попыток</div>
+          </div>
         </div>
       </header>
 
-      <section class="controls">
-        <div class="control">
-          <label for="sort">Sort</label>
-          <select id="sort">
-            <option value="generations">Generations</option>
-            <option value="site_clicks">Site clicks</option>
-            <option value="social_clicks">Social clicks</option>
-            <option value="user_id">User ID</option>
+      <!-- Search & Filters -->
+      <div class="toolbar">
+        <div class="search-box">
+          <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"/>
+            <path d="m21 21-4.35-4.35"/>
+          </svg>
+          <input type="text" id="searchInput" placeholder="Поиск по ID, username или имени..." />
+        </div>
+        <div class="toolbar-actions">
+          <select id="sortSelect" class="select">
+            <option value="generations">По генерациям</option>
+            <option value="tries_remaining">По попыткам</option>
+            <option value="user_id">По ID</option>
+            <option value="username">По username</option>
           </select>
+          <button id="refreshBtn" class="btn btn-icon" title="Обновить">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+              <path d="M3 3v5h5"/>
+              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+              <path d="M16 21h5v-5"/>
+            </svg>
+          </button>
         </div>
-        <button id="orderToggle" class="ghost" type="button" aria-pressed="true">
-          Descending
-        </button>
-        <div class="control">
-          <label for="limit">Rows</label>
-          <select id="limit">
-            <option value="25">25</option>
-            <option value="50" selected>50</option>
-            <option value="100">100</option>
-          </select>
+      </div>
+
+      <!-- Users List -->
+      <div class="users-list" id="usersList">
+        <!-- Users will be rendered here -->
+      </div>
+
+      <!-- Load More -->
+      <div class="load-more-container" id="loadMoreContainer">
+        <button id="loadMoreBtn" class="btn btn-secondary">Загрузить ещё</button>
+        <div class="users-count" id="usersCount">0 из 0</div>
+      </div>
+
+      <!-- Empty State -->
+      <div class="empty-state hidden" id="emptyState">
+        <div class="empty-icon">📭</div>
+        <div class="empty-title">Нет пользователей</div>
+        <div class="empty-text">База данных пуста</div>
+      </div>
+
+      <!-- Error State -->
+      <div class="error-state hidden" id="errorState">
+        <div class="error-icon">⚠️</div>
+        <div class="error-title" id="errorTitle">Ошибка</div>
+        <div class="error-text" id="errorText">Не удалось загрузить данные</div>
+        <button id="retryBtn" class="btn btn-primary">Повторить</button>
+      </div>
+
+      <!-- Loading State -->
+      <div class="loading-state hidden" id="loadingState">
+        <div class="spinner"></div>
+        <div class="loading-text">Загрузка...</div>
+      </div>
+    </div>
+
+    <!-- User Edit Modal -->
+    <div class="modal-overlay hidden" id="modalOverlay">
+      <div class="modal" id="userModal">
+        <div class="modal-header">
+          <h2 class="modal-title" id="modalTitle">Пользователь</h2>
+          <button class="modal-close" id="modalClose">&times;</button>
         </div>
-        <button id="refresh" class="primary" type="button">Refresh</button>
-      </section>
-
-      <section class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Telegram username / name</th>
-              <th>Profile link</th>
-              <th class="num">Generations</th>
-              <th class="num">Site clicks</th>
-              <th class="num">Social clicks</th>
-              <th>Phone</th>
-            </tr>
-          </thead>
-          <tbody id="tableBody"></tbody>
-        </table>
-      </section>
-
-      <section id="state" class="state hidden">
-        <div class="state-title" id="stateTitle">Loading...</div>
-        <div class="state-body" id="stateBody">
-          Fetching data from the API.
+        <div class="modal-body" id="modalBody">
+          <!-- Modal content will be rendered here -->
         </div>
-      </section>
+      </div>
+    </div>
 
-      <footer class="footer">
-        <div class="footer-meta" id="count">0 users</div>
-        <button id="loadMore" class="ghost" type="button">Load more</button>
-      </footer>
+    <!-- Confirm Dialog -->
+    <div class="modal-overlay hidden" id="confirmOverlay">
+      <div class="modal modal-small">
+        <div class="modal-header">
+          <h2 class="modal-title">Подтверждение</h2>
+        </div>
+        <div class="modal-body">
+          <p id="confirmText">Вы уверены?</p>
+          <div class="modal-actions">
+            <button id="confirmCancel" class="btn btn-secondary">Отмена</button>
+            <button id="confirmOk" class="btn btn-danger">Удалить</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div class="toast hidden" id="toast">
+      <span class="toast-message" id="toastMessage"></span>
     </div>
 
     <script src="config.js"></script>
