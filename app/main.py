@@ -44,6 +44,10 @@ from app.recommender import StyleRecommender
 from app.infrastructure.logging_middleware import LoggingMiddleware
 from app.infrastructure.identity_middleware import UserIdentityMiddleware
 from app.admin.api import start_admin_api, stop_admin_api
+from app.infrastructure.tunnel import (
+    CloudflareTunnel,
+    start_tunnel_and_update_config,
+)
 from logger import get_logger, info_domain, log_event, setup_logging
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -405,6 +409,49 @@ async def main() -> None:
             extra={"stage": "ADMIN_API_FAILED"},
         )
 
+    # Start Cloudflare Tunnel for HTTPS access to Admin API
+    tunnel: CloudflareTunnel | None = None
+    tunnel_url: str | None = None
+    if admin_api_runner is not None:
+        if CloudflareTunnel.is_available():
+            info_domain(
+                "bot.start",
+                "Запуск Cloudflare Tunnel...",
+                stage="TUNNEL_STARTING",
+            )
+            tunnel, tunnel_url = await start_tunnel_and_update_config(
+                local_port=admin_api_port,
+                timeout=30.0,
+            )
+            if tunnel_url:
+                info_domain(
+                    "bot.start",
+                    f"Cloudflare Tunnel запущен: {tunnel_url}",
+                    stage="TUNNEL_STARTED",
+                    tunnel_url=tunnel_url,
+                )
+                # Log the admin panel URL for easy access
+                admin_panel_url = f"{tunnel_url}/admin"
+                info_domain(
+                    "bot.start",
+                    f"🔐 Admin панель доступна: {admin_panel_url}",
+                    stage="ADMIN_PANEL_URL",
+                    admin_url=admin_panel_url,
+                )
+            else:
+                logger.warning(
+                    "Не удалось запустить Cloudflare Tunnel. "
+                    "Admin API доступен только локально на порту %s",
+                    admin_api_port,
+                    extra={"stage": "TUNNEL_FAILED"},
+                )
+        else:
+            logger.warning(
+                "cloudflared не установлен. Admin API доступен только локально. "
+                "Установите cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
+                extra={"stage": "CLOUDFLARED_NOT_INSTALLED"},
+            )
+
     info_domain("bot.start", "Бот запущен", stage="BOT_STARTED")
     try:
         await _run_polling(dp, bot, logger)
@@ -414,6 +461,8 @@ async def main() -> None:
             await social_ad.stop()
         if analytics_exporter is not None:
             await analytics_exporter.stop()
+        if tunnel is not None:
+            await tunnel.stop()
         if admin_api_runner is not None:
             await stop_admin_api(admin_api_runner)
         await catalog_service.aclose()
