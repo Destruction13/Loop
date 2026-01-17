@@ -480,6 +480,8 @@ class Repository:
             if profile is None:
                 return
             preserved_contact_never = profile.contact_never
+            # Preserve gen_count - it should accumulate across sessions
+            preserved_gen_count = profile.gen_count
             new_profile = UserProfile(
                 user_id=user_id,
                 gender=None,
@@ -496,7 +498,7 @@ class Repository:
                 seen_models=[],
                 remind_at=None,
                 referrer_id=profile.referrer_id,
-                gen_count=0,
+                gen_count=preserved_gen_count,
                 contact_skip_once=False,
                 contact_never=preserved_contact_never,
                 last_activity_ts=profile.last_activity_ts,

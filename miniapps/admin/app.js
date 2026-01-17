@@ -230,7 +230,8 @@ function filterUsers(users) {
     const name = formatUserName(user).toLowerCase();
     const id = String(user.user_id);
     const phone = (user.phone || "").toLowerCase();
-    return name.includes(query) || id.includes(query) || phone.includes(query);
+    const username = (user.username || "").toLowerCase();
+    return name.includes(query) || id.includes(query) || phone.includes(query) || username.includes(query);
   });
 }
 
@@ -516,16 +517,7 @@ elements.retryBtn.addEventListener("click", () => {
   fetchUsers({ reset: true });
 });
 
-// Keyboard handling
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") {
-    if (!elements.confirmOverlay.classList.contains("hidden")) {
-      closeConfirm();
-    } else if (!elements.modalOverlay.classList.contains("hidden")) {
-      closeModal();
-    }
-  }
-});
+// Keyboard handling moved to broadcast section below
 
 // Auto-refresh interval (every 30 seconds)
 let autoRefreshInterval = null;
@@ -560,6 +552,457 @@ document.addEventListener("visibilitychange", () => {
       fetchUsers({ reset: true });
     }
   }
+});
+
+// Broadcast functionality
+const broadcastElements = {
+  btn: document.getElementById("broadcastBtn"),
+  overlay: document.getElementById("broadcastOverlay"),
+  close: document.getElementById("broadcastClose"),
+  cancel: document.getElementById("broadcastCancel"),
+  send: document.getElementById("broadcastSend"),
+  preview: document.getElementById("broadcastPreview"),
+  previewBtnText: document.querySelector(".preview-btn-text"),
+  previewSection: document.getElementById("previewSection"),
+  previewContent: document.getElementById("previewContent"),
+  editMode: document.getElementById("broadcastEditMode"),
+  text: document.getElementById("broadcastText"),
+  photo: document.getElementById("broadcastPhoto"),
+  photoPreview: document.getElementById("photoPreview"),
+  photoPreviewImg: document.getElementById("photoPreviewImg"),
+  photoPlaceholder: document.getElementById("photoPlaceholder"),
+  photoRemove: document.getElementById("photoRemove"),
+  photoUploadArea: document.getElementById("photoUploadArea"),
+  userCount: document.getElementById("broadcastUserCount"),
+};
+
+let broadcastPhotoBase64 = null;
+let broadcastPhotoDataUrl = null;
+let isPreviewMode = false;
+
+function openBroadcastModal() {
+  broadcastElements.text.value = "";
+  broadcastPhotoBase64 = null;
+  broadcastPhotoDataUrl = null;
+  broadcastElements.photoPreview.classList.add("hidden");
+  broadcastElements.photoPlaceholder.classList.remove("hidden");
+  broadcastElements.userCount.textContent = state.total || 0;
+  // Reset to edit mode
+  setPreviewMode(false);
+  broadcastElements.overlay.classList.remove("hidden");
+}
+
+function closeBroadcastModal() {
+  broadcastElements.overlay.classList.add("hidden");
+  setPreviewMode(false);
+}
+
+function handlePhotoSelect(file) {
+  if (!file || !file.type.startsWith("image/")) return;
+  
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const dataUrl = e.target.result;
+    broadcastPhotoDataUrl = dataUrl;
+    broadcastPhotoBase64 = dataUrl.split(",")[1];
+    broadcastElements.photoPreviewImg.src = dataUrl;
+    broadcastElements.photoPreview.classList.remove("hidden");
+    broadcastElements.photoPlaceholder.classList.add("hidden");
+  };
+  reader.readAsDataURL(file);
+}
+
+function removePhoto() {
+  broadcastPhotoBase64 = null;
+  broadcastPhotoDataUrl = null;
+  broadcastElements.photo.value = "";
+  broadcastElements.photoPreview.classList.add("hidden");
+  broadcastElements.photoPlaceholder.classList.remove("hidden");
+}
+
+function sanitizeHtmlForPreview(html) {
+  // Only allow safe Telegram HTML tags: b, i, u, s, a, code, pre
+  // First escape any potentially dangerous content
+  const tempDiv = document.createElement("div");
+  tempDiv.textContent = html;
+  let escaped = tempDiv.innerHTML;
+  
+  // Now restore allowed Telegram HTML tags
+  const allowedTags = [
+    { open: /&lt;b&gt;/gi, close: /&lt;\/b&gt;/gi, openTag: "<b>", closeTag: "</b>" },
+    { open: /&lt;strong&gt;/gi, close: /&lt;\/strong&gt;/gi, openTag: "<strong>", closeTag: "</strong>" },
+    { open: /&lt;i&gt;/gi, close: /&lt;\/i&gt;/gi, openTag: "<i>", closeTag: "</i>" },
+    { open: /&lt;em&gt;/gi, close: /&lt;\/em&gt;/gi, openTag: "<em>", closeTag: "</em>" },
+    { open: /&lt;u&gt;/gi, close: /&lt;\/u&gt;/gi, openTag: "<u>", closeTag: "</u>" },
+    { open: /&lt;s&gt;/gi, close: /&lt;\/s&gt;/gi, openTag: "<s>", closeTag: "</s>" },
+    { open: /&lt;code&gt;/gi, close: /&lt;\/code&gt;/gi, openTag: "<code>", closeTag: "</code>" },
+    { open: /&lt;pre&gt;/gi, close: /&lt;\/pre&gt;/gi, openTag: "<pre>", closeTag: "</pre>" },
+  ];
+  
+  allowedTags.forEach(tag => {
+    escaped = escaped.replace(tag.open, tag.openTag);
+    escaped = escaped.replace(tag.close, tag.closeTag);
+  });
+  
+  // Handle <a href="..."> links specially
+  escaped = escaped.replace(/&lt;a\s+href=&quot;([^&]+)&quot;&gt;/gi, '<a href="$1" target="_blank">');
+  escaped = escaped.replace(/&lt;a\s+href='([^']+)'&gt;/gi, '<a href="$1" target="_blank">');
+  escaped = escaped.replace(/&lt;\/a&gt;/gi, "</a>");
+  
+  return escaped;
+}
+
+function setPreviewMode(enabled) {
+  isPreviewMode = enabled;
+  
+  if (enabled) {
+    // Switch to preview mode
+    broadcastElements.editMode.classList.add("hidden");
+    broadcastElements.previewSection.classList.remove("hidden");
+    broadcastElements.previewBtnText.textContent = "Редактировать";
+    broadcastElements.preview.classList.add("active");
+    
+    // Render preview content
+    renderPreviewContent();
+  } else {
+    // Switch to edit mode
+    broadcastElements.editMode.classList.remove("hidden");
+    broadcastElements.previewSection.classList.add("hidden");
+    broadcastElements.previewBtnText.textContent = "Предпросмотр";
+    broadcastElements.preview.classList.remove("active");
+  }
+}
+
+function renderPreviewContent() {
+  const text = broadcastElements.text.value.trim();
+  
+  if (!text && !broadcastPhotoDataUrl) {
+    broadcastElements.previewContent.innerHTML = `
+      <div class="preview-empty">Введите текст или добавьте фото для предпросмотра</div>
+    `;
+    return;
+  }
+  
+  let previewHtml = '<div class="preview-message">';
+  
+  // Add photo if present
+  if (broadcastPhotoDataUrl) {
+    previewHtml += `<img src="${broadcastPhotoDataUrl}" alt="Фото" />`;
+  }
+  
+  // Add text with HTML rendering
+  if (text) {
+    const sanitizedText = sanitizeHtmlForPreview(text);
+    previewHtml += sanitizedText;
+  }
+  
+  previewHtml += '</div>';
+  
+  broadcastElements.previewContent.innerHTML = previewHtml;
+}
+
+function togglePreview() {
+  setPreviewMode(!isPreviewMode);
+}
+
+async function sendBroadcast() {
+  const text = broadcastElements.text.value.trim();
+  
+  if (!text && !broadcastPhotoBase64) {
+    showToast("Введите текст или добавьте фото", "error");
+    return;
+  }
+  
+  broadcastElements.send.disabled = true;
+  broadcastElements.send.innerHTML = `
+    <div class="spinner" style="width: 16px; height: 16px; border-width: 2px;"></div>
+    Отправка...
+  `;
+  
+  try {
+    const result = await apiRequest("/admin/api/broadcast", {
+      method: "POST",
+      body: {
+        text: text,
+        photo_base64: broadcastPhotoBase64 || "",
+      },
+    });
+    closeBroadcastModal();
+    showToast(`✅ Отправлено: ${result.sent} из ${result.total} (заблокировано: ${result.blocked})`, "success");
+  } catch (error) {
+    showToast(`❌ ${error.message}`, "error");
+  } finally {
+    broadcastElements.send.disabled = false;
+    broadcastElements.send.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+        <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+      </svg>
+      Отправить
+    `;
+  }
+}
+
+// Broadcast event listeners
+broadcastElements.btn.addEventListener("click", openBroadcastModal);
+broadcastElements.close.addEventListener("click", closeBroadcastModal);
+broadcastElements.cancel.addEventListener("click", closeBroadcastModal);
+broadcastElements.overlay.addEventListener("click", (e) => {
+  if (e.target === broadcastElements.overlay) closeBroadcastModal();
+});
+broadcastElements.send.addEventListener("click", sendBroadcast);
+broadcastElements.preview.addEventListener("click", togglePreview);
+
+broadcastElements.photo.addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (file) handlePhotoSelect(file);
+});
+
+broadcastElements.photoRemove.addEventListener("click", (e) => {
+  e.stopPropagation();
+  removePhoto();
+});
+
+// Drag and drop support
+broadcastElements.photoUploadArea.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  broadcastElements.photoUploadArea.classList.add("dragover");
+});
+
+broadcastElements.photoUploadArea.addEventListener("dragleave", () => {
+  broadcastElements.photoUploadArea.classList.remove("dragover");
+});
+
+broadcastElements.photoUploadArea.addEventListener("drop", (e) => {
+  e.preventDefault();
+  broadcastElements.photoUploadArea.classList.remove("dragover");
+  const file = e.dataTransfer.files[0];
+  if (file) handlePhotoSelect(file);
+});
+
+// Update keyboard handling to include broadcast and dashboard modals
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (!dashboardElements.overlay.classList.contains("hidden")) {
+      closeDashboardModal();
+    } else if (!broadcastElements.overlay.classList.contains("hidden")) {
+      closeBroadcastModal();
+    } else if (!elements.confirmOverlay.classList.contains("hidden")) {
+      closeConfirm();
+    } else if (!elements.modalOverlay.classList.contains("hidden")) {
+      closeModal();
+    }
+  }
+});
+
+// Dashboard functionality
+const dashboardElements = {
+  btn: document.getElementById("dashboardBtn"),
+  overlay: document.getElementById("dashboardOverlay"),
+  close: document.getElementById("dashboardClose"),
+  loading: document.getElementById("dashboardLoading"),
+  empty: document.getElementById("dashboardEmpty"),
+  chart: document.getElementById("dashboardChart"),
+  filters: document.querySelectorAll(".filter-btn"),
+};
+
+let dashboardChart = null;
+let currentPeriod = "4h";
+
+function openDashboardModal() {
+  dashboardElements.overlay.classList.remove("hidden");
+  fetchDashboardData(currentPeriod);
+}
+
+function closeDashboardModal() {
+  dashboardElements.overlay.classList.add("hidden");
+}
+
+async function fetchDashboardData(period) {
+  currentPeriod = period;
+  
+  // Update active filter button
+  dashboardElements.filters.forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.period === period);
+  });
+  
+  // Show loading
+  dashboardElements.loading.classList.remove("hidden");
+  dashboardElements.empty.classList.add("hidden");
+  
+  try {
+    const data = await apiRequest("/admin/api/dashboard", {
+      params: { period },
+    });
+    
+    dashboardElements.loading.classList.add("hidden");
+    
+    if (!data.data || data.data.length === 0) {
+      dashboardElements.empty.classList.remove("hidden");
+      if (dashboardChart) {
+        dashboardChart.destroy();
+        dashboardChart = null;
+      }
+      return;
+    }
+    
+    renderDashboardChart(data.data, data.aggregation);
+    
+  } catch (error) {
+    dashboardElements.loading.classList.add("hidden");
+    showToast(`Ошибка загрузки дашборда: ${error.message}`, "error");
+  }
+}
+
+function renderDashboardChart(data, aggregation) {
+  const ctx = dashboardElements.chart.getContext("2d");
+  
+  // Prepare data - only include points with activity (no zeros)
+  const labels = data.map(point => {
+    const date = new Date(point.time);
+    if (aggregation === "daily") {
+      return date.toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+    } else {
+      return date.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+    }
+  });
+  
+  const activeUsers = data.map(point => point.active_users);
+  const totalActions = data.map(point => point.total_actions);
+  
+  // Destroy existing chart
+  if (dashboardChart) {
+    dashboardChart.destroy();
+  }
+  
+  // Create new chart with spanGaps: false to show gaps where there's no data
+  dashboardChart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: labels,
+      datasets: [
+        {
+          label: "Active Users",
+          data: activeUsers,
+          borderColor: "#6366f1",
+          backgroundColor: "rgba(99, 102, 241, 0.1)",
+          borderWidth: 2,
+          fill: true,
+          tension: 0.3,
+          pointRadius: 4,
+          pointHoverRadius: 6,
+          pointBackgroundColor: "#6366f1",
+          spanGaps: false,
+        },
+        {
+          label: "Total Actions",
+          data: totalActions,
+          borderColor: "#22c55e",
+          backgroundColor: "rgba(34, 197, 94, 0.1)",
+          borderWidth: 2,
+          fill: true,
+          tension: 0.3,
+          pointRadius: 4,
+          pointHoverRadius: 6,
+          pointBackgroundColor: "#22c55e",
+          spanGaps: false,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: {
+        intersect: false,
+        mode: "index",
+      },
+      plugins: {
+        legend: {
+          display: false,
+        },
+        tooltip: {
+          backgroundColor: "rgba(0, 0, 0, 0.8)",
+          titleColor: "#fff",
+          bodyColor: "#fff",
+          padding: 12,
+          cornerRadius: 8,
+          displayColors: true,
+          callbacks: {
+            title: function(context) {
+              const idx = context[0].dataIndex;
+              const point = data[idx];
+              const date = new Date(point.time);
+              if (aggregation === "daily") {
+                return date.toLocaleDateString("ru-RU", { 
+                  weekday: "short", 
+                  day: "numeric", 
+                  month: "long" 
+                });
+              } else {
+                return date.toLocaleString("ru-RU", { 
+                  day: "numeric", 
+                  month: "short", 
+                  hour: "2-digit", 
+                  minute: "2-digit" 
+                });
+              }
+            },
+            label: function(context) {
+              const label = context.dataset.label;
+              const value = context.parsed.y;
+              if (label === "Active Users") {
+                return ` Активных пользователей: ${value}`;
+              } else {
+                return ` Генераций: ${value}`;
+              }
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          grid: {
+            display: false,
+          },
+          ticks: {
+            color: "#888",
+            maxRotation: 45,
+            minRotation: 0,
+          },
+        },
+        y: {
+          beginAtZero: true,
+          grid: {
+            color: "rgba(136, 136, 136, 0.1)",
+          },
+          ticks: {
+            color: "#888",
+            stepSize: 1,
+            callback: function(value) {
+              if (Number.isInteger(value)) {
+                return value;
+              }
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+// Dashboard event listeners
+dashboardElements.btn.addEventListener("click", openDashboardModal);
+dashboardElements.close.addEventListener("click", closeDashboardModal);
+dashboardElements.overlay.addEventListener("click", (e) => {
+  if (e.target === dashboardElements.overlay) closeDashboardModal();
+});
+
+dashboardElements.filters.forEach(btn => {
+  btn.addEventListener("click", () => {
+    const period = btn.dataset.period;
+    if (period !== currentPeriod) {
+      fetchDashboardData(period);
+    }
+  });
 });
 
 // Init

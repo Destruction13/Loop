@@ -379,12 +379,17 @@ async def main() -> None:
 
     social_ad: SocialAdService | None = None
     if config.enable_social_ad and config.social_ad_minutes > 0:
+        # Create a getter for tracking URL that reads from router dynamically
+        def get_tracking_url() -> str | None:
+            return getattr(router, 'tracking_url', None)
+        
         social_ad = SocialAdService(
             bot=bot,
             repository=repository,
             social_links=[(link.title, link.url) for link in config.social_links],
             timeout_minutes=config.social_ad_minutes,
             interval_seconds=30,
+            tracking_url_getter=get_tracking_url,
         )
         social_ad.start()
 
@@ -395,6 +400,7 @@ async def main() -> None:
         admin_api_runner, _ = await start_admin_api(
             config=config,
             db_path=repository_path,
+            bot=bot,
         )
         info_domain(
             "bot.start",

@@ -305,8 +305,19 @@ def idle_reminder_keyboard(site_url: str) -> InlineKeyboardMarkup:
     )
 
 
-def social_ad_keyboard(links: Sequence[tuple[str, str]]) -> InlineKeyboardMarkup:
-    """Keyboard shown in social media advertisement messages."""
+def social_ad_keyboard(
+    links: Sequence[tuple[str, str]],
+    *,
+    tracking_base_url: str | None = None,
+    user_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    """Keyboard shown in social media advertisement messages.
+    
+    Args:
+        links: Sequence of (title, url) tuples for social links
+        tracking_base_url: Base URL for click tracking (e.g., tunnel URL)
+        user_id: User ID for click tracking
+    """
 
     rows: list[list[InlineKeyboardButton]] = []
     for title, url in links:
@@ -314,7 +325,12 @@ def social_ad_keyboard(links: Sequence[tuple[str, str]]) -> InlineKeyboardMarkup
         url_clean = url.strip()
         if not title_clean or not url_clean:
             continue
-        rows.append([InlineKeyboardButton(text=title_clean, url=url_clean)])
+        # Use tracking URL if available
+        if tracking_base_url and user_id is not None:
+            button_url = build_tracking_url(tracking_base_url, user_id, url_clean)
+        else:
+            button_url = url_clean
+        rows.append([InlineKeyboardButton(text=title_clean, url=button_url)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

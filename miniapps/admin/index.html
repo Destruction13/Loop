@@ -18,9 +18,26 @@
       <header class="header">
         <div class="header-top">
           <h1 class="logo">LOOV Admin</h1>
-          <div class="status-badge" id="statusBadge">
-            <span class="status-dot"></span>
-            <span class="status-text">Загрузка...</span>
+          <div class="header-actions">
+            <button id="dashboardBtn" class="btn btn-dashboard" title="Дашборд">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                <path d="M3 3v18h18"/>
+                <path d="M18 17V9"/>
+                <path d="M13 17V5"/>
+                <path d="M8 17v-3"/>
+              </svg>
+              <span>Дашборд</span>
+            </button>
+            <button id="broadcastBtn" class="btn btn-broadcast" title="Рассылка">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+              </svg>
+              <span>Рассылка</span>
+            </button>
+            <div class="status-badge" id="statusBadge">
+              <span class="status-dot"></span>
+              <span class="status-text">Загрузка...</span>
+            </div>
           </div>
         </div>
         
@@ -134,11 +151,120 @@
       </div>
     </div>
 
+    <!-- Broadcast Modal -->
+    <div class="modal-overlay hidden" id="broadcastOverlay">
+      <div class="modal modal-broadcast">
+        <div class="modal-header">
+          <h2 class="modal-title">📢 Рассылка сообщения</h2>
+          <button class="modal-close" id="broadcastClose">&times;</button>
+        </div>
+        <div class="modal-body">
+          <!-- Edit Mode -->
+          <div id="broadcastEditMode">
+            <div class="form-group">
+              <label for="broadcastText">Текст сообщения</label>
+              <textarea id="broadcastText" class="broadcast-textarea" placeholder="Введите текст сообщения...&#10;&#10;Поддерживается HTML-разметка:&#10;&lt;b&gt;жирный&lt;/b&gt;, &lt;i&gt;курсив&lt;/i&gt;, &lt;a href=&quot;url&quot;&gt;ссылка&lt;/a&gt;"></textarea>
+              <div class="form-hint">Поддерживаются: emoji 🎉, HTML-теги (&lt;b&gt;, &lt;i&gt;, &lt;a&gt;, &lt;code&gt;)</div>
+            </div>
+            <div class="form-group">
+              <label for="broadcastPhoto">Фото (опционально)</label>
+              <div class="photo-upload-area" id="photoUploadArea">
+                <input type="file" id="broadcastPhoto" accept="image/*" class="photo-input" />
+                <div class="photo-preview hidden" id="photoPreview">
+                  <img id="photoPreviewImg" src="" alt="Preview" />
+                  <button class="photo-remove" id="photoRemove">&times;</button>
+                </div>
+                <div class="photo-placeholder" id="photoPlaceholder">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="32" height="32">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                    <circle cx="8.5" cy="8.5" r="1.5"/>
+                    <polyline points="21 15 16 10 5 21"/>
+                  </svg>
+                  <span>Нажмите или перетащите фото</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <!-- Preview Mode -->
+          <div class="preview-section hidden" id="previewSection">
+            <div class="preview-header">
+              <span class="preview-title">👁 Предпросмотр сообщения</span>
+            </div>
+            <div class="preview-content" id="previewContent">
+              <!-- Preview will be rendered here -->
+            </div>
+          </div>
+          <div class="broadcast-info">
+            <span class="info-icon">ℹ️</span>
+            <span>Сообщение будет отправлено всем <strong id="broadcastUserCount">0</strong> пользователям бота</span>
+          </div>
+          <div class="modal-actions">
+            <button id="broadcastPreview" class="btn btn-preview">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+              <span class="preview-btn-text">Предпросмотр</span>
+            </button>
+            <button id="broadcastCancel" class="btn btn-secondary">Отмена</button>
+            <button id="broadcastSend" class="btn btn-primary btn-broadcast-send">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+              </svg>
+              Отправить
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Dashboard Modal -->
+    <div class="modal-overlay hidden" id="dashboardOverlay">
+      <div class="modal modal-dashboard">
+        <div class="modal-header">
+          <h2 class="modal-title">📊 Дашборд активности</h2>
+          <button class="modal-close" id="dashboardClose">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="dashboard-filters">
+            <button class="filter-btn active" data-period="4h">4 часа</button>
+            <button class="filter-btn" data-period="8h">8 часов</button>
+            <button class="filter-btn" data-period="24h">24 часа</button>
+            <button class="filter-btn" data-period="3d">3 дня</button>
+            <button class="filter-btn" data-period="7d">7 дней</button>
+          </div>
+          <div class="dashboard-chart-container">
+            <div class="dashboard-loading hidden" id="dashboardLoading">
+              <div class="spinner"></div>
+              <span>Загрузка данных...</span>
+            </div>
+            <div class="dashboard-empty hidden" id="dashboardEmpty">
+              <div class="empty-icon">📭</div>
+              <div class="empty-title">Нет данных</div>
+              <div class="empty-text">За выбранный период активности не было</div>
+            </div>
+            <canvas id="dashboardChart"></canvas>
+          </div>
+          <div class="dashboard-legend">
+            <div class="legend-item">
+              <span class="legend-color" style="background: #6366f1;"></span>
+              <span>Active Users — уникальные пользователи</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color" style="background: #22c55e;"></span>
+              <span>Генерации — количество примерок</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Toast Notification -->
     <div class="toast hidden" id="toast">
       <span class="toast-message" id="toastMessage"></span>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script src="config.js"></script>
     <script src="app.js"></script>
   </body>

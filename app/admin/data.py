@@ -273,7 +273,9 @@ def delete_user(db_path: Path, user_id: int) -> bool:
             ("user_style_pref", "user_id"),
             ("user_style_votes", "user_id"),
             ("event_user_attempts", "user_id"),
+            ("event_attempts", "user_id"),
             ("event_trigger_shown", "user_id"),
+            ("event_triggers", "user_id"),
             ("contact_shares", "user_id"),
         ]
         
@@ -428,3 +430,84 @@ def get_stats(db_path: Path) -> dict[str, Any]:
             stats["event_users"] = 0
         
         return stats
+
+
+def get_dashboard_data(
+    db_path: Path,
+    start_time: "datetime",
+    end_time: "datetime",
+    *,
+    use_daily: bool = False,
+) -> list[dict[str, Any]]:
+    """Get dashboard data for active users chart.
+    
+    Args:
+        db_path: Path to the database.
+        start_time: Start of the time range (UTC).
+        end_time: End of the time range (UTC).
+        use_daily: If True, aggregate by day; otherwise by hour.
+    
+    Returns:
+        List of data points with:
+        - time: ISO timestamp for the time slot start
+        - active_users: Number of unique users with activity
+        - total_actions: Total number of actions (optional metric)
+        
+    Note: Time slots with no activity are NOT included (graph will have gaps).
+    """
+    from datetime import datetime, timezone
+    
+    with _open_readonly(db_path) as conn:
+        if not _table_exists(conn, "analytics_events"):
+            return []
+        
+        start_iso = start_time.isoformat(timespec="seconds")
+        end_iso = end_time.isoformat(timespec="seconds")
+        
+        # SQLite strftime format for grouping
+        if use_daily:
+            # Group by day: YYYY-MM-DD
+            time_format = "%Y-%m-%d"
+        else:
+            # Group by hour: YYYY-MM-DDTHH:00:00
+            time_format = "%Y-%m-%dT%H:00:00"
+        
+        # Query: count unique users and successful generations per time slot
+        # Active users = unique users with any activity
+        # Total actions = only generation_finished events (successful generations)
+        # Only include slots that have activity (no zeros)
+        query = """
+            SELECT 
+                strftime(?, ts) AS time_slot,
+                COUNT(DISTINCT user_id) AS active_users,
+                SUM(CASE WHEN event = 'generation_finished' THEN 1 ELSE 0 END) AS total_actions
+            FROM analytics_events
+            WHERE ts >= ? AND ts < ?
+            GROUP BY time_slot
+            HAVING active_users > 0
+            ORDER BY time_slot ASC
+        """
+        
+        rows = conn.execute(query, (time_format, start_iso, end_iso)).fetchall()
+        
+        result = []
+        for row in rows:
+            time_slot = row["time_slot"]
+            if not time_slot:
+                continue
+            
+            # Convert time slot to full ISO format
+            if use_daily:
+                # Daily: add T00:00:00Z
+                time_iso = f"{time_slot}T00:00:00Z"
+            else:
+                # Hourly: add Z suffix
+                time_iso = f"{time_slot}Z"
+            
+            result.append({
+                "time": time_iso,
+                "active_users": row["active_users"],
+                "total_actions": row["total_actions"],
+            })
+        
+        return result

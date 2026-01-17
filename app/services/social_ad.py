@@ -27,6 +27,7 @@ class SocialAdService:
         social_links: Sequence[tuple[str, str]],
         timeout_minutes: int,
         interval_seconds: int = 30,
+        tracking_url_getter: Optional[callable] = None,
     ) -> None:
         self._bot = bot
         self._repository = repository
@@ -40,6 +41,7 @@ class SocialAdService:
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._logger = logging.getLogger("loop_bot.social_ad")
+        self._tracking_url_getter = tracking_url_getter
 
     def start(self) -> None:
         """Start the background check loop."""
@@ -89,7 +91,18 @@ class SocialAdService:
         if not self._social_links:
             self._logger.warning("No social links configured; skipping social ad")
             return
-        keyboard = social_ad_keyboard(self._social_links)
+        # Get tracking URL if available
+        tracking_url = None
+        if self._tracking_url_getter:
+            try:
+                tracking_url = self._tracking_url_getter()
+            except Exception:
+                pass
+        keyboard = social_ad_keyboard(
+            self._social_links,
+            tracking_base_url=tracking_url,
+            user_id=user_id,
+        )
         text = f"<b>{msg.SOCIAL_AD_TITLE}</b>\n{msg.SOCIAL_AD_BODY}"
         message = None
         try:
