@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Iterable
 
 # Replace with real Telegram user IDs for admin access.
-ADMIN_WHITELIST: set[int] = {5274709649}
+ADMIN_WHITELIST: set[int] = {5274709649, 823400350}
 
 
 def is_admin(user_id: int | None, *, whitelist: Iterable[int] | None = None) -> bool:
